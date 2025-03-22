@@ -320,7 +320,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     encoder.encode(.{ .literal = address });
                     encoder.encode(.{ .literal = trampoline_address });
                 },
-                .powerpc64le => {
+                .powerpc, .powerpc64, .powerpc64le => {
                     const code_address: usize = if (output) |slice| @intFromPtr(slice.ptr) else 0;
                     const code_addr_63_48: u16 = @truncate((code_address >> 48) & 0xffff);
                     const code_addr_47_32: u16 = @truncate((code_address >> 32) & 0xffff);
@@ -584,7 +584,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     :
                     : [arg] "{x6}" (ptr),
                 ),
-                .powerpc64le => asm volatile (
+                .powerpc, .powerpc64, .powerpc64le => asm volatile (
                 // actual nop's would get reordered for some reason despite the use of "volatile"
                     \\ li %r0, %r0
                     \\ li %r0, %r0
@@ -808,7 +808,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                         }
                     }
                 },
-                .powerpc64le => {
+                .powerpc, .powerpc64, .powerpc64le => {
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     // li 0, 0 is used as nop instead of regular nop
                     const nop: u32 = @bitCast(Instruction.ADDI{ .ra = 0, .rt = 0, .imm16 = 0 });
@@ -1924,7 +1924,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
         jalr: JALR,
         literal: usize,
     },
-    .powerpc64le => union(enum) {
+    .powerpc, .powerpc64, .powerpc64le => union(enum) {
         pub const ADDI = packed struct(u32) {
             imm16: i16,
             ra: u5,
