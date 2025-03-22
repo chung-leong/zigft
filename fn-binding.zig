@@ -320,7 +320,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     encoder.encode(.{ .literal = address });
                     encoder.encode(.{ .literal = trampoline_address });
                 },
-                .powerpc, .powerpc64, .powerpc64le => {
+                .powerpc64, .powerpc64le => {
                     const code_address: usize = if (output) |slice| @intFromPtr(slice.ptr) else 0;
                     const code_addr_63_48: u16 = @truncate((code_address >> 48) & 0xffff);
                     const code_addr_47_32: u16 = @truncate((code_address >> 32) & 0xffff);
@@ -328,7 +328,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     const code_addr_15_0: u16 = @truncate((code_address >> 0) & 0xffff);
                     // lis r11, code_addr_63_48
                     encoder.encode(.{
-                        .addi = .{ .rt = 11, .ra = 0, .imm16 = @bitCast(code_addr_63_48) },
+                        .addis = .{ .rt = 11, .ra = 0, .imm16 = @bitCast(code_addr_63_48) },
                     });
                     // ori r11, r11, code_addr_47_32
                     encoder.encode(.{
@@ -348,7 +348,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     });
                     // ld r12, [r11 + 40] (address)
                     encoder.encode(.{
-                        .ld = .{ .rt = 12, .ra = 11, .ds = 10 },
+                        .ld = .{ .rt = 12, .ra = 11, .ds = 40 >> 2 },
                     });
                     // std [sp + pos.offset], r12
                     encoder.encode(.{
@@ -356,7 +356,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     });
                     // ld r12, [r11 + 48] (trampoline_address)
                     encoder.encode(.{
-                        .ld = .{ .rt = 12, .ra = 11, .ds = 12 },
+                        .ld = .{ .rt = 12, .ra = 11, .ds = 48 >> 2 },
                     });
                     // mtctr r12
                     encoder.encode(.{
@@ -514,6 +514,41 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     encoder.encode(.{ .literal = address });
                     encoder.encode(.{ .literal = trampoline_address });
                 },
+                .powerpc, .powerpcle => {
+                    const code_address: usize = if (output) |slice| @intFromPtr(slice.ptr) else 0;
+                    const code_addr_31_16: u16 = @truncate((code_address >> 16) & 0xffff);
+                    const code_addr_15_0: u16 = @truncate((code_address >> 0) & 0xffff);
+                    // lis r11, code_addr_31_16
+                    encoder.encode(.{
+                        .addis = .{ .rt = 11, .ra = 0, .imm16 = @bitCast(code_addr_31_16) },
+                    });
+                    // ori r11, r11, code_addr_15_0
+                    encoder.encode(.{
+                        .ori = .{ .ra = 11, .rs = 11, .imm16 = @bitCast(code_addr_15_0) },
+                    });
+                    // lw r12, [r11 + 28] (address)
+                    encoder.encode(.{
+                        .lw = .{ .rt = 12, .ra = 11, .ds = 28 },
+                    });
+                    // stw [sp + pos.offset], r12
+                    encoder.encode(.{
+                        .stw = .{ .ra = 1, .rs = 12, .ds = @intCast(pos.offset) },
+                    });
+                    // lw r12, [r11 + 32] (trampoline_address)
+                    encoder.encode(.{
+                        .lw = .{ .rt = 12, .ra = 11, .ds = 32 },
+                    });
+                    // mtctr r12
+                    encoder.encode(.{
+                        .mtctr = .{ .rs = 12 },
+                    });
+                    // bctrl
+                    encoder.encode(.{
+                        .bctrl = .{},
+                    });
+                    encoder.encode(.{ .literal = address });
+                    encoder.encode(.{ .literal = trampoline_address });
+                },
                 else => @compileError("No support for '" ++ @tagName(builtin.target.cpu.arch) ++ "'"),
             }
             return encoder.len;
@@ -584,7 +619,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                     :
                     : [arg] "{x6}" (ptr),
                 ),
-                .powerpc, .powerpc64, .powerpc64le => asm volatile (
+                .powerpc, .powerpcle, .powerpc64, .powerpc64le => asm volatile (
                 // actual nop's would get reordered for some reason despite the use of "volatile"
                     \\ li %r0, %r0
                     \\ li %r0, %r0
@@ -808,7 +843,7 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                         }
                     }
                 },
-                .powerpc, .powerpc64, .powerpc64le => {
+                .powerpc, .powerpcle, .powerpc64, .powerpc64le => {
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     // li 0, 0 is used as nop instead of regular nop
                     const nop: u32 = @bitCast(Instruction.ADDI{ .ra = 0, .rt = 0, .imm16 = 0 });
@@ -823,6 +858,8 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                                 registers[addi.rt] = registers[addi.ra] + addi.imm16;
                             } else if (match(Instruction.STDU, instr)) |stdu| {
                                 registers[stdu.ra] += @as(isize, stdu.ds) << 2;
+                            } else if (match(Instruction.STWU, instr)) |stwu| {
+                                registers[stwu.ra] += stwu.ds;
                             } else if (match(Instruction.OR, instr)) |@"or"| {
                                 if (@"or".rb == @"or".rs) { // => mr ra rs
                                     registers[@"or".ra] = registers[@"or".rs];
@@ -1924,12 +1961,18 @@ const Instruction = switch (builtin.target.cpu.arch) {
         jalr: JALR,
         literal: usize,
     },
-    .powerpc, .powerpc64, .powerpc64le => union(enum) {
+    .powerpc, .powerpcle, .powerpc64, .powerpc64le => union(enum) {
         pub const ADDI = packed struct(u32) {
             imm16: i16,
             ra: u5,
             rt: u5,
             @"31:26": u6 = 14,
+        };
+        pub const ADDIS = packed struct(u32) {
+            imm16: i16,
+            ra: u5,
+            rt: u5,
+            @"31:26": u6 = 15,
         };
         pub const ORI = packed struct(u32) {
             imm16: u16,
@@ -1960,6 +2003,12 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rt: u5,
             @"31:26": u6 = 58,
         };
+        pub const LW = packed struct {
+            ds: i16,
+            ra: u5,
+            rt: u5,
+            @"31:26": u6 = 32,
+        };
         pub const STD = packed struct {
             @"1:0": u2 = 0,
             ds: i14,
@@ -1967,12 +2016,24 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs: u5,
             @"31:26": u6 = 62,
         };
+        pub const STW = packed struct {
+            ds: i16,
+            ra: u5,
+            rs: u5,
+            @"31:26": u6 = 36,
+        };
         pub const STDU = packed struct {
             @"1:0": u2 = 1,
             ds: i14,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 62,
+        };
+        pub const STWU = packed struct {
+            ds: i16,
+            ra: u5,
+            rs: u5,
+            @"31:26": u6 = 37,
         };
         pub const OR = packed struct(u32) {
             @"0": u1 = 0,
@@ -2000,11 +2061,17 @@ const Instruction = switch (builtin.target.cpu.arch) {
         };
 
         addi: ADDI,
+        addis: ADDIS,
         ori: ORI,
         oris: ORIS,
         rldic: RLDIC,
         ld: LD,
+        lw: LW,
         std: STD,
+        stw: STW,
+        stdu: STDU,
+        stwu: STWU,
+        @"or": OR,
         mtctr: MTCTR,
         bctrl: BCTRL,
         literal: usize,
