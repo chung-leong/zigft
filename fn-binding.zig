@@ -194,7 +194,7 @@ fn Binding(comptime T: type, comptime CT: type) type {
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
                     switch (@typeInfo(@TypeOf(func))) {
                         .@"fn" => {
-                            return @call(.never_inline, func, args);
+                            return @call(.never_inline, uninline(func), args);
                         },
                         .pointer => {
                             // expect address of function to be stored immediately after the context
@@ -1091,6 +1091,35 @@ test "FnType" {
     };
     try expect(FnType(@TypeOf(ns.foo)) == fn (i32) i32);
     try expect(FnType(@TypeOf(&ns.foo)) == fn (i32) i32);
+}
+
+pub fn Uninlined(comptime FT: type) type {
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return FT;
+    return @Type(.{
+        .@"fn" = .{
+            .calling_convention = switch (f.calling_convention) {
+                .@"inline" => .auto,
+                else => |cc| cc,
+            },
+            .is_generic = f.is_generic,
+            .is_var_args = f.is_var_args,
+            .return_type = f.return_type,
+            .params = f.params,
+        },
+    });
+}
+
+fn uninline(func: anytype) Uninlined(@TypeOf(func)) {
+    const FT = @TypeOf(func);
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return func;
+    const ns = struct {
+        inline fn call(args: std.meta.ArgsTuple(FT)) f.return_type.? {
+            return @call(.auto, func, args);
+        }
+    };
+    return fn_transform.spreadArgs(ns.call, .auto);
 }
 
 const Instruction = switch (builtin.target.cpu.arch) {
