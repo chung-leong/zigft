@@ -7,9 +7,7 @@ const expect = std.testing.expect;
 ///
 /// The allocator should use an instance of ExecutablePageAllocator as its backing allocator.
 pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf(vars)) {
-    const T = @TypeOf(func);
-    const CT = @TypeOf(vars);
-    const binding = Binding(T, CT);
+    const binding = Binding(@TypeOf(func), @TypeOf(vars));
     return if (!@inComptime())
         binding.createRuntime(allocator, func, vars)
     else
@@ -60,6 +58,12 @@ pub fn bind(func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf
 /// Nothing happens if the given pointer does not actually point at a bound function.
 pub fn unbind(fn_ptr: *const anyopaque) void {
     destroy(exec_allocator, fn_ptr);
+}
+
+/// Bind a function at comptime.
+pub fn define(func: anytype, vars: anytype) BoundFn(@TypeOf(func), @TypeOf(vars)) {
+    if (!@inComptime()) @compileError("This function can only be called in comptime");
+    return Binding(@TypeOf(func), @TypeOf(vars)).getComptime(func, vars).*;
 }
 
 /// Enable or disable write protection on executable memory on platforms that has the feature.
