@@ -1,8 +1,8 @@
 # Zigft
 
-Zigft is a small library that let you perform function transform in Zig. Consisting of just two 
-files, it's designed to be used as source code. Simply download the file you need from this repo 
-and place it in your `src` directory. Then import it into your own code.
+Zigft is a small library that lets you perform function transform in Zig. Consisting of just two 
+files, it's designed to be used in source form. Simply download the file you need from this repo, 
+place it in your `src` directory, and import it into your own code.
 
 [`fn-transform.zig`](#fn-transformzig) provides the library's core functionality. 
 [`fn-binding.zig`](#fn-bindingzig) meanwhile gives you the ability to bind variables to a function.
