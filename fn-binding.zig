@@ -1111,10 +1111,7 @@ fn Uninlined(comptime FT: type) type {
     if (f.calling_convention != .@"inline") return FT;
     return @Type(.{
         .@"fn" = .{
-            .calling_convention = switch (f.calling_convention) {
-                .@"inline" => .auto,
-                else => |cc| cc,
-            },
+            .calling_convention = .auto,
             .is_generic = f.is_generic,
             .is_var_args = f.is_var_args,
             .return_type = f.return_type,
