@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 const fn_transform = @import("fn-transform.zig");
 const expect = std.testing.expect;
 
+/// Create a binding using an user-provided allocator instead of the default.
+///
+/// The allocator should use an instance of ExecutablePageAllocator as its backing allocator.
 pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf(vars)) {
     const T = @TypeOf(func);
     const CT = @TypeOf(vars);
@@ -13,6 +16,7 @@ pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*cons
         return binding.getComptime(func, vars);
 }
 
+/// Free a binding using an user-provided allocator instead of the default.
 pub fn destroy(allocator: std.mem.Allocator, fn_ptr: *const anyopaque) void {
     const fn_addr = @intFromPtr(fn_ptr);
     if (fn_addr >= @sizeOf(Header) and std.mem.isAligned(fn_addr - @sizeOf(Header), @alignOf(Header))) {
@@ -28,7 +32,11 @@ pub fn destroy(allocator: std.mem.Allocator, fn_ptr: *const anyopaque) void {
     }
 }
 
-pub fn bound(comptime CT: type, fn_ptr: *const anyopaque) ?*CT {
+/// Obtain a pointer to the tuple holding variables bound to a function.
+///
+/// Before modifying the tuple, you need to call protect() to disable write protection and again
+/// afterward to reenable it.
+pub fn bound(comptime T: type, fn_ptr: *const anyopaque) ?*T {
     const fn_addr = @intFromPtr(fn_ptr);
     if (fn_addr >= @sizeOf(Header) and std.mem.isAligned(fn_addr - @sizeOf(Header), @alignOf(Header))) {
         const header_ptr: *Header = @ptrFromInt(fn_addr - @sizeOf(Header));
@@ -39,14 +47,22 @@ pub fn bound(comptime CT: type, fn_ptr: *const anyopaque) ?*CT {
     return null;
 }
 
+/// Create a new function by binding values to some (possibly all) of its arguments.
+///
+/// When called in a comptime context the binding will occur at comptime. That is to say,
+/// you will get a normal function.
 pub fn bind(func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf(vars)) {
     return create(exec_allocator, func, vars);
 }
 
+/// Free memory associated with a function binding.
+///
+/// Nothing happens if the given pointer does not actually point at a bound function.
 pub fn unbind(fn_ptr: *const anyopaque) void {
     destroy(exec_allocator, fn_ptr);
 }
 
+/// Enable or disable write protection on executable memory on platforms that has the feature.
 pub fn protect(state: bool) void {
     if (builtin.target.os.tag.isDarwin()) {
         const c = @cImport({
@@ -941,6 +957,7 @@ fn Binding(comptime T: type, comptime CT: type) type {
     };
 }
 
+/// Return type of bind() and create().
 pub fn BoundFn(comptime T: type, comptime CT: type) type {
     const FT = FnType(T);
     const f = @typeInfo(FT).@"fn";
@@ -1093,7 +1110,7 @@ test "FnType" {
     try expect(FnType(@TypeOf(&ns.foo)) == fn (i32) i32);
 }
 
-pub fn Uninlined(comptime FT: type) type {
+fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
     if (f.calling_convention != .@"inline") return FT;
     return @Type(.{
@@ -2348,6 +2365,7 @@ const windows = std.os.windows;
 const posix = std.posix;
 const page_size_min = std.heap.page_size_min;
 
+/// Duplicate of std.heap.PageAllocator that allocates pages with EXEC flag set.
 pub const ExecutablePageAllocator = struct {
     const vtable: std.mem.Allocator.VTable = .{
         .alloc = alloc,

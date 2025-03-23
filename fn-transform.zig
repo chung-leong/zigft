@@ -1,8 +1,9 @@
 const std = @import("std");
 const expect = std.testing.expect;
 
+/// Take a function that accepts a tuple as its only argument and create a new one with the tuple
+/// elements spread across the argument list.
 pub fn spreadArgs(func: anytype, comptime conv: ?std.builtin.CallingConvention) SpreadFn(@TypeOf(func), conv) {
-    @setEvalBranchQuota(200000);
     const pyramid = getPyramid(func, conv);
     const fields = getTupleFields(@TypeOf(func));
     const caller_name = std.fmt.comptimePrint("call{d}", .{fields.len});
@@ -12,6 +13,7 @@ pub fn spreadArgs(func: anytype, comptime conv: ?std.builtin.CallingConvention) 
     return @field(pyramid, caller_name);
 }
 
+/// Return type of spreadArgs().
 pub fn SpreadFn(comptime T: type, comptime conv: ?std.builtin.CallingConvention) type {
     const fields = getTupleFields(T);
     const f = @typeInfo(T).@"fn";
