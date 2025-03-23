@@ -1681,10 +1681,10 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 }
                 if (std.mem.startsWith(u8, name, "push ")) {
                     attrs.pushes = true;
-                    attrs.affects_all = std.mem.startsWith(u8, name, " all");
+                    attrs.affects_all = std.mem.endsWith(u8, name, " all");
                 } else if (std.mem.startsWith(u8, name, "pop ")) {
                     attrs.pops = true;
-                    attrs.affects_all = std.mem.startsWith(u8, name, " all");
+                    attrs.affects_all = std.mem.endsWith(u8, name, " all");
                 }
                 const index: usize = field.value;
                 table[index] = attrs;
