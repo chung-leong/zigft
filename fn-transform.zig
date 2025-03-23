@@ -3,6 +3,9 @@ const expect = std.testing.expect;
 
 /// Take a function that accepts a tuple as its only argument and create a new one with the tuple
 /// elements spread across the argument list.
+///
+/// When conv is null, the output function will have the same calling convention as the input
+/// function.
 pub fn spreadArgs(func: anytype, comptime conv: ?std.builtin.CallingConvention) SpreadFn(@TypeOf(func), conv) {
     const pyramid = getPyramid(func, conv);
     const fields = getTupleFields(@TypeOf(func));

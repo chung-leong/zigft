@@ -1,9 +1,42 @@
-# zigft
-Zig function transform library
+# Zigft
+
+Zigft is a small library that let you perform function transform in Zig. Consisting of just two 
+files, it's designed to be used as source code. Simply download the file you need from this repo 
+and place it in your `src` directory. Then import it into your own code.
+
+[`fn-transform.zig`](#fn-transformzig) provides the library's core functionality. 
+[`fn-binding.zig`](#fn-bindingzig) meanwhile gives you the ability to bind variables to a function.
+
+This project's code was developed original for [Zigar](https://github.com/chung-leong/zigar). 
+Check it out of you haven't already learned of its existence.
 
 ## fn-transform.zig
 
-Adding debug output to a function:
+`fn-transform.zig` provides a single function: 
+[`spreadArgs()`](https://chung-leong.github.io/zigft/#zigft.fn-transform.spreadArgs). It takes a
+function that accepts a tuple as the only argument and returns a new function where the tuple 
+elements are spread across the argument list. For example, if the following function is the input:
+
+```zig
+fn hello(args: std.meta.Tuple(&.{ .i8, i16, .i32, .i64 })) bool {
+    // ...;
+}
+```
+
+Then `spreadArgs(hello, null)` will return:
+
+```zig
+*const fn (i8, i16, i32, i64) bool
+```
+
+Because you have full control over the definition of the tuple at comptime, `spreadArgs()` 
+basically lets you to generate any function you want. The only limitation is that its arguments 
+cannot be `comptime` or `anytype`.
+
+It's easier to see the function's purpose in action. Here're some usage scenarios:
+
+#### Adding debug output to a function:
+
 ```zig
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
@@ -35,7 +68,8 @@ hello: { 123, 456 }
 sum = 579
 ```
 
-Uninlining an inline function:
+#### "Uninlining" an explicitly inline function:
+
 ```zig
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
@@ -82,7 +116,8 @@ pub fn main() void {
 fn address = 10deb00
 ```
 
-Converting a function that returns an error code into one that returns an error union:
+#### Converting a function that returns an error code into one that returns an error union:
+
 ```zig
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
@@ -155,6 +190,16 @@ error: CantaloupeExploded
 
 ## fn-binding.zig
 
+`fn-binding.zig` provides a [set of functions](https://chung-leong.github.io/zigft/#zigft.fn-binding)
+related to function binding. [`bind()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.bind)
+and [`unbind()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.unbind) are the pair you 
+will most likely use.
+
+The first argument to `bind()` can be either `fn (...)` or `*const fn (...)`. The second argument 
+is a tuple containing arguments for the given function. The function returned by `bind()` depends 
+on the tuple's content. If it provides a complete set of arguments, then the returned function 
+will have an empty argument list. That is the case for the following example:
+
 ```zig
 const std = @import("std");
 const fn_binding = @import("./fn-binding.zig");
@@ -175,6 +220,35 @@ hello: 4
 hello: 5
 ```
 
+If you wish to bind to arguments in the middle of the argument list while leaving preceding 
+ones unbound, you can do so with the help of explicit indices:
+
+```zig
+const std = @import("std");
+const fn_binding = @import("./fn-binding.zig");
+
+pub fn main() !void {
+    const ns = struct {
+        fn hello(a: i8, b: i16, c: i32, d: i64) void {
+            std.debug.print("a = {d}, b = {d}, c = {d}, d = {d}\n", .{ a, b, c, d });
+        }
+    };
+    const func1 = try fn_binding.bind(ns.hello, .{ .@"2" = 300 });
+    defer fn_binding.unbind(func1);
+    func1(1, 2, 4);
+    const func2 = try fn_binding.bind(ns.hello, .{ .@"-2" = 301 });
+    defer fn_binding.unbind(func2);
+    func2(1, 2, 4);
+}
+```
+```
+a = 1, b = 2, c = 300, d = 4
+a = 1, b = 2, c = 301, d = 4
+```
+
+Negative indices mean "from the end".
+
+Binding to inline functions is possible:
 
 ```zig
 const std = @import("std");
@@ -194,6 +268,15 @@ pub fn main() !void {
 sum = 126
 ```
 
+Binding to inline functions with `comptime` or `anytype` arguments is impossible, however.
+
+As you've seen already in the example involving 
+[`std.debug.print()`](https://ziglang.org/documentation/0.14.0/std/#std.debug.print), binding to 
+functions with `comptime` and `anytype` arguments is definitely possible as long as the resulting 
+function will have no such arguments. 
+
+In a `comptime` context, `bind()` would create a comptime binding. You would get basically a 
+regular, not-dynamically-generated function:
 
 ```zig
 const std = @import("std");
@@ -215,3 +298,10 @@ Woof!
 Meow!
 ???
 ```
+
+Use [`define()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.define) instead in this
+scenario if you dislike the appearance of `catch unreachable`.
+
+Function binding requires hardware-specific code. The CPU architectures listed here are currently 
+supported: `x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
+`powerpc`.
