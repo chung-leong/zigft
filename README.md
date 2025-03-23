@@ -18,7 +18,7 @@ function that accepts a tuple as the only argument and returns a new function wh
 elements are spread across the argument list. For example, if the following function is the input:
 
 ```zig
-fn hello(args: std.meta.Tuple(&.{ .i8, i16, .i32, .i64 })) bool {
+fn hello(args: std.meta.Tuple(&.{ i8, i16, i32, i64 })) bool {
     // ...;
 }
 ```
@@ -74,28 +74,26 @@ sum = 579
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
 
-pub fn Uninlined(comptime FT: type) type {
-    return switch (@typeInfo(FT)) {
-        .@"fn" => |f| @Type(.{
-            .@"fn" = .{
-                .calling_convention = switch (f.calling_convention) {
-                    .@"inline" => .auto,
-                    else => |cc| cc,
-                },
-                .is_generic = f.is_generic,
-                .is_var_args = f.is_var_args,
-                .return_type = f.return_type,
-                .params = f.params,
-            },
-        }),
-        else => @compileError("Not a function"),
-    };
+fn Uninlined(comptime FT: type) type {
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return FT;
+    return @Type(.{
+        .@"fn" = .{
+            .calling_convention = .auto,
+            .is_generic = f.is_generic,
+            .is_var_args = f.is_var_args,
+            .return_type = f.return_type,
+            .params = f.params,
+        },
+    });
 }
 
-fn uninline(comptime func: anytype) Uninlined(@TypeOf(func)) {
+fn uninline(func: anytype) Uninlined(@TypeOf(func)) {
     const FT = @TypeOf(func);
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return func;
     const ns = struct {
-        inline fn call(args: std.meta.ArgsTuple(FT)) @typeInfo(FT).@"fn".return_type.? {
+        inline fn call(args: std.meta.ArgsTuple(FT)) f.return_type.? {
             return @call(.auto, func, args);
         }
     };
@@ -272,10 +270,10 @@ Binding to inline functions with `comptime` or `anytype` arguments is impossible
 
 As you've seen already in the example involving 
 [`std.debug.print()`](https://ziglang.org/documentation/0.14.0/std/#std.debug.print), binding to 
-functions with `comptime` and `anytype` arguments is definitely possible as long as the resulting 
-function will have no such arguments. 
+functions with `comptime` and `anytype` arguments is permitted as long as the resulting function 
+will have no such arguments. 
 
-In a `comptime` context, `bind()` would create a comptime binding. You would get basically a 
+In a `comptime` context, `bind()` would create a comptime binding. You would basically get a 
 regular, not-dynamically-generated function:
 
 ```zig

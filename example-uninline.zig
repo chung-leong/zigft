@@ -1,28 +1,26 @@
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
 
-pub fn Uninlined(comptime FT: type) type {
-    return switch (@typeInfo(FT)) {
-        .@"fn" => |f| @Type(.{
-            .@"fn" = .{
-                .calling_convention = switch (f.calling_convention) {
-                    .@"inline" => .auto,
-                    else => |cc| cc,
-                },
-                .is_generic = f.is_generic,
-                .is_var_args = f.is_var_args,
-                .return_type = f.return_type,
-                .params = f.params,
-            },
-        }),
-        else => @compileError("Not a function"),
-    };
+fn Uninlined(comptime FT: type) type {
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return FT;
+    return @Type(.{
+        .@"fn" = .{
+            .calling_convention = .auto,
+            .is_generic = f.is_generic,
+            .is_var_args = f.is_var_args,
+            .return_type = f.return_type,
+            .params = f.params,
+        },
+    });
 }
 
-fn uninline(comptime func: anytype) Uninlined(@TypeOf(func)) {
+fn uninline(func: anytype) Uninlined(@TypeOf(func)) {
     const FT = @TypeOf(func);
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return func;
     const ns = struct {
-        inline fn call(args: std.meta.ArgsTuple(FT)) @typeInfo(FT).@"fn".return_type.? {
+        inline fn call(args: std.meta.ArgsTuple(FT)) f.return_type.? {
             return @call(.auto, func, args);
         }
     };
