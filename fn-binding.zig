@@ -7,16 +7,10 @@ pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*cons
     const T = @TypeOf(func);
     const CT = @TypeOf(vars);
     const binding = Binding(T, CT);
-    if (!@inComptime()) {
-        return binding.createRuntime(allocator, func, vars);
-    } else {
-        const target = switch (@typeInfo(T)) {
-            .@"fn" => func,
-            .pointer => func.*,
-            else => unreachable,
-        };
-        return binding.getComptime(target, vars);
-    }
+    return if (!@inComptime())
+        binding.createRuntime(allocator, func, vars)
+    else
+        return binding.getComptime(func, vars);
 }
 
 pub fn destroy(allocator: std.mem.Allocator, fn_ptr: *const anyopaque) void {
@@ -2977,7 +2971,7 @@ test "bind (i64 x 1 + i64 x 1, comptime)" {
     };
     const number: i64 = 1234;
     const vars = .{ .@"-1" = number };
-    const bf = comptime try bind(ns.add, vars);
+    const bf = comptime try bind(&ns.add, vars);
     try expect(@TypeOf(bf) == *const fn (i64) i64);
     defer unbind(bf);
     const sum = bf(1);
