@@ -17,17 +17,15 @@ pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*cons
     const CT = @TypeOf(vars);
     const binding = Binding(T, CT);
     if (!@inComptime()) {
-        // binding structure: [header][instructions][fn_address][context]
-        const instr_len = try binding.findInstructionLength();
+        // binding structure: [header][instructions][context]
+        const instr_len = try binding.findInstructionLength(func);
         const instr_index = std.mem.alignForward(usize, @sizeOf(Header), @alignOf(fn () void));
-        const ctx_index = std.mem.alignForward(usize, instr_index + instr_len + @sizeOf(usize), @max(@alignOf(CT), @alignOf(usize)));
-        const fn_address_index = ctx_index - @sizeOf(usize);
+        const ctx_index = std.mem.alignForward(usize, instr_index + instr_len, @alignOf(CT));
         const binding_len = ctx_index + @sizeOf(CT);
         const max_align = @max(@alignOf(Header), @alignOf(CT));
         const new_bytes = try allocator.alignedAlloc(u8, max_align, binding_len);
         const header_ptr: *Header = @ptrCast(@alignCast(new_bytes.ptr));
         const instr_slice: []u8 = new_bytes[instr_index .. instr_index + instr_len];
-        const fn_address_ptr: *usize = @ptrCast(@alignCast(new_bytes.ptr + fn_address_index));
         const ctx_ptr: *CT = @ptrCast(@alignCast(new_bytes.ptr + ctx_index));
         protect(false);
         defer protect(true);
@@ -36,14 +34,8 @@ pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*cons
             .len = @intCast(binding_len),
             .alignment = @intCast(max_align),
         };
-        try binding.encodeInstructions(instr_slice, @intFromPtr(fn_address_ptr));
+        try binding.encodeInstructions(instr_slice, @intFromPtr(ctx_ptr), func);
         ctx_ptr.* = vars;
-        const fn_ptr = switch (@typeInfo(T)) {
-            .@"fn" => &func,
-            .pointer => func,
-            else => unreachable,
-        };
-        fn_address_ptr.* = @intFromPtr(fn_ptr);
         invalidate(new_bytes);
         return @ptrCast(@alignCast(instr_slice));
     } else {
@@ -116,31 +108,68 @@ var exec_da: std.heap.DebugAllocator(.{}) = .{
 };
 const exec_allocator = exec_da.allocator();
 
-pub fn Binding(comptime T: type, comptime CT: type) type {
+fn Binding(comptime T: type, comptime CT: type) type {
     const FT = FnType(T);
     const BFT = BoundFunction(FT, CT);
     const AddressPosition = struct { offset: isize, stack_offset: isize, stack_align_mask: ?isize };
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
+    const BFArgsTuple = std.meta.ArgsTuple(BFT);
+    const ArgsTuple = init: {
+        // std.meta.ArgsTuple() fails when anytype is in the argument list
+        const params = @typeInfo(FT).@"fn".params;
+        var tuple_fields: [params.len]std.builtin.Type.StructField = undefined;
+        inline for (params, 0..) |param, index| {
+            const name = std.fmt.comptimePrint("{d}", .{index});
+            const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
+                // find the variable bound to this param, if any
+                inline for (ctx_mapping) |m| {
+                    if (std.mem.eql(u8, name, m.dest)) {
+                        // find the type (and default value) from the bound variable
+                        const ctx_fields = @typeInfo(CT).@"struct".fields;
+                        inline for (ctx_fields) |field| {
+                            if (std.mem.eql(u8, m.src, field.name))
+                                break :find .{ field.type, field.default_value_ptr };
+                        }
+                    }
+                } else break :find .{ null, null };
+            };
+            tuple_fields[index] = .{
+                .name = name,
+                .type = var_type orelse (param.type orelse unreachable),
+                .default_value_ptr = var_def_ptr,
+                .is_comptime = var_def_ptr != null,
+                .alignment = 0,
+            };
+        }
+        break :init @Type(.{
+            .@"struct" = .{
+                .is_tuple = true,
+                .layout = .auto,
+                .decls = &.{},
+                .fields = &tuple_fields,
+            },
+        });
+    };
 
     return struct {
         var instr_len: ?usize = null;
         var address_pos: ?AddressPosition = null;
 
-        fn findInstructionLength() !usize {
+        fn findInstructionLength(func: anytype) !usize {
             return instr_len orelse init: {
-                const len = try encodeInstructionsReturnLength(null, 0);
+                const len = try encodeInstructionsReturnLength(null, 0, func);
                 instr_len = len;
                 break :init len;
             };
         }
 
-        fn encodeInstructions(output: []u8, address: usize) !void {
-            _ = try encodeInstructionsReturnLength(output, address);
+        fn encodeInstructions(output: []u8, address: usize, func: anytype) !void {
+            _ = try encodeInstructionsReturnLength(output, address, func);
         }
 
-        fn encodeInstructionsReturnLength(output: ?[]u8, address: usize) !usize {
-            const trampoline = getTrampoline();
+        fn encodeInstructionsReturnLength(output: ?[]u8, address: usize, func: anytype) !usize {
+            const trampoline = getTrampoline(func);
             const trampoline_address = @intFromPtr(&trampoline);
             // find the offset of target inside the trampoline function
             const pos = address_pos orelse init: {
@@ -558,27 +587,21 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
         const RT = bf.return_type.?;
         const cc = bf.calling_convention;
 
-        fn getTrampoline() BFT {
+        fn getTrampoline(func: anytype) BFT {
             const ns = struct {
-                inline fn call(bf_args: std.meta.ArgsTuple(BFT)) RT {
+                inline fn call(bf_args: BFArgsTuple) RT {
                     // disable runtime safety so target isn't written with 0xaa when optimize = Debug
                     @setRuntimeSafety(false);
-                    // this variable will be set by dynamically generated code before the jump
-                    // using a two-element array to ensure the compiler doesn't attempt to keep it in register
+                    // this variable will be set by dynamically generated code before it jumps here;
+                    // a two-element array is used to so the compiler doesn't attempt to keep it in a register
                     var target: [2]usize = undefined;
                     // insert nop x 3 so we can find the displacement for target in the instruction stream
                     insertNOPs(&target);
-                    const fn_address_ptr: *const usize = @ptrFromInt(target[0]);
-                    const ctx_ptr: *const CT = @ptrFromInt(target[0] + @sizeOf(usize));
-                    var args: std.meta.ArgsTuple(FT) = undefined;
-                    inline for (arg_mapping) |m| {
-                        @field(args, m.dest) = @field(bf_args, m.src);
-                    }
-                    inline for (ctx_mapping) |m| {
-                        @field(args, m.dest) = @field(ctx_ptr.*, m.src);
-                    }
-                    const fn_ptr: *const FT = @ptrFromInt(fn_address_ptr.*);
-                    return @call(.never_inline, fn_ptr, args);
+                    const ctx_ptr: *const CT = @ptrFromInt(target[0]);
+                    var args: ArgsTuple = undefined;
+                    inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
+                    inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
+                    return @call(.never_inline, func, args);
                 }
             };
             return fn_transform.spreadArgs(ns.call, cc);
@@ -586,8 +609,8 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
 
         fn getComptime(comptime func: anytype, comptime vars: anytype) BFT {
             const ns = struct {
-                inline fn call(bf_args: std.meta.ArgsTuple(BFT)) RT {
-                    var args: std.meta.ArgsTuple(FT) = undefined;
+                inline fn call(bf_args: BFArgsTuple) RT {
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| {
                         @field(args, m.dest) = @field(bf_args, m.src);
                     }
@@ -927,12 +950,16 @@ pub fn BoundFunction(comptime T: type, comptime CT: type) type {
     for (params, 0..) |param, number| {
         const name = std.fmt.comptimePrint("{d}", .{number});
         if (!isMapped(&context_mapping, name)) {
+            if (param.type == null) {
+                @compileError("A variable must be bound to an 'anytype' parameter");
+            }
             new_params[index] = param;
             index += 1;
         }
     }
     var new_f = f;
     new_f.params = &new_params;
+    new_f.is_generic = false;
     return @Type(.{ .@"fn" = new_f });
 }
 
