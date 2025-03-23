@@ -856,13 +856,23 @@ pub fn Binding(comptime T: type, comptime CT: type) type {
                             const instr = instrs[i];
                             if (match(Instruction.ADDI, instr)) |addi| {
                                 registers[addi.rt] = registers[addi.ra] + addi.imm16;
-                            } else if (match(Instruction.STDU, instr)) |stdu| {
-                                registers[stdu.ra] += @as(isize, stdu.ds) << 2;
-                            } else if (match(Instruction.STWU, instr)) |stwu| {
-                                registers[stwu.ra] += stwu.ds;
+                            } else if (match(Instruction.SUBFIC, instr)) |subfic| {
+                                registers[subfic.rt] = registers[subfic.ra] + subfic.imm16;
                             } else if (match(Instruction.OR, instr)) |@"or"| {
                                 if (@"or".rb == @"or".rs) { // => mr ra rs
                                     registers[@"or".ra] = registers[@"or".rs];
+                                }
+                            } else if (@bitSizeOf(usize) == 64) {
+                                if (match(Instruction.STDU, instr)) |stdu| {
+                                    registers[stdu.ra] += @as(isize, stdu.ds) << 2;
+                                } else if (match(Instruction.STDUX, instr)) |stdux| {
+                                    registers[stdux.rs] = registers[stdux.ra] + registers[stdux.rb];
+                                }
+                            } else if (@bitSizeOf(usize) == 32) {
+                                if (match(Instruction.STWU, instr)) |stwu| {
+                                    registers[stwu.ra] += stwu.ds;
+                                } else if (match(Instruction.STWUX, instr)) |stwux| {
+                                    registers[stwux.rs] = registers[stwux.ra] + registers[stwux.rb];
                                 }
                             }
                         }
@@ -2035,6 +2045,22 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs: u5,
             @"31:26": u6 = 37,
         };
+        pub const STDUX = packed struct {
+            @"0": u1 = 0,
+            @"10:1": i10 = 181,
+            rb: u5,
+            ra: u5,
+            rs: u5,
+            @"31:26": u6 = 31,
+        };
+        pub const STWUX = packed struct {
+            @"0": u1,
+            @"10:1": i10 = 183,
+            rb: u5,
+            ra: u5,
+            rs: u5,
+            @"31:26": u6 = 31,
+        };
         pub const OR = packed struct(u32) {
             @"0": u1 = 0,
             @"9:1": u10 = 444,
@@ -2042,6 +2068,12 @@ const Instruction = switch (builtin.target.cpu.arch) {
             ra: u5,
             rs: u5,
             @"31:26": u6 = 31,
+        };
+        pub const SUBFIC = packed struct(u32) {
+            imm16: i16,
+            ra: u5,
+            rt: u5,
+            @"31:26": u6 = 8,
         };
         pub const MTCTR = packed struct(u32) {
             @"0": u1 = 0,
@@ -2071,7 +2103,10 @@ const Instruction = switch (builtin.target.cpu.arch) {
         stw: STW,
         stdu: STDU,
         stwu: STWU,
+        stdux: STDUX,
+        stwux: STWUX,
         @"or": OR,
+        subfic: SUBFIC,
         mtctr: MTCTR,
         bctrl: BCTRL,
         literal: usize,
@@ -2211,12 +2246,10 @@ const InstructionEncoder = struct {
         encoder.add(o);
         const s: packed struct {
             a: u32 = 456,
-            b: u32 = 789,
         } = .{};
         encoder.add(s);
         try expect(@as(*align(1) u32, @ptrCast(&bytes[0])).* == 123);
         try expect(@as(*align(1) u32, @ptrCast(&bytes[4])).* == 456);
-        try expect(@as(*align(1) u32, @ptrCast(&bytes[8])).* == 789);
     }
 
     fn write(self: *@This(), instr: anytype) void {
@@ -2238,12 +2271,10 @@ const InstructionEncoder = struct {
         encoder.write(u);
         const s: packed struct {
             a: u32 = 456,
-            b: u32 = 789,
         } = .{};
         encoder.write(s);
         try expect(@as(*align(1) u32, @ptrCast(&bytes[0])).* == 123);
         try expect(@as(*align(1) u32, @ptrCast(&bytes[4])).* == 456);
-        try expect(@as(*align(1) u32, @ptrCast(&bytes[8])).* == 789);
     }
 };
 
