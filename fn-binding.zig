@@ -685,7 +685,11 @@ fn Binding(comptime T: type, comptime CT: type) type {
                     const instrs: [*]const u8 = @ptrCast(ptr);
                     const nop = @intFromEnum(Instruction.Opcode.nop);
                     const sp = 4;
-                    var registers = [1]isize{0} ** 16;
+                    var registers = [1]isize{0} ** switch (@bitSizeOf(usize)) {
+                        32 => 8,
+                        64 => 16,
+                        else => unreachable,
+                    };
                     var i: usize = 0;
                     while (i < 262144) {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
@@ -727,13 +731,11 @@ fn Binding(comptime T: type, comptime CT: type) type {
                                     else => {},
                                 }
                             }
-                            const size_one: isize = @sizeOf(usize);
-                            const size_all: isize = size_one * size_one * 2;
-                            if (attrs.pushes) {
-                                registers[sp] -= if (attrs.affects_all) size_all else size_one;
-                            } else if (attrs.pops) {
-                                registers[sp] += if (attrs.affects_all) size_all else size_one;
-                            }
+                            const change: isize = if (attrs.affects_all) @sizeOf(usize) * registers.len else @sizeOf(usize);
+                            if (attrs.pushes)
+                                registers[sp] -= change
+                            else if (attrs.pops)
+                                registers[sp] += change;
                         }
                     }
                 },
