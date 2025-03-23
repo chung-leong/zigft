@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const fn_transform = @import("fn-transform.zig");
 const expect = std.testing.expect;
 
-pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BoundFunction(@TypeOf(func), @TypeOf(vars)) {
+pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf(vars)) {
     const T = @TypeOf(func);
     const CT = @TypeOf(vars);
     const binding = Binding(T, CT);
@@ -45,7 +45,7 @@ pub fn bound(comptime CT: type, fn_ptr: *const anyopaque) ?*CT {
     return null;
 }
 
-pub fn bind(func: anytype, vars: anytype) !*const BoundFunction(@TypeOf(func), @TypeOf(vars)) {
+pub fn bind(func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf(vars)) {
     return create(exec_allocator, func, vars);
 }
 
@@ -90,7 +90,7 @@ const Header = extern struct {
 
 fn Binding(comptime T: type, comptime CT: type) type {
     const FT = FnType(T);
-    const BFT = BoundFunction(FT, CT);
+    const BFT = BoundFn(FT, CT);
     const AddressPosition = struct { offset: isize, stack_offset: isize, stack_align_mask: ?isize };
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
@@ -947,7 +947,7 @@ fn Binding(comptime T: type, comptime CT: type) type {
     };
 }
 
-pub fn BoundFunction(comptime T: type, comptime CT: type) type {
+pub fn BoundFn(comptime T: type, comptime CT: type) type {
     const FT = FnType(T);
     const f = @typeInfo(FT).@"fn";
     const params = @typeInfo(FT).@"fn".params;
@@ -971,12 +971,12 @@ pub fn BoundFunction(comptime T: type, comptime CT: type) type {
     return @Type(.{ .@"fn" = new_f });
 }
 
-test "BoundFunction" {
+test "BoundFn" {
     const FT = fn (i8, i16, i32, i64) i64;
     const CT = struct {
         @"2": i32,
     };
-    const BFT = BoundFunction(FT, CT);
+    const BFT = BoundFn(FT, CT);
     try expect(BFT == fn (i8, i16, i64) i64);
 }
 
