@@ -210,6 +210,7 @@ pub fn main() !void {
     ns.fox();
 }
 ```
+```
 Woof!
 Meow!
 ???

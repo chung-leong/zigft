@@ -350,14 +350,6 @@ fn Binding(comptime T: type, comptime CT: type) type {
                 },
                 .aarch64 => {
                     if (pos.stack_align_mask) |mask| {
-                        encoder.encode(.{
-                            .sub = .{
-                                .rd = 11,
-                                .rn = 31,
-                                .imm12 = 0,
-                                .shift = 0,
-                            },
-                        });
                         // sub x10, sp, -pos.stack_offset
                         encoder.encode(.{
                             .sub = .{
