@@ -3,41 +3,12 @@ const builtin = @import("builtin");
 const fn_transform = @import("fn-transform.zig");
 const expect = std.testing.expect;
 
-const Header = extern struct {
-    signature: u64 = magic_number,
-    len: u32,
-    alignment: u16,
-    ctx_offset: u16,
-
-    const magic_number: u64 = 0x380f_fc59_7bac_4e96;
-};
-
 pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BoundFunction(@TypeOf(func), @TypeOf(vars)) {
     const T = @TypeOf(func);
     const CT = @TypeOf(vars);
     const binding = Binding(T, CT);
     if (!@inComptime()) {
-        // binding structure: [header][instructions][context]
-        const instr_len = try binding.findInstructionLength(func);
-        const instr_index = std.mem.alignForward(usize, @sizeOf(Header), @alignOf(fn () void));
-        const ctx_index = std.mem.alignForward(usize, instr_index + instr_len, @alignOf(CT));
-        const binding_len = ctx_index + @sizeOf(CT);
-        const max_align = @max(@alignOf(Header), @alignOf(CT));
-        const new_bytes = try allocator.alignedAlloc(u8, max_align, binding_len);
-        const header_ptr: *Header = @ptrCast(@alignCast(new_bytes.ptr));
-        const instr_slice: []u8 = new_bytes[instr_index .. instr_index + instr_len];
-        const ctx_ptr: *CT = @ptrCast(@alignCast(new_bytes.ptr + ctx_index));
-        protect(false);
-        defer protect(true);
-        header_ptr.* = .{
-            .ctx_offset = @intCast(ctx_index - instr_index),
-            .len = @intCast(binding_len),
-            .alignment = @intCast(max_align),
-        };
-        try binding.encodeInstructions(instr_slice, @intFromPtr(ctx_ptr), func);
-        ctx_ptr.* = vars;
-        invalidate(new_bytes);
-        return @ptrCast(@alignCast(instr_slice));
+        return binding.createRuntime(allocator, func, vars);
     } else {
         const target = switch (@typeInfo(T)) {
             .@"fn" => func,
@@ -108,6 +79,15 @@ var exec_da: std.heap.DebugAllocator(.{}) = .{
 };
 const exec_allocator = exec_da.allocator();
 
+const Header = extern struct {
+    signature: u64 = magic_number,
+    len: u32,
+    alignment: u16,
+    ctx_offset: u16,
+
+    const magic_number: u64 = 0x380f_fc59_7bac_4e96;
+};
+
 fn Binding(comptime T: type, comptime CT: type) type {
     const FT = FnType(T);
     const BFT = BoundFunction(FT, CT);
@@ -153,27 +133,134 @@ fn Binding(comptime T: type, comptime CT: type) type {
     };
 
     return struct {
-        var instr_len: ?usize = null;
+        var instr_encoded_len: ?usize = null;
         var address_pos: ?AddressPosition = null;
 
-        fn findInstructionLength(func: anytype) !usize {
-            return instr_len orelse init: {
-                const len = try encodeInstructionsReturnLength(null, 0, func);
-                instr_len = len;
+        pub fn createRuntime(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BFT {
+            // binding structure: [header][instructions][context][?fn_address]
+            const instr_index = std.mem.alignForward(usize, @sizeOf(Header), @alignOf(fn () void));
+            const instr_len = instr_encoded_len orelse init: {
+                const len = try encodeInstructions(null, 0, func);
+                instr_encoded_len = len;
                 break :init len;
             };
+            const ctx_index = std.mem.alignForward(usize, instr_index + instr_len, @alignOf(CT));
+            const fn_address_index = std.mem.alignForward(usize, ctx_index + @sizeOf(CT), @alignOf(usize));
+            const binding_len = switch (@typeInfo(@TypeOf(func))) {
+                .@"fn" => ctx_index + @sizeOf(CT),
+                .pointer => fn_address_index + @sizeOf(usize),
+                else => unreachable,
+            };
+            const max_align = @max(@alignOf(Header), @alignOf(CT));
+            const new_bytes = try allocator.alignedAlloc(u8, max_align, binding_len);
+            const header_ptr: *Header = @ptrCast(@alignCast(new_bytes.ptr));
+            const instr_slice: []u8 = new_bytes[instr_index .. instr_index + instr_len];
+            const ctx_ptr: *CT = @ptrCast(@alignCast(new_bytes.ptr + ctx_index));
+            const fn_address_ptr: *usize = @ptrCast(@alignCast(new_bytes.ptr + fn_address_index));
+            protect(false);
+            defer protect(true);
+            header_ptr.* = .{
+                .ctx_offset = @intCast(ctx_index - instr_index),
+                .len = @intCast(binding_len),
+                .alignment = @intCast(max_align),
+            };
+            const actual_instr_len = try encodeInstructions(instr_slice, @intFromPtr(ctx_ptr), func);
+            assert(instr_len == actual_instr_len);
+            ctx_ptr.* = vars;
+            if (@typeInfo(@TypeOf(func)) == .pointer) fn_address_ptr.* = @intFromPtr(func);
+            invalidate(new_bytes);
+            return @ptrCast(@alignCast(instr_slice));
         }
 
-        fn encodeInstructions(output: []u8, address: usize, func: anytype) !void {
-            _ = try encodeInstructionsReturnLength(output, address, func);
+        pub fn getComptime(comptime func: anytype, comptime vars: anytype) *const BFT {
+            const ns = struct {
+                inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
+                    var args: ArgsTuple = undefined;
+                    inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
+                    inline for (ctx_mapping) |m| @field(args, m.dest) = @field(vars, m.src);
+                    return @call(.auto, func, args);
+                }
+            };
+            return fn_transform.spreadArgs(ns.call, @typeInfo(BFT).@"fn".calling_convention);
         }
 
-        fn encodeInstructionsReturnLength(output: ?[]u8, address: usize, func: anytype) !usize {
+        fn getTrampoline(func: anytype) *const BFT {
+            const ns = struct {
+                inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
+                    // disable runtime safety so target isn't written with 0xaa when optimize = Debug
+                    @setRuntimeSafety(false);
+                    // this variable will be set by dynamically generated code before it jumps here;
+                    // a two-element array is used to so the compiler doesn't attempt to keep it in a register
+                    var target: [2]usize = undefined;
+                    // insert nop x 3 so we can find the displacement for target in the instruction stream
+                    insertNOPs(&target);
+                    const ctx_ptr: *const CT = @ptrFromInt(target[0]);
+                    var args: ArgsTuple = undefined;
+                    inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
+                    inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
+                    switch (@typeInfo(@TypeOf(func))) {
+                        .@"fn" => {
+                            return @call(.never_inline, func, args);
+                        },
+                        .pointer => {
+                            // expect address of function to be stored immediately after the context
+                            const fn_address_address = std.mem.alignForward(usize, target[0] + @sizeOf(CT), @alignOf(usize));
+                            const fn_address_ptr: *const usize = @ptrFromInt(fn_address_address);
+                            const fn_ptr: *const FT = @ptrFromInt(fn_address_ptr.*);
+                            return @call(.never_inline, fn_ptr, args);
+                        },
+                        else => unreachable,
+                    }
+                }
+            };
+            return fn_transform.spreadArgs(ns.call, @typeInfo(BFT).@"fn".calling_convention);
+        }
+
+        inline fn insertNOPs(ptr: *const anyopaque) void {
+            const asm_code =
+                \\ nop
+                \\ nop
+                \\ nop
+            ;
+            switch (builtin.target.cpu.arch) {
+                .x86_64 => asm volatile (asm_code
+                    :
+                    : [arg] "{rax}" (ptr),
+                ),
+                .aarch64 => asm volatile (asm_code
+                    :
+                    : [arg] "{x9}" (ptr),
+                ),
+                .riscv32, .riscv64 => asm volatile (asm_code
+                    :
+                    : [arg] "{x6}" (ptr),
+                ),
+                .powerpc, .powerpcle, .powerpc64, .powerpc64le => asm volatile (
+                // actual nop's would get reordered for some reason despite the use of "volatile"
+                    \\ li %r0, %r0
+                    \\ li %r0, %r0
+                    \\ li %r0, %r0        
+                    :
+                    : [arg] "{r11}" (ptr),
+                ),
+                .x86 => asm volatile (asm_code
+                    :
+                    : [arg] "{eax}" (ptr),
+                ),
+                .arm => asm volatile (asm_code
+                    :
+                    : [arg] "{r4}" (ptr),
+                ),
+                else => unreachable,
+            }
+        }
+
+        fn encodeInstructions(output: ?[]u8, address: usize, func: anytype) !usize {
             const trampoline = getTrampoline(func);
-            const trampoline_address = @intFromPtr(&trampoline);
+            const trampoline_address = @intFromPtr(trampoline);
             // find the offset of target inside the trampoline function
             const pos = address_pos orelse init: {
-                const offset = try findAddressPosition(&trampoline);
+                const offset = try findAddressPosition(trampoline);
                 address_pos = offset;
                 break :init offset;
             };
@@ -581,85 +668,6 @@ fn Binding(comptime T: type, comptime CT: type) type {
                 else => @compileError("No support for '" ++ @tagName(builtin.target.cpu.arch) ++ "'"),
             }
             return encoder.len;
-        }
-
-        const bf = @typeInfo(BFT).@"fn";
-        const RT = bf.return_type.?;
-        const cc = bf.calling_convention;
-
-        fn getTrampoline(func: anytype) BFT {
-            const ns = struct {
-                inline fn call(bf_args: BFArgsTuple) RT {
-                    // disable runtime safety so target isn't written with 0xaa when optimize = Debug
-                    @setRuntimeSafety(false);
-                    // this variable will be set by dynamically generated code before it jumps here;
-                    // a two-element array is used to so the compiler doesn't attempt to keep it in a register
-                    var target: [2]usize = undefined;
-                    // insert nop x 3 so we can find the displacement for target in the instruction stream
-                    insertNOPs(&target);
-                    const ctx_ptr: *const CT = @ptrFromInt(target[0]);
-                    var args: ArgsTuple = undefined;
-                    inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
-                    inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
-                    return @call(.never_inline, func, args);
-                }
-            };
-            return fn_transform.spreadArgs(ns.call, cc);
-        }
-
-        fn getComptime(comptime func: anytype, comptime vars: anytype) BFT {
-            const ns = struct {
-                inline fn call(bf_args: BFArgsTuple) RT {
-                    var args: ArgsTuple = undefined;
-                    inline for (arg_mapping) |m| {
-                        @field(args, m.dest) = @field(bf_args, m.src);
-                    }
-                    inline for (ctx_mapping) |m| {
-                        @field(args, m.dest) = @field(vars, m.src);
-                    }
-                    return @call(.auto, func, args);
-                }
-            };
-            return fn_transform.spreadArgs(ns.call, cc);
-        }
-
-        inline fn insertNOPs(ptr: *const anyopaque) void {
-            const asm_code =
-                \\ nop
-                \\ nop
-                \\ nop
-            ;
-            switch (builtin.target.cpu.arch) {
-                .x86_64 => asm volatile (asm_code
-                    :
-                    : [arg] "{rax}" (ptr),
-                ),
-                .aarch64 => asm volatile (asm_code
-                    :
-                    : [arg] "{x9}" (ptr),
-                ),
-                .riscv32, .riscv64 => asm volatile (asm_code
-                    :
-                    : [arg] "{x6}" (ptr),
-                ),
-                .powerpc, .powerpcle, .powerpc64, .powerpc64le => asm volatile (
-                // actual nop's would get reordered for some reason despite the use of "volatile"
-                    \\ li %r0, %r0
-                    \\ li %r0, %r0
-                    \\ li %r0, %r0        
-                    :
-                    : [arg] "{r11}" (ptr),
-                ),
-                .x86 => asm volatile (asm_code
-                    :
-                    : [arg] "{eax}" (ptr),
-                ),
-                .arm => asm volatile (asm_code
-                    :
-                    : [arg] "{r4}" (ptr),
-                ),
-                else => unreachable,
-            }
         }
 
         fn findAddressPosition(ptr: *const anyopaque) !AddressPosition {
@@ -2969,7 +2977,25 @@ test "bind (i64 x 1 + i64 x 1, comptime)" {
     };
     const number: i64 = 1234;
     const vars = .{ .@"-1" = number };
-    const bf = comptime try bind(&ns.add, vars);
+    const bf = comptime try bind(ns.add, vars);
+    try expect(@TypeOf(bf) == *const fn (i64) i64);
+    defer unbind(bf);
+    const sum = bf(1);
+    try expect(sum == 1 + 1234);
+}
+
+test "bind (i64 x 1 + i64 x 1, pointer)" {
+    const ns = struct {
+        fn add(a1: i64, a2: i64) i64 {
+            return a1 + a2;
+        }
+    };
+    var number: i64 = 1234;
+    _ = &number;
+    const vars = .{ .@"-1" = number };
+    var fn_ptr = &ns.add;
+    _ = &fn_ptr;
+    const bf = try bind(fn_ptr, vars);
     try expect(@TypeOf(bf) == *const fn (i64) i64);
     defer unbind(bf);
     const sum = bf(1);
