@@ -732,10 +732,11 @@ fn Binding(comptime T: type, comptime CT: type) type {
                                 }
                             }
                             const change: isize = if (attrs.affects_all) @sizeOf(usize) * registers.len else @sizeOf(usize);
-                            if (attrs.pushes)
-                                registers[sp] -= change
-                            else if (attrs.pops)
+                            if (attrs.pushes) {
+                                registers[sp] -= change;
+                            } else if (attrs.pops) {
                                 registers[sp] += change;
+                            }
                         }
                     }
                 },
