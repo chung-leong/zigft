@@ -300,6 +300,6 @@ Meow!
 Use [`define()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.define) instead in this
 scenario if you dislike the appearance of `catch unreachable`.
 
-Function binding requires hardware-specific code. The CPU architectures listed here are currently 
-supported: `x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
+Function binding requires hardware-specific code. CPU architectures currently supported: 
+`x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
 `powerpc`.
