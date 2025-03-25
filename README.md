@@ -329,8 +329,8 @@ Hello: 3, 123
 Hello: 4, 123
 ```
 
-Function binding requires hardware-specific code. The CPU architectures listed here are currently 
-supported: `x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
+Function binding requires hardware-specific code. CPU architectures currently supported: 
+`x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
 `powerpc`.
 
 ## Support for earlier versions of Zig
