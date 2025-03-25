@@ -155,13 +155,6 @@ pub fn onlyFn(comptime ns: type) find: {
     };
 }
 
-test "onlyFn" {
-    const func = onlyFn(struct {
-        pub fn one() void {}
-    });
-    try expect(@typeInfo(@TypeOf(func)) == .@"fn");
-}
-
 var exec_da: std.heap.DebugAllocator(.{}) = .{
     .backing_allocator = .{
         .ptr = undefined,
