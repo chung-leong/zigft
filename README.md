@@ -300,6 +300,43 @@ Meow!
 Use [`define()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.define) instead in this
 scenario if you dislike the appearance of `catch unreachable`.
 
+[`closure()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.close) lets you conveniently
+creating a closure with the help of an inline struct type:
+
+```zig
+const std = @import("std");
+const fn_binding = @import("./fn-binding.zig");
+
+pub fn main() !void {
+    var funcs: [5]*const fn (i32) void = undefined;
+    for (&funcs, 0..) |*ptr, index|
+        ptr.* = try fn_binding.close(struct {
+            number: usize,
+
+            pub fn print(self: @This(), arg: i32) void {
+                std.debug.print("Hello: {d}, {d}\n", .{ self.number, arg });
+            }
+        }, .{ .number = index });
+    defer for (funcs) |f| fn_binding.unbind(f);
+    for (funcs) |f| f(123);
+}
+```
+```
+Hello: 0, 123
+Hello: 1, 123
+Hello: 2, 123
+Hello: 3, 123
+Hello: 4, 123
+```
+
 Function binding requires hardware-specific code. The CPU architectures listed here are currently 
 supported: `x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
 `powerpc`.
+
+## Support for earlier versions of Zig
+
+Zigft is designed for Zig 0.14.0. The code in fn-transform.zig will work in 0.13.0--after you have
+replaced `.@"struct"` and `.@"fn"` with `.Struct` and `.Fn`. The code in fn-binding.zig cannot be 
+made to work in 0.13.0 when `optimize` is `Debug` due to the compiler insisting on initializing
+uninitialized variables to `0xAAA...A`.
+

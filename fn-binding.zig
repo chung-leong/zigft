@@ -7,11 +7,25 @@ const expect = std.testing.expect;
 ///
 /// The allocator should use an instance of ExecutablePageAllocator as its backing allocator.
 pub fn create(allocator: std.mem.Allocator, func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf(vars)) {
-    const binding = Binding(@TypeOf(func), @TypeOf(vars));
+    const binding = Binding(@TypeOf(func), @TypeOf(vars), null);
     return if (!@inComptime())
         binding.createRuntime(allocator, func, vars)
     else
-        return binding.getComptime(func, vars);
+        binding.getComptime(func, vars);
+}
+
+/// Create a binding with a different calling convention.
+pub fn createWithCallConv(
+    allocator: std.mem.Allocator,
+    func: anytype,
+    vars: anytype,
+    comptime cc: std.builtin.CallingConvention,
+) !*const BoundFnWithCallConv(@TypeOf(func), @TypeOf(vars), cc) {
+    const binding = Binding(@TypeOf(func), @TypeOf(vars), cc);
+    return if (!@inComptime())
+        binding.createRuntime(allocator, func, vars)
+    else
+        binding.getComptime(func, vars);
 }
 
 /// Free a binding using an user-provided allocator instead of the default.
@@ -53,6 +67,15 @@ pub fn bind(func: anytype, vars: anytype) !*const BoundFn(@TypeOf(func), @TypeOf
     return create(exec_allocator, func, vars);
 }
 
+/// Create a new function with a different calling convention and bind values to its arguments.
+pub fn bindWithCallConv(
+    func: anytype,
+    vars: anytype,
+    comptime cc: std.builtin.CallingConvention,
+) !*const BoundFnWithCallConv(@TypeOf(func), @TypeOf(vars), cc) {
+    return createWithCallConv(exec_allocator, func, vars, cc);
+}
+
 /// Free memory associated with a function binding.
 ///
 /// Nothing happens if the given pointer does not actually point at a bound function.
@@ -63,7 +86,33 @@ pub fn unbind(fn_ptr: *const anyopaque) void {
 /// Bind a function at comptime.
 pub fn define(func: anytype, vars: anytype) BoundFn(@TypeOf(func), @TypeOf(vars)) {
     if (!@inComptime()) @compileError("This function can only be called in comptime");
-    return Binding(@TypeOf(func), @TypeOf(vars)).getComptime(func, vars).*;
+    return Binding(@TypeOf(func), @TypeOf(vars), null).getComptime(func, vars).*;
+}
+
+/// Bind a function at comptime with a different calling convention.
+pub fn defineWithCallConv(
+    func: anytype,
+    vars: anytype,
+    comptime cc: std.builtin.CallingConvention,
+) BoundFn(@TypeOf(func), @TypeOf(vars)) {
+    if (!@inComptime()) @compileError("This function can only be called in comptime");
+    return Binding(@TypeOf(func), @TypeOf(vars), cc).getComptime(func, vars).*;
+}
+
+/// Create a function closure.
+pub fn close(comptime T: type, vars: T) !*const BoundFn(@TypeOf(onlyFn(T)), std.meta.Tuple(&.{T})) {
+    const func = onlyFn(T);
+    return try bind(func, .{vars});
+}
+
+/// Create a function closure with a different calling convention.
+pub fn closeWithCallConv(
+    comptime T: type,
+    vars: T,
+    comptime cc: std.builtin.CallingConvention,
+) !*const BoundFnWithCallConv(@TypeOf(onlyFn(T)), std.meta.Tuple(&.{T}), cc) {
+    const func = onlyFn(T);
+    return try bindWithCallConv(func, .{vars}, cc);
 }
 
 /// Enable or disable write protection on executable memory on platforms that has the feature.
@@ -85,6 +134,34 @@ fn invalidate(slice: []u8) void {
     }
 }
 
+/// Return the only public function that exists in the given namespace.
+pub fn onlyFn(comptime ns: type) find: {
+    const T: type = for (std.meta.declarations(ns)) |decl| {
+        const DT = @TypeOf(@field(ns, decl.name));
+        if (@typeInfo(DT) == .@"fn") break DT;
+    } else @TypeOf(undefined);
+    break :find T;
+} {
+    var fn_name: ?[]const u8 = null;
+    inline for (std.meta.declarations(ns)) |decl| {
+        if (@typeInfo(@TypeOf(@field(ns, decl.name))) == .@"fn") {
+            if (fn_name == null) fn_name = decl.name else {
+                @compileError("Found multiple public functions in " ++ @typeName(ns));
+            }
+        }
+    }
+    return if (fn_name) |name| @field(ns, name) else {
+        @compileError("Unable to find a public function in " ++ @typeName(ns));
+    };
+}
+
+test "onlyFn" {
+    const func = onlyFn(struct {
+        pub fn one() void {}
+    });
+    try expect(@typeInfo(@TypeOf(func)) == .@"fn");
+}
+
 var exec_da: std.heap.DebugAllocator(.{}) = .{
     .backing_allocator = .{
         .ptr = undefined,
@@ -102,9 +179,10 @@ const Header = extern struct {
     const magic_number: u64 = 0x380f_fc59_7bac_4e96;
 };
 
-fn Binding(comptime T: type, comptime CT: type) type {
+fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.CallingConvention) type {
     const FT = FnType(T);
-    const BFT = BoundFn(FT, CT);
+    const calling_convention: std.builtin.CallingConvention = cc orelse @typeInfo(FT).@"fn".calling_convention;
+    const BFT = BoundFnWithCallConv(FT, CT, calling_convention);
     const AddressPosition = struct { offset: isize, stack_offset: isize, stack_align_mask: ?isize };
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
@@ -195,7 +273,7 @@ fn Binding(comptime T: type, comptime CT: type) type {
                     return @call(.auto, func, args);
                 }
             };
-            return fn_transform.spreadArgs(ns.call, @typeInfo(BFT).@"fn".calling_convention);
+            return fn_transform.spreadArgs(ns.call, calling_convention);
         }
 
         fn getTrampoline(func: anytype) *const BFT {
@@ -227,7 +305,7 @@ fn Binding(comptime T: type, comptime CT: type) type {
                     }
                 }
             };
-            return fn_transform.spreadArgs(ns.call, @typeInfo(BFT).@"fn".calling_convention);
+            return fn_transform.spreadArgs(ns.call, calling_convention);
         }
 
         inline fn insertNOPs(ptr: *const anyopaque) void {
@@ -956,8 +1034,8 @@ fn Binding(comptime T: type, comptime CT: type) type {
     };
 }
 
-/// Return type of bind() and create().
-pub fn BoundFn(comptime T: type, comptime CT: type) type {
+/// Return type of bindWithCallConv(), createWithCallConv(), etc.
+pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, cc: ?std.builtin.CallingConvention) type {
     const FT = FnType(T);
     const f = @typeInfo(FT).@"fn";
     const params = @typeInfo(FT).@"fn".params;
@@ -978,7 +1056,13 @@ pub fn BoundFn(comptime T: type, comptime CT: type) type {
     var new_f = f;
     new_f.params = &new_params;
     new_f.is_generic = false;
+    if (cc) |c| new_f.calling_convention = c;
     return @Type(.{ .@"fn" = new_f });
+}
+
+/// Return type of bind(), create(), etc.
+pub fn BoundFn(comptime T: type, comptime CT: type) type {
+    return BoundFnWithCallConv(T, CT, null);
 }
 
 test "BoundFn" {
