@@ -329,6 +329,10 @@ Hello: 3, 123
 Hello: 4, 123
 ```
 
+The function in the struct can have any name. It must be the only public function.
+
+## Limitations
+
 Function binding requires hardware-specific code. CPU architectures currently supported: 
 `x86_64`, `x86`, `aarch64`, `arm`, `riscv64`, `riscv32`, `powerpc64`, `powerpc64le`, 
 `powerpc`.
