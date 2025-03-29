@@ -8,30 +8,37 @@ pub const TranslatorOptions = struct {
     substitutions: []const TypeSubstitution = &.{},
     error_type: TypeSubstitution = undefined,
     default_error: anyerror = undefined,
-    c_import_ns: type,
-    target_ns: type,
 };
 pub const TypeSubstitution = struct {
-    old: @TypeOf(.enum_literal),
-    new: @TypeOf(.enum_literal),
+    old: type,
+    new: type,
 };
+
 pub const CodeGeneratorOptions = struct {
     include_path: []const u8,
     header_paths: []const []const u8,
-    translater_name: []const u8 = "c_to_zig",
+    translater: []const u8 = "c_to_zig",
+    c_error_type: []const u8,
+    c_error_none: []const u8,
+    error_set: []const u8 = "Error",
+    c_import: []const u8 = "c",
+    c_root_struct: ?[]const u8 = null,
+    target_ns: type,
     writer_type: type = std.fs.File.Writer,
-    decl_filter_fn: fn ([]const u8) bool,
-    fn_name_fn: ?fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = null,
-    const_name_fn: ?fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = null,
-    param_name_fn: ?fn (std.mem.Allocator, []const u8, []const u8) std.mem.Allocator.Error![]const u8 = null,
-    field_name_fn: ?fn (std.mem.Allocator, []const u8, []const u8) std.mem.Allocator.Error![]const u8 = null,
-    enum_item_name_fn: ?fn (std.mem.Allocator, []const u8, []const u8) std.mem.Allocator.Error![]const u8 = null,
+
+    filter_fn: fn ([]const u8) bool,
+    fn_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg1,
+    type_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg1,
+    const_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg1,
+    param_name_fn: fn (std.mem.Allocator, []const u8, []const u8) anyerror![]const u8 = returnArg2,
+    field_name_fn: fn (std.mem.Allocator, []const u8, []const u8) anyerror![]const u8 = returnArg2,
+    enum_item_name_fn: fn (std.mem.Allocator, []const u8, []const u8) anyerror![]const u8 = returnArg2,
 };
 
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
-        const OldError = @field(options.c_import_ns, @tagName(options.error_type.old));
-        const NewError = @field(options.target_ns, @tagName(options.error_type.new));
+        const OldError = options.error_type.old;
+        const NewError = options.error_type.new;
 
         pub fn Translated(comptime OldFn: anytype, local_subs: anytype) type {
             // look for non-const pointers, scanning backward
@@ -86,9 +93,8 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         test "Translated" {
-            if (!@hasDecl(options.c_import_ns, "animal_struct")) return;
-            const OldStruct = options.c_import_ns.animal_struct;
-            const NewStruct = options.target_ns.Struct;
+            const OldStruct = options.substitutions[0].old;
+            const NewStruct = options.substitutions[0].new;
             const Fn1 = Translated(fn (i32, OldStruct) OldError, .{});
             try expect(Fn1 == fn (i32, NewStruct) NewError!void);
             const Fn2 = Translated(fn (i32, []const OldStruct) OldError, .{});
@@ -102,10 +108,10 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         const error_list = init: {
-            const es = @typeInfo(options.error_type.new).error_set.?;
-            var list: [es.len]options.error_type.new = undefined;
+            const es = @typeInfo(NewError).error_set.?;
+            var list: [es.len]NewError = undefined;
             for (es, 0..) |e, index| {
-                list[index] = @field(options.error_type.new, e.name);
+                list[index] = @field(NewError, e.name);
             }
             break :init list;
         };
@@ -136,24 +142,18 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     } else result = {};
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
-                    if (@hasField(options, "old_error_type_to_index")) {
-                        // custom error index lookup
-                        const convert = @field(options, "old_error_type_to_index");
-                        return if (convert(old_rv)) |index| error_list[index] else result;
-                    } else {
-                        // default handling, where 0 is assumed to mean no error
-                        const num = switch (@typeInfo(OldError)) {
-                            .int => old_rv,
-                            .@"enum" => @intFromEnum(old_rv),
-                        };
-                        const index: usize = @intCast(@abs(num));
-                        return if (index == 0)
-                            result
-                        else if (index - 1 < error_list.len)
-                            error_list[index - 1]
-                        else
-                            options.default_error;
-                    }
+                    // 0 is assumed to mean no error
+                    const num = switch (@typeInfo(OldError)) {
+                        .int => old_rv,
+                        .@"enum" => @intFromEnum(old_rv),
+                    };
+                    const index: usize = @intCast(@abs(num));
+                    return if (index == 0)
+                        result
+                    else if (index - 1 < error_list.len)
+                        error_list[index - 1]
+                    else
+                        options.default_error;
                 }
             };
             return fn_transform.spreadArgs(ns.call, .auto);
@@ -166,15 +166,10 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             } else .{"retval"};
             return inline for (keys) |key| {
                 // look for type in function-specific tuple first
-                if (@hasField(@TypeOf(tuple), key)) {
-                    const literal = @field(tuple, key);
-                    break @field(options.target_ns, @tagName(literal));
-                }
+                if (@hasField(@TypeOf(tuple), key)) break @field(tuple, key);
             } else inline for (options.substitutions) |sub| {
                 // then look in global list
-                const Old = @field(options.c_import_ns, @tagName(sub.old));
-                const New = @field(options.target_ns, @tagName(sub.new));
-                if (T == Old) break New;
+                if (T == sub.old) break sub.new;
             } else switch (@typeInfo(T)) {
                 .pointer => |pt| redefine: {
                     var new_pt = pt;
@@ -210,16 +205,15 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         test "Substitute" {
-            if (!@hasDecl(options.c_import_ns, "animal_struct")) return;
-            const NewStruct = options.target_ns.Struct;
-            const OldStruct = options.c_import_ns.animal_struct;
-            const NewEnum = options.target_ns.Enum;
-            const OldEnum = options.c_import_ns.animal_enum;
+            const OldStruct = options.substitutions[0].old;
+            const NewStruct = options.substitutions[0].new;
+            const OldEnum = options.substitutions[1].old;
+            const NewEnum = options.substitutions[1].new;
             const T1 = Substitute(OldStruct, .{}, 0, 1);
             try expect(T1 == NewStruct);
-            const T2 = Substitute(OldEnum, .{ .@"0" = .Enum }, 0, 1);
+            const T2 = Substitute(OldEnum, .{ .@"0" = NewEnum }, 0, 1);
             try expect(T2 == NewEnum);
-            const T3 = Substitute(OldEnum, .{ .@"-1" = .Enum }, 0, 1);
+            const T3 = Substitute(OldEnum, .{ .@"-1" = NewEnum }, 0, 1);
             try expect(T3 == NewEnum);
             const T4 = Substitute([]OldStruct, .{}, 0, 1);
             try expect(T4 == []NewStruct);
@@ -231,10 +225,30 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             try expect(T7 == ?NewStruct);
             const T8 = Substitute(anyerror!OldStruct, .{}, 0, 1);
             try expect(T8 == anyerror!NewStruct);
-            const T9 = Substitute(OldEnum, .{ .retval = .Enum }, null, 1);
+            const T9 = Substitute(OldEnum, .{ .retval = NewEnum }, null, 1);
             try expect(T9 == NewEnum);
         }
     };
+}
+
+test "Translator" {
+    const c = @cImport(@cInclude("./test/include/animal.h"));
+    const Self = struct {
+        pub const Struct = struct {
+            number1: i32,
+            nunmer2: i32,
+        };
+        pub const Enum = enum(c_uint) { dog, cat, fox };
+        pub const ErrorSet = error{ Woof, Meow, WhatDoesTheFoxSay };
+    };
+    _ = Translator(.{
+        .substitutions = &.{
+            .{ .old = c.animal_struct, .new = Self.Struct },
+            .{ .old = c.animal_status, .new = Self.Enum },
+        },
+        .error_type = .{ .old = c.animal_status, .new = Self.ErrorSet },
+        .default_error = Self.ErrorSet.Woof,
+    });
 }
 
 pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
@@ -526,8 +540,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn printDeclarations(self: *@This()) !void {
             for (self.root.container.decls) |decl| {
-                if (options.decl_filter_fn(decl.name)) {
-                    std.debug.print("{s}\n", .{decl.name});
+                if (options.filter_fn(decl.name)) {
+                    const new_name = try options.fn_name_fn(allocator, decl.name);
+                    std.debug.print("{s}\n", .{new_name});
                 }
             }
         }
@@ -538,18 +553,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         //     if (getCurrentArgList(name)) |_| return;
         //     try self.print("pub const {s}: fn (", .{name});
         // }
-
-        fn changeName(name: []const u8, kind: @TypeOf(.enum_literal), context: anytype) ![]const u8 {
-            return if (@field(options, @tagName(kind) ++ "_name_fn")) |func| run: {
-                var args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
-                args[0] = allocator;
-                args[1] = name;
-                for (context, 0..) |arg, index| {
-                    args[2 + index] = arg;
-                }
-                break :run @call(.auto, func, args);
-            } else name;
-        }
 
         // fn getCurrentArgList(name: []const u8) ?[]const []const u8 {
         //     return inline for (std.meta.declarations(options.target_ns)) |decl| {
@@ -613,40 +616,23 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
 test "CodeGenerator" {
     const ns = struct {
-        fn filterDecl(name: []const u8) bool {
+        fn filter(name: []const u8) bool {
             return std.mem.startsWith(u8, name, "animal_");
         }
 
-        fn nameDecl(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, 7, false);
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
+            return camelize(allocator, name, 7, true);
         }
     };
     _ = CodeGenerator(.{
         .include_path = "./test/include",
         .header_paths = &.{"animal.h"},
+        .c_error_type = "animal_status",
+        .c_error_none = "animal_ok",
+        .target_ns = @This(),
+        .filter_fn = ns.filter,
+        .fn_name_fn = ns.getFnName,
         .writer_type = std.fs.File.Writer,
-        .decl_filter_fn = ns.filterDecl,
-    });
-}
-
-test "Translator" {
-    const c_import_ns = @cImport(@cInclude("./test/include/animal.h"));
-    const target_ns = struct {
-        pub const Struct = struct {
-            number1: i32,
-            nunmer2: i32,
-        };
-        pub const Enum = enum(c_uint) { dog, cat, fox };
-        pub const ErrorSet = error{ Woof, Meow, WhatDoesTheFoxSay };
-    };
-    _ = Translator(.{
-        .substitutions = &.{
-            .{ .old = .animal_struct, .new = .Struct },
-        },
-        .c_import_ns = c_import_ns,
-        .target_ns = target_ns,
-        .error_type = .{ .old = .animal_status, .new = .ErrorSet },
-        .default_error = target_ns.ErrorSet.Woof,
     });
 }
 
@@ -776,4 +762,12 @@ fn remove(allocator: std.mem.Allocator, slice_ptr: anytype, index: usize) void {
         slice_ptr.* = allocator.realloc(slice_before, new_capacity) catch unreachable;
     }
     slice_ptr.*.len = new_len;
+}
+
+fn returnArg1(_: std.mem.Allocator, arg1: []const u8) std.mem.Allocator.Error![]const u8 {
+    return arg1;
+}
+
+fn returnArg2(_: std.mem.Allocator, _: []const u8, arg2: []const u8) std.mem.Allocator.Error![]const u8 {
+    return arg2;
 }

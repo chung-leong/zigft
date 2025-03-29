@@ -8,9 +8,10 @@ typedef struct {
 } animal_struct;
 
 typedef enum {
+    animal_ok,
     animal_sick,
     animal_dead,
-    animal_healthy,
+    animal_crazy,
 } animal_status;
 
 typedef enum {
