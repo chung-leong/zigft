@@ -40,6 +40,10 @@ int animal_random(int, int, int);
 animal_status animal_launch(animal_pig *pig);
 void animal_smell(const animal_hen *hen);
 
+inline int animal_road_runner(int a, int b, int c) {
+    return a + b + c;
+}
+
 int __attribute__((aligned (64))) animal_pay_soccer_with(animal_pig pig);
 
 struct evil {

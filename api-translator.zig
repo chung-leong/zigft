@@ -27,12 +27,12 @@ pub const CodeGeneratorOptions = struct {
     writer_type: type = std.fs.File.Writer,
 
     filter_fn: fn ([]const u8) bool,
-    fn_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg1,
-    type_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg1,
-    const_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg1,
-    param_name_fn: fn (std.mem.Allocator, []const u8, []const u8) anyerror![]const u8 = returnArg2,
-    field_name_fn: fn (std.mem.Allocator, []const u8, []const u8) anyerror![]const u8 = returnArg2,
-    enum_item_name_fn: fn (std.mem.Allocator, []const u8, []const u8) anyerror![]const u8 = returnArg2,
+    fn_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
+    type_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
+    const_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
+    param_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
+    field_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
+    enum_item_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
 };
 
 pub fn Translator(comptime options: TranslatorOptions) type {
@@ -253,11 +253,6 @@ test "Translator" {
 
 pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
     return struct {
-        print_count: usize,
-        root: *Type,
-        type_map: std.StringArrayHashMap(*Type),
-        writer: options.writer_type,
-
         var gpa: std.heap.DebugAllocator(.{}) = .init;
         var arena: std.heap.ArenaAllocator = .init(gpa.allocator());
         const allocator = arena.allocator();
@@ -284,17 +279,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             },
             enumeration: struct {
                 items: []EnumItem = &.{},
+                is_signed: bool,
+                is_binary: bool,
+                is_sequential: bool,
             },
             function: struct {
                 parameters: []Parameter = &.{},
-                return_value: []const u8,
+                return_type: *Type,
                 alignment: ?[]const u8,
             },
             unknown: []const u8,
-        };
-        const Parameter = struct {
-            type: *Type,
-            name: ?[]const u8 = null,
         };
         const Field = struct {
             name: []const u8,
@@ -308,16 +302,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             mutable: bool = false,
             expr: Expr = .{ .unknown = "" },
         };
+        const Parameter = struct {
+            type: *Type,
+            name: ?[]const u8 = null,
+        };
         const EnumItem = struct {
             name: []const u8,
             value: i128,
         };
+
+        print_count: usize,
+        root: *Type,
+        type_map: std.StringArrayHashMap(*Type),
+        new_name_map: std.StringArrayHashMap([]const u8),
+        writer: options.writer_type,
 
         pub fn init(writer: options.writer_type) !@This() {
             var self: @This() = .{
                 .print_count = 0,
                 .root = undefined,
                 .type_map = .init(allocator),
+                .new_name_map = .init(allocator),
                 .writer = writer,
             };
             self.root = try self.createType(.{ .container = .{ .kind = "struct" } });
@@ -331,6 +336,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         pub fn generateDiff(self: *@This()) !bool {
             // obtain declarations from header files
             try self.processHeaderFiles();
+            // move function into structs, etc.
+            try self.reorganizeDeclarations();
             // print out differences
             try self.printDeclarations();
             return self.print_count > 0;
@@ -365,10 +372,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         test "processHeaderFiles" {
-            // var self: @This() = try .init(std.io.getStdOut().writer());
-            // defer self.deinit();
-            // try self.processHeaderFiles();
-            // try expect(self.root.container.decls.len > 0);
+            var self: @This() = try .init(std.io.getStdOut().writer());
+            defer self.deinit();
+            try self.processHeaderFiles();
+            try expect(self.root.container.decls.len > 0);
         }
 
         fn processFnProto(self: *@This(), tree: Ast, proto: Ast.full.FnProto) !void {
@@ -392,7 +399,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const type_ptr = try self.createType(.{
                 .function = .{
                     .parameters = params,
-                    .return_value = nodeSlice(tree, proto.ast.return_type).?,
+                    .return_type = try self.obtainType(nodeSlice(tree, proto.ast.return_type).?),
                     .alignment = nodeSlice(tree, proto.ast.align_expr),
                 },
             });
@@ -447,20 +454,34 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     },
                 });
                 return .{ .type = ptr };
-            } else if (self.detectEnumType(tree, node)) |count| {
+            } else if (self.detectEnumType(tree, node)) |tuple| {
+                const count, const is_signed = tuple;
                 // remove decls containing integers and use them as the enum values
                 const index: usize = self.root.container.decls.len - count;
                 var items: []EnumItem = &.{};
-                for (0..count) |_| {
+                var is_sequential = true;
+                var previous_value: i128 = undefined;
+                var is_binary = count >= 4;
+                for (0..count) |i| {
                     const decl = self.root.container.decls[index];
-                    try append(allocator, &items, .{
-                        .name = decl.name,
-                        .value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable,
-                    });
+                    const value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable;
+                    try append(allocator, &items, .{ .name = decl.name, .value = value });
                     remove(allocator, &self.root.container.decls, index);
+                    if (i > 0 and is_sequential) {
+                        if (value != previous_value + 1) is_sequential = false;
+                    }
+                    if (is_binary and value != 0) {
+                        if (value < 0 or !std.math.isPowerOfTwo(value)) is_binary = false;
+                    }
+                    previous_value = value;
                 }
                 const ptr = try self.createType(.{
-                    .enumeration = .{ .items = items },
+                    .enumeration = .{
+                        .items = items,
+                        .is_signed = is_signed,
+                        .is_binary = is_binary,
+                        .is_sequential = is_sequential,
+                    },
                 });
                 return .{ .type = ptr };
             } else {
@@ -479,10 +500,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return null;
         }
 
-        fn detectEnumType(self: *@This(), tree: Ast, node: Ast.Node.Index) ?usize {
+        fn detectEnumType(self: *@This(), tree: Ast, node: Ast.Node.Index) ?std.meta.Tuple(&.{ usize, bool }) {
             // C enums get translated as either c_uint or c_int
             const expr = nodeSlice(tree, node).?;
-            if (std.mem.eql(u8, expr, "c_uint") or std.mem.eql(u8, expr, "c_int")) {
+            const is_signed_int = std.mem.eql(u8, expr, "c_int");
+            const is_unsigned_int = std.mem.eql(u8, expr, "c_uint");
+            if (is_signed_int or is_unsigned_int) {
                 // enum items are declared ahead of the type;
                 // scan backward looking for int values
                 const decls = self.root.container.decls;
@@ -493,7 +516,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         _ = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch break;
                     } else break;
                 }
-                if (count > 0) return count;
+                if (count > 0) return .{ count, is_signed_int };
             }
             return null;
         }
@@ -518,18 +541,25 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn createType(_: *@This(), info: Type) !*Type {
-            const ptr = try allocator.create(Type);
-            ptr.* = info;
-            return ptr;
+            const t = try allocator.create(Type);
+            t.* = info;
+            return t;
         }
 
         fn obtainType(self: *@This(), name: []const u8) !*Type {
             return self.type_map.get(name) orelse add: {
-                const ptr = try allocator.create(Type);
-                ptr.* = .{ .unknown = "" };
-                try self.type_map.put(name, ptr);
-                break :add ptr;
+                const t = try self.createType(.{ .unknown = "" });
+                try self.type_map.put(name, t);
+                break :add t;
             };
+        }
+
+        fn getTypeName(self: *@This(), t: *Type) ?[]const u8 {
+            var iterator = self.type_map.iterator();
+            while (iterator.next()) |item| {
+                if (item.value_ptr.* == t) return item.key_ptr.*;
+            }
+            return null;
         }
 
         fn nodeSlice(tree: Ast, node: Ast.Node.Index) ?[]const u8 {
@@ -538,21 +568,130 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return tree.source[span.start..span.end];
         }
 
-        fn printDeclarations(self: *@This()) !void {
+        fn reorganizeDeclarations(self: *@This()) !void {
             for (self.root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
                     const new_name = try options.fn_name_fn(allocator, decl.name);
-                    std.debug.print("{s}\n", .{new_name});
+                    try self.new_name_map.put(decl.name, new_name);
                 }
             }
         }
 
-        // fn printFunction(self: *@This(), decl: Declaration) !void {
-        //     const arg_list = self.getNewArgList(decl);
-        //     const name = self.name_map.get(decl.name) orelse return;
-        //     if (getCurrentArgList(name)) |_| return;
-        //     try self.print("pub const {s}: fn (", .{name});
-        // }
+        const WriteError = std.fs.File.WriteError;
+
+        fn printDeclarations(self: *@This()) WriteError!void {
+            for (self.root.container.decls) |decl| try self.printDeclaration(decl);
+        }
+
+        fn printDeclaration(self: *@This(), decl: Decl) WriteError!void {
+            if (self.new_name_map.get(decl.name)) |new_name| {
+                const mut = if (decl.mutable) "var" else "const";
+                try self.print("pub {s} {s}", .{ mut, new_name });
+                const is_function = if (decl.type) |t| check: {
+                    try self.print(": ", .{});
+                    try self.printTypeRef(t);
+                    break :check t.* == .function;
+                } else false;
+                try self.print(" = ", .{});
+                if (is_function) {} else {
+                    try self.printExpr(decl.expr);
+                }
+                try self.print(";\n", .{});
+            }
+        }
+
+        fn printExpr(self: *@This(), expr: Expr) WriteError!void {
+            switch (expr) {
+                .type => |t| try self.printTypeDecl(t),
+                .unknown => |u| try self.printUnknownRef(u),
+            }
+        }
+
+        fn printUnknownRef(self: *@This(), name: []const u8) WriteError!void {
+            // see if it's a type defined in the header file; if not, then
+            // it's probably a builtin type
+            for (self.root.container.decls) |decl| {
+                if (std.mem.eql(u8, decl.name, name)) {
+                    try self.print("{s}.{s}", .{ options.c_import, name });
+                    break;
+                }
+            } else try self.print("{s}", .{name});
+        }
+
+        fn printTypeRef(self: *@This(), t: *Type) WriteError!void {
+            if (self.getTypeName(t)) |old_name| {
+                if (self.new_name_map.get(old_name)) |new_name| {
+                    try self.print("{s}", .{new_name});
+                } else {
+                    try self.printUnknownRef(old_name);
+                }
+            } else try self.printTypeDecl(t);
+        }
+
+        fn printTypeDecl(self: *@This(), t: *Type) WriteError!void {
+            switch (t.*) {
+                .container => |c| {
+                    if (!std.mem.eql(u8, c.kind, "opaque")) try self.print("extern ", .{});
+                    if (c.fields.len == 0) {
+                        try self.print("{s} {{}}", .{c.kind});
+                    } else {
+                        try self.print("{s} {{\n", .{c.kind});
+                        for (c.fields) |field| {
+                            try self.print("{s}: ", .{field.name});
+                            try self.printTypeRef(field.type);
+                            if (field.alignment) |a| try self.print(" align({s})", .{a});
+                            try self.print(",\n", .{});
+                        }
+                        try self.print("}}", .{});
+                    }
+                },
+                .pointer => |p| {
+                    if (p.is_optional) try self.print("?", .{});
+                    switch (p.size) {
+                        .one => try self.print("*", .{}),
+                        .many => try self.print("[*", .{}),
+                        .slice => try self.print("[", .{}),
+                        .c => try self.print("[*c", .{}),
+                    }
+                    if (p.sentinel) |s| try self.print(":{s}", .{s});
+                    if (p.size != .one) try self.print("]", .{});
+                    if (p.allows_zero) try self.print("allows_zero ", .{});
+                    if (p.alignment) |a| try self.print("align({s}) ", .{a});
+                    if (p.is_volatile) try self.print("volatile ", .{});
+                    try self.printTypeRef(p.child_type);
+                },
+                .enumeration => |e| {
+                    try self.print("enum({s}) {{\n", .{if (e.is_signed) "c_int" else "c_uint"});
+                    for (e.items, 0..) |item, index| {
+                        try self.print("{s}", .{item.name});
+                        if (!e.is_sequential or (index == 0 and item.value != 0)) {
+                            if (e.is_binary) {
+                                const bit_size = std.fmt.comptimePrint("{d}", .{@bitSizeOf(c_int)});
+                                try self.print(" = 0x{b:0" ++ bit_size ++ "}", .{item.value});
+                            } else {
+                                try self.print(" = {d}", .{item.value});
+                            }
+                        }
+                        try self.print(",\n", .{});
+                    }
+                    try self.print("}}", .{});
+                },
+                .function => |f| {
+                    try self.print("fn (\n", .{});
+                    for (f.parameters) |param| {
+                        if (param.name) |n| try self.print("{s}: ", .{n});
+                        try self.printTypeRef(param.type);
+                        try self.print(",\n", .{});
+                    }
+                    try self.print(") ", .{});
+                    if (f.alignment) |a| try self.print("align({s}) ", .{a});
+                    try self.printTypeRef(f.return_type);
+                },
+                .unknown => |u| {
+                    try self.printUnknownRef(u);
+                },
+            }
+        }
 
         // fn getCurrentArgList(name: []const u8) ?[]const []const u8 {
         //     return inline for (std.meta.declarations(options.target_ns)) |decl| {
@@ -607,9 +746,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try expect(std.mem.containsAtLeast(u8, code, 1, prefix));
         }
 
-        fn print(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
+        fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
             self.print_count += 1;
-            try self.writer.print(fmt, args);
+            return self.writer.print(fmt, args);
         }
     };
 }
@@ -764,10 +903,6 @@ fn remove(allocator: std.mem.Allocator, slice_ptr: anytype, index: usize) void {
     slice_ptr.*.len = new_len;
 }
 
-fn returnArg1(_: std.mem.Allocator, arg1: []const u8) std.mem.Allocator.Error![]const u8 {
-    return arg1;
-}
-
-fn returnArg2(_: std.mem.Allocator, _: []const u8, arg2: []const u8) std.mem.Allocator.Error![]const u8 {
-    return arg2;
+fn returnArg(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+    return arg;
 }
