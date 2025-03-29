@@ -312,6 +312,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         };
 
         print_count: usize,
+        indent_needed: bool,
+        indented: bool,
         root: *Type,
         type_map: std.StringArrayHashMap(*Type),
         new_name_map: std.StringArrayHashMap([]const u8),
@@ -320,6 +322,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         pub fn init(writer: options.writer_type) !@This() {
             var self: @This() = .{
                 .print_count = 0,
+                .indent_needed = false,
+                .indented = false,
                 .root = undefined,
                 .type_map = .init(allocator),
                 .new_name_map = .init(allocator),
@@ -628,6 +632,24 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             } else try self.printTypeDecl(t);
         }
 
+        fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
+            self.print_count += 1;
+            if (std.mem.startsWith(u8, fmt, "}") or std.mem.startsWith(u8, fmt, ")")) {
+                self.indent_needed = false;
+            }
+            if (self.indent_needed and !self.indented) {
+                try self.writer.print("    ", .{});
+                self.indented = true;
+            }
+            try self.writer.print(fmt, args);
+            if (std.mem.endsWith(u8, fmt, "{\n") or std.mem.endsWith(u8, fmt, "(\n")) {
+                self.indent_needed = true;
+            }
+            if (std.mem.endsWith(u8, fmt, "\n")) {
+                self.indented = false;
+            }
+        }
+
         fn printTypeDecl(self: *@This(), t: *Type) WriteError!void {
             switch (t.*) {
                 .container => |c| {
@@ -693,31 +715,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
-        // fn getCurrentArgList(name: []const u8) ?[]const []const u8 {
-        //     return inline for (std.meta.declarations(options.target_ns)) |decl| {
-        //         if (std.mem.eql(u8, name, decl.name)) {
-        //             const func = @field(options.target_ns, decl.name);
-        //             const info = @typeInfo(func);
-        //             if (info != .@"fn") break null;
-        //             return comptime get: {
-        //                 const params = info.@"fn".params;
-        //                 var list: [params.len][]const u8 = undefined;
-        //                 for (params, 0..) |param, index| {
-        //                     list[index] = getTypeName(param.type);
-        //                 }
-        //                 break :get &list;
-        //             };
-        //         }
-        //     } else null;
-        // }
-
-        // fn getTypeName(comptime T: type) []const u8 {
-        //     const name = @typeName(T);
-        //     return if (std.mem.lastIndexOfScalar(u8, name, '.')) |index| {
-        //         return name[index + 1 ..];
-        //     } else name;
-        // }
-
         fn translateHeaderFile(_: *@This(), full_path: []const u8) ![]const u8 {
             const result = try std.process.Child.run(.{
                 .allocator = allocator,
@@ -744,11 +741,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const code = try self.translateHeaderFile(full_path);
             const prefix = std.mem.sliceTo(options.header_paths[0], '.');
             try expect(std.mem.containsAtLeast(u8, code, 1, prefix));
-        }
-
-        fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
-            self.print_count += 1;
-            return self.writer.print(fmt, args);
         }
     };
 }
