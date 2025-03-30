@@ -27,12 +27,12 @@ pub const CodeGeneratorOptions = struct {
     writer_type: type = std.fs.File.Writer,
 
     filter_fn: fn ([]const u8) bool,
-    fn_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
-    type_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
-    const_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
-    param_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
-    field_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
-    enum_item_name_fn: fn (std.mem.Allocator, []const u8) anyerror![]const u8 = returnArg,
+    fn_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
+    type_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
+    const_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
+    param_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
+    field_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
+    enum_item_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
 };
 
 pub fn Translator(comptime options: TranslatorOptions) type {
@@ -273,6 +273,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 alignment: ?[]const u8,
                 sentinel: ?[]const u8,
                 size: std.builtin.Type.Pointer.Size,
+                is_const: bool,
                 is_volatile: bool,
                 is_optional: bool,
                 allows_zero: bool,
@@ -280,8 +281,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             enumeration: struct {
                 items: []EnumItem = &.{},
                 is_signed: bool,
-                is_binary: bool,
-                is_sequential: bool,
             },
             function: struct {
                 parameters: []Parameter = &.{},
@@ -313,24 +312,30 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         print_count: usize,
         indent_needed: bool,
+        indent_level: usize,
         indented: bool,
-        root: *Type,
-        type_map: std.StringArrayHashMap(*Type),
-        new_name_map: std.StringArrayHashMap([]const u8),
+        old_root: *Type,
+        old_type_map: std.StringArrayHashMap(*Type),
+        old_name_map: std.AutoArrayHashMap(*Type, []const u8),
+        old_to_new_type_map: std.AutoArrayHashMap(*Type, *Type),
+        new_root: *Type,
+        new_name_map: std.AutoArrayHashMap(*Type, []const u8),
         writer: options.writer_type,
 
         pub fn init(writer: options.writer_type) !@This() {
-            var self: @This() = .{
+            return .{
                 .print_count = 0,
                 .indent_needed = false,
+                .indent_level = 0,
                 .indented = false,
-                .root = undefined,
-                .type_map = .init(allocator),
+                .old_root = try createType(.{ .container = .{ .kind = "struct" } }),
+                .old_type_map = .init(allocator),
+                .old_name_map = .init(allocator),
+                .old_to_new_type_map = .init(allocator),
+                .new_root = try createType(.{ .container = .{ .kind = "struct" } }),
                 .new_name_map = .init(allocator),
                 .writer = writer,
             };
-            self.root = try self.createType(.{ .container = .{ .kind = "struct" } });
-            return self;
         }
 
         pub fn deinit(_: *@This()) void {
@@ -340,8 +345,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         pub fn generateDiff(self: *@This()) !bool {
             // obtain declarations from header files
             try self.processHeaderFiles();
-            // move function into structs, etc.
-            try self.reorganizeDeclarations();
+            // create new declarations with new names
+            try self.translateDeclarations();
             // print out differences
             try self.printDeclarations();
             return self.print_count > 0;
@@ -379,7 +384,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var self: @This() = try .init(std.io.getStdOut().writer());
             defer self.deinit();
             try self.processHeaderFiles();
-            try expect(self.root.container.decls.len > 0);
+            try expect(self.old_root.container.decls.len > 0);
         }
 
         fn processFnProto(self: *@This(), tree: Ast, proto: Ast.full.FnProto) !void {
@@ -400,7 +405,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     },
                 });
             }
-            const type_ptr = try self.createType(.{
+            const type_ptr = try createType(.{
                 .function = .{
                     .parameters = params,
                     .return_type = try self.obtainType(nodeSlice(tree, proto.ast.return_type).?),
@@ -437,7 +442,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         });
                     }
                 }
-                const ptr = try self.createType(.{
+                const ptr = try createType(.{
                     .container = .{
                         .kind = tree.tokenSlice(decl.ast.main_token),
                         .fields = fields,
@@ -446,11 +451,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 return .{ .type = ptr };
             } else if (self.detectPointerType(tree, node)) |tuple| {
                 const ptr_type, const is_optional = tuple;
-                const ptr = try self.createType(.{
+                const ptr = try createType(.{
                     .pointer = .{
                         .child_type = try self.obtainType(nodeSlice(tree, ptr_type.ast.child_type).?),
                         .sentinel = nodeSlice(tree, ptr_type.ast.sentinel),
                         .size = ptr_type.size,
+                        .is_const = ptr_type.const_token != null,
                         .is_volatile = ptr_type.volatile_token != null,
                         .is_optional = is_optional,
                         .allows_zero = ptr_type.allowzero_token != null,
@@ -461,30 +467,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             } else if (self.detectEnumType(tree, node)) |tuple| {
                 const count, const is_signed = tuple;
                 // remove decls containing integers and use them as the enum values
-                const index: usize = self.root.container.decls.len - count;
+                const index: usize = self.old_root.container.decls.len - count;
                 var items: []EnumItem = &.{};
-                var is_sequential = true;
-                var previous_value: i128 = undefined;
-                var is_binary = count >= 4;
-                for (0..count) |i| {
-                    const decl = self.root.container.decls[index];
+                for (0..count) |_| {
+                    const decl = self.old_root.container.decls[index];
                     const value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable;
                     try append(allocator, &items, .{ .name = decl.name, .value = value });
-                    remove(allocator, &self.root.container.decls, index);
-                    if (i > 0 and is_sequential) {
-                        if (value != previous_value + 1) is_sequential = false;
-                    }
-                    if (is_binary and value != 0) {
-                        if (value < 0 or !std.math.isPowerOfTwo(value)) is_binary = false;
-                    }
-                    previous_value = value;
+                    remove(allocator, &self.old_root.container.decls, index);
                 }
-                const ptr = try self.createType(.{
+                const ptr = try createType(.{
                     .enumeration = .{
                         .items = items,
                         .is_signed = is_signed,
-                        .is_binary = is_binary,
-                        .is_sequential = is_sequential,
                     },
                 });
                 return .{ .type = ptr };
@@ -512,7 +506,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (is_signed_int or is_unsigned_int) {
                 // enum items are declared ahead of the type;
                 // scan backward looking for int values
-                const decls = self.root.container.decls;
+                const decls = self.old_root.container.decls;
                 var count: usize = 0;
                 while (count + 1 < decls.len) : (count += 1) {
                     const decl = decls[decls.len - count - 1];
@@ -528,42 +522,36 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn addDecl(self: *@This(), decl: Decl) !void {
             var copy = decl;
             if (decl.expr == .type) {
-                if (self.type_map.get(decl.name)) |type_ptr| {
+                if (self.old_type_map.get(decl.name)) |type_ptr| {
                     // copy type info into the existing Type object
                     type_ptr.* = decl.expr.type.*;
                     copy.expr.type = type_ptr;
                 } else {
                     // add the type under the decl name
-                    try self.type_map.put(decl.name, decl.expr.type);
+                    try self.old_type_map.put(decl.name, decl.expr.type);
+                    try self.old_name_map.put(decl.expr.type, decl.name);
                 }
             }
-            try append(allocator, &self.root.container.decls, copy);
+            try append(allocator, &self.old_root.container.decls, copy);
         }
 
         fn obtainTypeOrNull(self: *@This(), name: ?[]const u8) !?*Type {
             return if (name) |n| self.obtainType(n) else null;
         }
 
-        fn createType(_: *@This(), info: Type) !*Type {
+        fn createType(info: Type) !*Type {
             const t = try allocator.create(Type);
             t.* = info;
             return t;
         }
 
         fn obtainType(self: *@This(), name: []const u8) !*Type {
-            return self.type_map.get(name) orelse add: {
-                const t = try self.createType(.{ .unknown = "" });
-                try self.type_map.put(name, t);
+            return self.old_type_map.get(name) orelse add: {
+                const t = try createType(.{ .unknown = name });
+                try self.old_type_map.put(name, t);
+                try self.old_name_map.put(t, name);
                 break :add t;
             };
-        }
-
-        fn getTypeName(self: *@This(), t: *Type) ?[]const u8 {
-            var iterator = self.type_map.iterator();
-            while (iterator.next()) |item| {
-                if (item.value_ptr.* == t) return item.key_ptr.*;
-            }
-            return null;
         }
 
         fn nodeSlice(tree: Ast, node: Ast.Node.Index) ?[]const u8 {
@@ -572,82 +560,164 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return tree.source[span.start..span.end];
         }
 
-        fn reorganizeDeclarations(self: *@This()) !void {
-            for (self.root.container.decls) |decl| {
+        fn translateDeclarations(self: *@This()) !void {
+            for (self.old_root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
-                    const new_name = try options.fn_name_fn(allocator, decl.name);
-                    try self.new_name_map.put(decl.name, new_name);
+                    // get name in target namespace
+                    const new_name = if (decl.type != null and decl.type.?.* == .function)
+                        try options.fn_name_fn(allocator, decl.name)
+                    else switch (decl.expr) {
+                        .type => try options.type_name_fn(allocator, decl.name),
+                        .unknown => try options.const_name_fn(allocator, decl.name),
+                    };
+                    const new_decl_t = if (decl.type) |t| try self.obtainTranslatedType(t) else null;
+                    const expr: Expr = switch (decl.expr) {
+                        .type => |t| translate: {
+                            const new_t = try self.obtainTranslatedType(t);
+                            try self.new_name_map.put(new_t, new_name);
+                            break :translate .{ .type = new_t };
+                        },
+                        .unknown => |u| .{ .unknown = u },
+                    };
+                    try append(allocator, &self.new_root.container.decls, .{
+                        .name = new_name,
+                        .type = new_decl_t,
+                        .alignment = decl.alignment,
+                        .mutable = false,
+                        .expr = expr,
+                    });
                 }
+            }
+        }
+
+        fn translateField(self: *@This(), field: Field) !Field {
+            const new_name = try options.field_name_fn(allocator, field.name);
+            return .{
+                .name = new_name,
+                .type = try self.obtainTranslatedType(field.type),
+                .alignment = field.alignment,
+            };
+        }
+
+        fn translateParameter(self: *@This(), param: Parameter) !Parameter {
+            const new_name = if (param.name) |n| try options.param_name_fn(allocator, n) else null;
+            return .{
+                .name = new_name,
+                .type = try self.obtainTranslatedType(param.type),
+            };
+        }
+
+        fn translateEnumItem(_: *@This(), item: EnumItem) !EnumItem {
+            const new_name = try options.enum_item_name_fn(allocator, item.name);
+            return .{
+                .name = new_name,
+                .value = item.value,
+            };
+        }
+
+        fn obtainTranslatedType(self: *@This(), t: *Type) std.mem.Allocator.Error!*Type {
+            return self.old_to_new_type_map.get(t) orelse add: {
+                const new_t = try createType(try self.translateType(t));
+                try self.old_to_new_type_map.put(t, new_t);
+                break :add new_t;
+            };
+        }
+
+        fn translateType(self: *@This(), t: *Type) !Type {
+            switch (t.*) {
+                .container => |c| {
+                    var new_fields: []Field = &.{};
+                    for (c.fields) |field| {
+                        const new_field = try self.translateField(field);
+                        try append(allocator, &new_fields, new_field);
+                    }
+                    return .{
+                        .container = .{
+                            .kind = c.kind,
+                            .fields = new_fields,
+                        },
+                    };
+                },
+                .pointer => |p| {
+                    return .{
+                        .pointer = .{
+                            .child_type = try self.obtainTranslatedType(p.child_type),
+                            .alignment = p.alignment,
+                            .sentinel = p.sentinel,
+                            .size = p.size,
+                            .is_const = p.is_const,
+                            .is_volatile = p.is_volatile,
+                            .is_optional = p.is_optional,
+                            .allows_zero = p.allows_zero,
+                        },
+                    };
+                },
+                .enumeration => |e| {
+                    var new_items: []EnumItem = &.{};
+                    for (e.items) |item| {
+                        const new_field = try self.translateEnumItem(item);
+                        try append(allocator, &new_items, new_field);
+                    }
+                    return .{
+                        .enumeration = .{
+                            .items = new_items,
+                            .is_signed = e.is_signed,
+                        },
+                    };
+                },
+                .function => |f| {
+                    var new_params: []Parameter = &.{};
+                    // TODO adjust argument list
+                    for (f.parameters, 0..) |param, index| {
+                        _ = index;
+                        const new_param = try self.translateParameter(param);
+                        try append(allocator, &new_params, new_param);
+                    }
+                    // TODO change type
+                    const return_type = try self.obtainTranslatedType(f.return_type);
+                    return .{
+                        .function = .{
+                            .parameters = new_params,
+                            .return_type = return_type,
+                            .alignment = f.alignment,
+                        },
+                    };
+                },
+                .unknown => |u| {
+                    return .{ .unknown = u };
+                },
             }
         }
 
         const WriteError = std.fs.File.WriteError;
 
         fn printDeclarations(self: *@This()) WriteError!void {
-            for (self.root.container.decls) |decl| try self.printDeclaration(decl);
+            for (self.new_root.container.decls) |decl| try self.printDeclaration(decl);
         }
 
         fn printDeclaration(self: *@This(), decl: Decl) WriteError!void {
-            if (self.new_name_map.get(decl.name)) |new_name| {
-                const mut = if (decl.mutable) "var" else "const";
-                try self.print("pub {s} {s}", .{ mut, new_name });
-                const is_function = if (decl.type) |t| check: {
-                    try self.print(": ", .{});
-                    try self.printTypeRef(t);
-                    break :check t.* == .function;
-                } else false;
-                try self.print(" = ", .{});
-                if (is_function) {} else {
-                    try self.printExpr(decl.expr);
-                }
-                try self.print(";\n", .{});
+            const mut = if (decl.mutable) "var" else "const";
+            try self.print("pub {s} {s}", .{ mut, decl.name });
+            if (decl.type) |t| {
+                try self.print(": ", .{});
+                try self.printTypeRef(t);
             }
+            try self.print(" = ", .{});
+            try self.printExpr(decl.expr);
+            try self.print(";\n\n", .{});
         }
 
         fn printExpr(self: *@This(), expr: Expr) WriteError!void {
             switch (expr) {
                 .type => |t| try self.printTypeDecl(t),
-                .unknown => |u| try self.printUnknownRef(u),
+                .unknown => |u| try self.print("{s}", .{u}),
             }
-        }
-
-        fn printUnknownRef(self: *@This(), name: []const u8) WriteError!void {
-            // see if it's a type defined in the header file; if not, then
-            // it's probably a builtin type
-            for (self.root.container.decls) |decl| {
-                if (std.mem.eql(u8, decl.name, name)) {
-                    try self.print("{s}.{s}", .{ options.c_import, name });
-                    break;
-                }
-            } else try self.print("{s}", .{name});
         }
 
         fn printTypeRef(self: *@This(), t: *Type) WriteError!void {
-            if (self.getTypeName(t)) |old_name| {
-                if (self.new_name_map.get(old_name)) |new_name| {
-                    try self.print("{s}", .{new_name});
-                } else {
-                    try self.printUnknownRef(old_name);
-                }
+            if (self.new_name_map.get(t)) |name| {
+                try self.print("{s}", .{name});
             } else try self.printTypeDecl(t);
-        }
-
-        fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
-            self.print_count += 1;
-            if (std.mem.startsWith(u8, fmt, "}") or std.mem.startsWith(u8, fmt, ")")) {
-                self.indent_needed = false;
-            }
-            if (self.indent_needed and !self.indented) {
-                try self.writer.print("    ", .{});
-                self.indented = true;
-            }
-            try self.writer.print(fmt, args);
-            if (std.mem.endsWith(u8, fmt, "{\n") or std.mem.endsWith(u8, fmt, "(\n")) {
-                self.indent_needed = true;
-            }
-            if (std.mem.endsWith(u8, fmt, "\n")) {
-                self.indented = false;
-            }
         }
 
         fn printTypeDecl(self: *@This(), t: *Type) WriteError!void {
@@ -678,18 +748,49 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     if (p.sentinel) |s| try self.print(":{s}", .{s});
                     if (p.size != .one) try self.print("]", .{});
                     if (p.allows_zero) try self.print("allows_zero ", .{});
+                    if (p.is_const) try self.print("const ", .{});
                     if (p.alignment) |a| try self.print("align({s}) ", .{a});
                     if (p.is_volatile) try self.print("volatile ", .{});
                     try self.printTypeRef(p.child_type);
                 },
                 .enumeration => |e| {
                     try self.print("enum({s}) {{\n", .{if (e.is_signed) "c_int" else "c_uint"});
+                    const is_sequential = for (e.items, 0..) |item, index| {
+                        if (index > 0 and item.value != e.items[index - 1].value + 1) break false;
+                    } else true;
+                    const is_binary = for (e.items) |item| {
+                        if (item.value < 0) break false;
+                        if (item.value > 0 and !std.math.isPowerOfTwo(item.value)) break false;
+                    } else true;
+                    const is_hexidecimal = !is_sequential and for (e.items) |item| {
+                        if (item.value < 0) break false;
+                    } else true;
+                    const max_width = find: {
+                        var width: usize = 0;
+                        for (e.items) |item| {
+                            width = @max(width, @bitSizeOf(@TypeOf(item.value)) - @clz(item.value) + 1);
+                        }
+                        break :find width;
+                    };
                     for (e.items, 0..) |item, index| {
                         try self.print("{s}", .{item.name});
-                        if (!e.is_sequential or (index == 0 and item.value != 0)) {
-                            if (e.is_binary) {
-                                const bit_size = std.fmt.comptimePrint("{d}", .{@bitSizeOf(c_int)});
-                                try self.print(" = 0x{b:0" ++ bit_size ++ "}", .{item.value});
+                        if (!is_sequential or (index == 0 and item.value != 0)) {
+                            if (is_binary) {
+                                inline for (.{ 64, 32, 16, 8 }) |bits| {
+                                    if (max_width > bits or bits == 8) {
+                                        const width = std.fmt.comptimePrint("{d}", .{bits});
+                                        try self.print(" = 0b{b:0" ++ width ++ "}", .{item.value});
+                                        break;
+                                    }
+                                }
+                            } else if (is_hexidecimal) {
+                                inline for (.{ 64, 32, 16, 8 }) |bits| {
+                                    if (max_width > bits or bits == 8) {
+                                        const width = std.fmt.comptimePrint("{d}", .{bits / 4});
+                                        try self.print(" = 0x{x:0" ++ width ++ "}", .{item.value});
+                                        break;
+                                    }
+                                }
                             } else {
                                 try self.print(" = {d}", .{item.value});
                             }
@@ -710,8 +811,30 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.printTypeRef(f.return_type);
                 },
                 .unknown => |u| {
-                    try self.printUnknownRef(u);
+                    try self.print("{s}", .{u});
                 },
+            }
+        }
+
+        fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
+            self.print_count += 1;
+            if (std.mem.startsWith(u8, fmt, "}") or std.mem.startsWith(u8, fmt, ")")) {
+                self.indent_needed = false;
+                self.indent_level -= 1;
+            }
+            if (self.indent_level > 0 and !self.indented) {
+                for (0..self.indent_level) |_| {
+                    try self.writer.print("    ", .{});
+                }
+                self.indented = true;
+            }
+            try self.writer.print(fmt, args);
+            if (std.mem.endsWith(u8, fmt, "{\n") or std.mem.endsWith(u8, fmt, "(\n")) {
+                self.indent_needed = true;
+                self.indent_level += 1;
+            }
+            if (std.mem.endsWith(u8, fmt, "\n")) {
+                self.indented = false;
             }
         }
 
@@ -751,8 +874,17 @@ test "CodeGenerator" {
             return std.mem.startsWith(u8, name, "animal_");
         }
 
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) anyerror![]const u8 {
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, 7, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
             return camelize(allocator, name, 7, true);
+        }
+
+        fn getEnumItemName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            const index = if (std.mem.lastIndexOfScalar(u8, name, '_')) |i| i + 1 else 0;
+            return snakify(allocator, name, index);
         }
     };
     _ = CodeGenerator(.{
@@ -762,7 +894,9 @@ test "CodeGenerator" {
         .c_error_none = "animal_ok",
         .target_ns = @This(),
         .filter_fn = ns.filter,
+        .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
+        .enum_item_name_fn = ns.getEnumItemName,
         .writer_type = std.fs.File.Writer,
     });
 }
