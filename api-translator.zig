@@ -2,18 +2,18 @@ const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
 
 const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-pub const TranslatorOptions = struct {
-    substitutions: []const TypeSubstitution = &.{},
-    error_type: TypeSubstitution = undefined,
-    default_error: anyerror = undefined,
-};
 pub const TypeSubstitution = struct {
     old: type,
     new: type,
 };
-
+pub const TranslatorOptions = struct {
+    substitutions: []const TypeSubstitution = &.{},
+    error_scheme: type,
+    ignore_cb_status: bool = true,
+};
 pub const CodeGeneratorOptions = struct {
     include_path: []const u8,
     header_paths: []const []const u8,
@@ -27,38 +27,148 @@ pub const CodeGeneratorOptions = struct {
     writer_type: type = std.fs.File.Writer,
 
     filter_fn: fn ([]const u8) bool,
-    fn_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
-    type_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
-    const_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
-    param_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
-    field_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
-    enum_item_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = returnArg,
+    fn_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    type_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    const_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    param_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    field_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    enum_item_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+
+    fn none(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+        return arg;
+    }
 };
+
+pub fn inferErrorScheme(
+    comptime OldStatusEnum: type,
+    def_status: OldStatusEnum,
+    comptime NewErrorSet: type,
+    def_error: NewErrorSet,
+) type {
+    const pos_statuses, const neg_statuses = comptime find: {
+        const e = @typeInfo(OldStatusEnum).@"enum";
+        var p_statuses: [e.fields.len]OldStatusEnum = undefined;
+        var n_statuses: [e.fields.len]OldStatusEnum = undefined;
+        var p_count: usize = 0;
+        var n_count: usize = 0;
+        for (e.fields) |field| {
+            if (field.value > 0) {
+                p_statuses[p_count] = @field(OldStatusEnum, field.name);
+                p_count += 1;
+            } else if (field.value < 0) {
+                n_statuses[n_count] = @field(OldStatusEnum, field.name);
+                n_count += 1;
+            }
+        }
+        var p_array: [p_count]OldStatusEnum = undefined;
+        var n_array: [n_count]OldStatusEnum = undefined;
+        for (&p_array, 0..) |*ptr, i| ptr.* = p_statuses[i];
+        for (&n_array, 0..) |*ptr, i| ptr.* = n_statuses[i];
+        break :find .{ p_array, n_array };
+    };
+    return struct {
+        pub const Status = OldStatusEnum;
+        pub const ErrorSet = NewErrorSet;
+        pub const PositiveStatus = if (neg_statuses.len == 0 or pos_statuses.len == 0)
+            void
+        else if (neg_statuses.len > 0 and pos_statuses.len == 1)
+            bool
+        else
+            Status;
+        pub const Result = union {
+            value: PositiveStatus,
+            err: ErrorSet,
+        };
+        pub const ok: Status = @enumFromInt(0);
+
+        const error_list = init: {
+            const es = @typeInfo(ErrorSet).error_set.?;
+            var list: [es.len]ErrorSet = undefined;
+            for (es, 0..) |e, index| {
+                list[index] = @field(ErrorSet, e.name);
+            }
+            break :init list;
+        };
+        const status_list = init: {
+            const slice = if (neg_statuses.len == 0)
+                // positive statuses are error code
+                pos_statuses
+            else
+                // negative statuses are error code
+                neg_statuses;
+            var array: [slice.len]Status = undefined;
+            for (slice, 0..) |value, index| array[index] = value;
+            break :init array;
+        };
+
+        pub fn fromEnum(arg: Status) Result {
+            const int = @intFromEnum(arg);
+            if (int != 0) {
+                const index = std.mem.indexOfScalar(@TypeOf(int), &status_list, int) orelse std.math.maxInt(usize);
+                return .{ .err = switch (index < error_list.len) {
+                    true => error_list[index],
+                    false => def_error,
+                } };
+            }
+            return .{
+                .value = switch (PositiveStatus) {
+                    void => {},
+                    bool => int == 0,
+                    Status => @enumFromInt(int),
+                },
+            };
+        }
+
+        pub fn toEnum(arg: Result) Status {
+            return switch (arg) {
+                .value => switch (PositiveStatus) {
+                    void => @enumFromInt(0),
+                    bool => @enumFromInt(if (arg) 0 else 1),
+                    Status => arg,
+                },
+                .err => get: {
+                    const err_index = std.mem.indexOfScalar(ErrorSet, error_list, arg) orelse std.math.maxInt(usize);
+                    break :get if (err_index < status_list.len)
+                        @enumFromInt(status_list[err_index])
+                    else
+                        def_status;
+                },
+            };
+        }
+    };
+}
 
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
-        const OldError = options.error_type.old;
-        const NewError = options.error_type.new;
-
-        pub fn Translated(comptime OldFn: anytype, local_subs: anytype) type {
-            // look for non-const pointers, scanning backward
+        pub fn Translated(
+            comptime OldFn: anytype,
+            comptime can_fail: bool,
+            comptime ignore_status: bool,
+            comptime local_subs: anytype,
+        ) type {
             const old_fn = @typeInfo(OldFn).@"fn";
             const OldRT = old_fn.return_type.?;
-            const extra = if (OldRT != OldError and OldRT != void) 1 else 0;
+            const extra = switch (ignore_status) {
+                true => 0,
+                false => switch (can_fail) {
+                    // room for an extra type when there're multiple status codes indicating success
+                    true => if (options.error_scheme.PositiveStatus != void) 1 else 0,
+                    // room for an extra type when the return value isn't an error code or void
+                    false => if (OldRT != void) 1 else 0,
+                },
+            };
+            // look for non-const pointers, scanning backward
             const OutputTypes = init: {
-                // room for an extra type when the return value of the function isn't OldError or void
                 var types: [old_fn.params.len + extra]type = undefined;
                 if (extra == 1) {
-                    types[old_fn.params.len] = Substitute(OldRT, local_subs, null, old_fn.params.len);
+                    types[old_fn.params.len] = switch (can_fail) {
+                        true => options.error_scheme.PositiveStatus,
+                        false => Substitute(OldRT, local_subs, null, old_fn.params.len),
+                    };
                 }
                 const start_index = inline for (0..old_fn.params.len) |j| {
                     const i = old_fn.params.len - j - 1;
-                    const info = @typeInfo(old_fn.params[i].type.?);
-                    if (info != .pointer or info.pointer.is_const) break i + 1;
-                    const Target = switch (@typeInfo(info.pointer.child)) {
-                        .optional => |op| op.child,
-                        else => info.pointer.child,
-                    };
+                    const Target = WritableTarget(old_fn.params[i].type.?) orelse break i + 1;
                     types[i] = Substitute(Target, local_subs, i, old_fn.params.len);
                 } else 0;
                 break :init types[start_index..];
@@ -80,7 +190,8 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 1 => OutputTypes[0],
                 else => std.meta.Tuple(OutputTypes),
             };
-            const NewRT = if (OldRT == OldError) NewError!Payload else Payload;
+            const NewError = options.error_scheme.ErrorSet;
+            const NewRT = if (can_fail) NewError!Payload else Payload;
             return @Type(.{
                 .@"fn" = .{
                     .calling_convention = .auto,
@@ -95,68 +206,203 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         test "Translated" {
             const OldStruct = options.substitutions[0].old;
             const NewStruct = options.substitutions[0].new;
-            const Fn1 = Translated(fn (i32, OldStruct) OldError, .{});
-            try expect(Fn1 == fn (i32, NewStruct) NewError!void);
-            const Fn2 = Translated(fn (i32, []const OldStruct) OldError, .{});
-            try expect(Fn2 == fn (i32, []const NewStruct) NewError!void);
-            const Fn3 = Translated(fn (i32, *OldStruct) OldError, .{});
-            try expect(Fn3 == fn (i32) NewError!NewStruct);
-            const Fn4 = Translated(fn (i32, *bool, *OldStruct) OldError, .{});
-            try expect(Fn4 == fn (i32) NewError!std.meta.Tuple(&.{ bool, NewStruct }));
-            const Fn5 = Translated(fn (i32, OldStruct) bool, .{});
-            try expect(Fn5 == fn (i32, NewStruct) bool);
+            const NewError = options.error_scheme.ErrorSet;
+            const OldError = c_uint;
+            const Fn1 = Translated(fn (i32, OldStruct) OldError, true, false, .{});
+            try expectEqual(Fn1, fn (i32, NewStruct) NewError!void);
+            const Fn2 = Translated(fn (i32, []const OldStruct) OldError, true, false, .{});
+            try expectEqual(Fn2, fn (i32, []const NewStruct) NewError!void);
+            const Fn3 = Translated(fn (i32, *OldStruct) OldError, true, false, .{});
+            try expectEqual(Fn3, fn (i32) NewError!NewStruct);
+            const Fn4 = Translated(fn (i32, *bool, *OldStruct) OldError, true, false, .{});
+            try expectEqual(Fn4, fn (i32) NewError!std.meta.Tuple(&.{ bool, NewStruct }));
+            const Fn5 = Translated(fn (i32, OldStruct) bool, false, false, .{});
+            try expectEqual(Fn5, fn (i32, NewStruct) bool);
+            const Fn6 = Translated(fn (i32, OldStruct) c_int, false, false, .{});
+            try expectEqual(Fn6, fn (i32, NewStruct) c_int);
+            const Fn7 = Translated(fn (i32, OldStruct) c_int, false, true, .{});
+            try expectEqual(Fn7, fn (i32, NewStruct) void);
         }
 
-        const error_list = init: {
-            const es = @typeInfo(NewError).error_set.?;
-            var list: [es.len]NewError = undefined;
-            for (es, 0..) |e, index| {
-                list[index] = @field(NewError, e.name);
-            }
-            break :init list;
-        };
-
-        pub fn translate(comptime func: anytype) Translated(@TypeOf(func)) {
+        pub fn translate(
+            comptime func: anytype,
+            comptime can_fail: bool,
+            comptime ignore_status: bool,
+            local_subs: anytype,
+        ) Translated(@TypeOf(func), can_fail, ignore_status, local_subs) {
             const OldFn = @TypeOf(func);
-            const NewFn = Translated(OldFn);
-            const RT = @typeInfo(NewFn).@"fn".return_type.?;
-            const Payload = @typeInfo(RT).error_union.payload;
+            const NewFn = Translated(OldFn, can_fail, ignore_status, local_subs);
+            const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
+            const Payload = @typeInfo(NewRT).error_union.payload;
             const ns = struct {
-                inline fn call(new_args: std.meta.ArgsTuple(NewFn)) RT {
+                inline fn call(new_args: std.meta.ArgsTuple(NewFn)) NewRT {
                     var old_args: std.meta.ArgsTuple(OldFn) = undefined;
                     // copy arguments
-                    inline for (new_args, 0..) |new_arg, index| {
-                        old_args[index] = @bitCast(new_arg);
+                    inline for (new_args, 0..) |new_arg, i| {
+                        const ArgT = @TypeOf(old_args[i]);
+                        old_args[i] = cast(ArgT, new_arg);
                     }
-                    var result: Payload = undefined;
-                    if (Payload != void) {
-                        // add pointers to result
-                        const outputs = old_args.len - new_args.len;
-                        if (outputs == 1) {
-                            old_args[old_args.len - 1] = @ptrCast(&result);
-                        } else {
-                            for (new_args.len..old_args.len) |i| {
-                                old_args[i] = @ptrCast(&result[i - new_args.len]);
-                            }
-                        }
-                    } else result = {};
+                    var payload: Payload = if (Payload == void) {} else undefined;
+                    // see how many pointers and tuple fields there're
+                    const pointer_count = old_args.len - new_args.len;
+                    const output_count = switch (@typeInfo(Payload)) {
+                        .@"struct" => |st| if (st.is_tuple) payload.len else 1,
+                        .void => 0,
+                        else => 1,
+                    };
+                    const extra = output_count - pointer_count;
+                    const last = if (output_count > 1) payload.len - 1 else 0;
+                    // add pointers to result
+                    switch (output_count) {
+                        1 => old_args[new_args.len] = @ptrCast(&payload),
+                        else => for (new_args.len..old_args.len) |i| {
+                            const ArgT = @TypeOf(old_args[i]);
+                            old_args[i] = cast(ArgT, &payload[i - new_args.len]);
+                        },
+                    }
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
-                    // 0 is assumed to mean no error
-                    const num = switch (@typeInfo(OldError)) {
-                        .int => old_rv,
-                        .@"enum" => @intFromEnum(old_rv),
-                    };
-                    const index: usize = @intCast(@abs(num));
-                    return if (index == 0)
-                        result
-                    else if (index - 1 < error_list.len)
-                        error_list[index - 1]
-                    else
-                        options.default_error;
+                    if (can_fail) {
+                        // see if the call encountered an error
+                        const status: options.error_scheme.Status = @bitCast(old_rv);
+                        switch (options.error_scheme.fromStatus(status)) {
+                            .err => |e| return e,
+                            .value => |v| if (extra > 0) {
+                                // add status to result
+                                if (last > 0) {
+                                    payload[last] = v;
+                                } else {
+                                    payload = v;
+                                }
+                            },
+                        }
+                    } else if (extra > 0) {
+                        if (last > 0) {
+                            payload[last] = cast(@TypeOf(payload[last]), old_rv);
+                        } else {
+                            payload = cast(@TypeOf(payload), old_rv);
+                        }
+                    }
+                    return payload;
                 }
             };
             return fn_transform.spreadArgs(ns.call, .auto);
+        }
+
+        test "translate" {
+            const c = @cImport(@cInclude("./test/include/animal.h"));
+            const cow = options.substitutions[2];
+            const hen = options.substitutions[3];
+            const pig = options.substitutions[4];
+            const ErrorSet = options.error_scheme.ErrorSet;
+            const func1 = translate(c.animal_mate, true, false, .{});
+            try expectEqual(@TypeOf(func1), fn (cow.new, hen.new) ErrorSet!pig.new);
+        }
+
+        pub fn translateCallback(
+            comptime FT: type,
+            comptime func: Translated(FT, true, options.ignore_cb_status, .{}),
+        ) *const FT {
+            const NewCallbackFn = @TypeOf(func);
+            const OldCallbackFn = FT;
+            const NewRT = @typeInfo(NewCallbackFn).@"fn".return_type.?;
+            const OldRT = @typeInfo(OldCallbackFn).@"fn".return_type.?;
+            const Payload = @typeInfo(NewRT).error_union.payload;
+            const ns = struct {
+                inline fn call(old_args: std.meta.ArgsTuple(OldCallbackFn)) OldRT {
+                    var new_args: std.meta.ArgsTuple(NewCallbackFn) = undefined;
+                    // copy arguments
+                    inline for (0..new_args.len) |i| {
+                        new_args[i] = cast(@TypeOf(new_args[i]), old_args[i]);
+                    }
+                    // call new callback
+                    var result: options.error_scheme.Result = undefined;
+                    if (@call(.auto, func, new_args)) |payload| {
+                        // set pointers
+                        const pointer_count = old_args.len - new_args.len;
+                        const output_count = switch (@typeInfo(Payload)) {
+                            .@"struct" => |st| if (st.is_tuple) payload.len else 1,
+                            .void => 0,
+                            else => 1,
+                        };
+                        const last = if (output_count > 1) payload.len - 1 else 0;
+                        const extra = output_count - pointer_count;
+                        inline for (new_args.len..old_args.len) |i| {
+                            const j = i - new_args.len;
+                            const ptr = old_args[i].*;
+                            if (ptr != null) ptr.* = payload[j];
+                        }
+                        if (extra > 0) {
+                            result = .{ .value = if (last > 0) payload[last] else payload };
+                        } else {
+                            result = .{ .value = {} };
+                        }
+                    } else |err| {
+                        result = .{ .err = err };
+                    }
+                    if (OldRT != void) {
+                        const status = options.error_scheme.toEnum(result);
+                        return @bitCast(status);
+                    }
+                }
+            };
+            return fn_transform.spreadArgs(ns.call, .c);
+        }
+
+        fn cast(comptime T: type, arg: anytype) T {
+            return switch (@typeInfo(T)) {
+                .pointer => |pt| switch (@typeInfo(pt.child)) {
+                    .@"fn" => &translateCallback(pt.child, arg),
+                    else => @ptrCast(arg),
+                },
+                else => @bitCast(arg),
+            };
+        }
+
+        fn SwitchType(comptime T: type, comptime dir: enum { old_to_new, new_to_old }) type {
+            return inline for (options.substitutions) |sub| {
+                if (dir == .old_to_new) {
+                    if (T == sub.old) break sub.new;
+                } else {
+                    if (T == sub.new) break sub.old;
+                }
+            } else switch (@typeInfo(T)) {
+                .pointer => |pt| define: {
+                    if (@typeInfo(pt.child) == .@"fn" and dir == .old_to_new) {
+                        // use function type of translated callback, since translation
+                        // requires the actual function
+                        break :define Translated(pt.child, true, options.ignore_cb_status, .{});
+                    }
+                    var new_pt = pt;
+                    if (pt.is_const) {
+                        // look for substitution of non-const pointer
+                        new_pt.is_const = false;
+                        const PT = SwitchType(@Type(.{ .pointer = new_pt }), dir);
+                        new_pt = @typeInfo(PT).pointer;
+                        new_pt.is_const = true;
+                    } else {
+                        // look for substitution of child
+                        new_pt.child = SwitchType(pt.child, dir);
+                    }
+                    break :define @Type(.{ .pointer = new_pt });
+                },
+                .array => |ar| define: {
+                    var new_ar = ar;
+                    new_ar.child = SwitchType(ar.child, dir);
+                    break :define @Type(.{ .array = new_ar });
+                },
+                .optional => |op| define: {
+                    var new_op = op;
+                    new_op.child = SwitchType(op.child, dir);
+                    break :define @Type(.{ .optional = new_op });
+                },
+                .error_union => |eu| define: {
+                    var new_eu = eu;
+                    new_eu.payload = SwitchType(eu.payload, dir);
+                    break :define @Type(.{ .error_union = new_eu });
+                },
+                else => T,
+            };
         }
 
         fn Substitute(comptime T: type, tuple: anytype, arg_index: ?usize, arg_count: usize) type {
@@ -167,41 +413,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             return inline for (keys) |key| {
                 // look for type in function-specific tuple first
                 if (@hasField(@TypeOf(tuple), key)) break @field(tuple, key);
-            } else inline for (options.substitutions) |sub| {
-                // then look in global list
-                if (T == sub.old) break sub.new;
-            } else switch (@typeInfo(T)) {
-                .pointer => |pt| redefine: {
-                    var new_pt = pt;
-                    if (pt.is_const) {
-                        // look for substitution of non-const pointer
-                        new_pt.is_const = false;
-                        const PT = Substitute(@Type(.{ .pointer = new_pt }), .{}, 0, 0);
-                        new_pt = @typeInfo(PT).pointer;
-                        new_pt.is_const = true;
-                    } else {
-                        // look for substitution of child
-                        new_pt.child = Substitute(pt.child, .{}, 0, 0);
-                    }
-                    break :redefine @Type(.{ .pointer = new_pt });
-                },
-                .array => |ar| redefine: {
-                    var new_ar = ar;
-                    new_ar.child = Substitute(ar.child, .{}, 0, 0);
-                    break :redefine @Type(.{ .array = new_ar });
-                },
-                .optional => |op| redefine: {
-                    var new_op = op;
-                    new_op.child = Substitute(op.child, .{}, 0, 0);
-                    break :redefine @Type(.{ .optional = new_op });
-                },
-                .error_union => |eu| redefine: {
-                    var new_eu = eu;
-                    new_eu.payload = Substitute(eu.payload, .{}, 0, 0);
-                    break :redefine @Type(.{ .error_union = new_eu });
-                },
-                else => T,
-            };
+            } else SwitchType(T, .old_to_new);
         }
 
         test "Substitute" {
@@ -210,23 +422,51 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             const OldEnum = options.substitutions[1].old;
             const NewEnum = options.substitutions[1].new;
             const T1 = Substitute(OldStruct, .{}, 0, 1);
-            try expect(T1 == NewStruct);
+            try expectEqual(T1, NewStruct);
             const T2 = Substitute(OldEnum, .{ .@"0" = NewEnum }, 0, 1);
-            try expect(T2 == NewEnum);
+            try expectEqual(T2, NewEnum);
             const T3 = Substitute(OldEnum, .{ .@"-1" = NewEnum }, 0, 1);
-            try expect(T3 == NewEnum);
+            try expectEqual(T3, NewEnum);
             const T4 = Substitute([]OldStruct, .{}, 0, 1);
-            try expect(T4 == []NewStruct);
+            try expectEqual(T4, []NewStruct);
             const T5 = Substitute([]const OldStruct, .{}, 0, 1);
-            try expect(T5 == []const NewStruct);
+            try expectEqual(T5, []const NewStruct);
             const T6 = Substitute([4]OldStruct, .{}, 0, 1);
-            try expect(T6 == [4]NewStruct);
+            try expectEqual(T6, [4]NewStruct);
             const T7 = Substitute(?OldStruct, .{}, 0, 1);
-            try expect(T7 == ?NewStruct);
+            try expectEqual(T7, ?NewStruct);
             const T8 = Substitute(anyerror!OldStruct, .{}, 0, 1);
-            try expect(T8 == anyerror!NewStruct);
+            try expectEqual(T8, anyerror!NewStruct);
             const T9 = Substitute(OldEnum, .{ .retval = NewEnum }, null, 1);
-            try expect(T9 == NewEnum);
+            try expectEqual(T9, NewEnum);
+        }
+
+        fn WritableTarget(comptime T: type) ?type {
+            const info = @typeInfo(T);
+            if (info == .pointer and !info.pointer.is_const) {
+                const Target = switch (@typeInfo(info.pointer.child)) {
+                    .optional => |op| op.child,
+                    else => info.pointer.child,
+                };
+                if (@typeInfo(Target) != .@"opaque" and @sizeOf(Target) != 0) return Target;
+            }
+            return null;
+        }
+
+        test "WritableTarget" {
+            const Null = @TypeOf(null);
+            const T1 = WritableTarget(*usize) orelse Null;
+            try expectEqual(T1, usize);
+            const T2 = WritableTarget(*const usize) orelse Null;
+            try expectEqual(T2, Null);
+            const T3 = WritableTarget(*void) orelse Null;
+            try expectEqual(T3, Null);
+            const T4 = WritableTarget(*anyopaque) orelse Null;
+            try expectEqual(T4, Null);
+            const T5 = WritableTarget(*opaque {}) orelse Null;
+            try expectEqual(T5, Null);
+            const T6 = WritableTarget(*type) orelse Null;
+            try expectEqual(T6, Null);
         }
     };
 }
@@ -239,15 +479,36 @@ test "Translator" {
             nunmer2: i32,
         };
         pub const Enum = enum(c_uint) { dog, cat, fox };
-        pub const ErrorSet = error{ Woof, Meow, WhatDoesTheFoxSay };
+        pub const ErrorSet = error{ Sick, Dead, Crazy, Unknown };
+        pub const Status = enum {
+            ok,
+            sick,
+            dead,
+            crazy,
+            unknown,
+        };
+        pub const Cow = struct {
+            number1: i32,
+            number2: i32,
+        };
+        pub const Hen = struct {
+            number1: i32,
+        };
+        pub const Pig = struct {
+            number1: i32,
+            number2: i32,
+            number3: i32,
+        };
     };
     _ = Translator(.{
         .substitutions = &.{
             .{ .old = c.animal_struct, .new = Self.Struct },
             .{ .old = c.animal_status, .new = Self.Enum },
+            .{ .old = c.animal_cow, .new = Self.Cow },
+            .{ .old = c.animal_hen, .new = Self.Hen },
+            .{ .old = c.animal_pig, .new = Self.Pig },
         },
-        .error_type = .{ .old = c.animal_status, .new = Self.ErrorSet },
-        .default_error = Self.ErrorSet.Woof,
+        .error_scheme = inferErrorScheme(Self.Status, Self.Status.ok, Self.ErrorSet, Self.ErrorSet.Unknown),
     });
 }
 
@@ -615,14 +876,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn obtainTranslatedType(self: *@This(), t: *Type) std.mem.Allocator.Error!*Type {
-            return self.old_to_new_type_map.get(t) orelse add: {
-                const new_t = try createType(try self.translateType(t));
-                try self.old_to_new_type_map.put(t, new_t);
-                break :add new_t;
-            };
-        }
-
         fn translateType(self: *@This(), t: *Type) !Type {
             switch (t.*) {
                 .container => |c| {
@@ -667,9 +920,19 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 },
                 .function => |f| {
                     var new_params: []Parameter = &.{};
-                    // TODO adjust argument list
-                    for (f.parameters, 0..) |param, index| {
-                        _ = index;
+                    var output_types: []*Type = &.{};
+                    const output_start = for (0..f.parameters.len) |offset| {
+                        const index = f.parameters.len - offset - 1;
+                        const param = f.parameters[index];
+                        if (param.type.* != .pointer or param.type.pointer.is_const) {
+                            break index + 1;
+                        }
+                    } else 0;
+                    for (f.parameters, 0..) |output, index| {
+                        if (index >= output_start) try append(allocator, &output_types, output.type);
+                    }
+                    const arg_count = f.parameters.len - output_types.len;
+                    for (f.parameters[0..arg_count]) |param| {
                         const new_param = try self.translateParameter(param);
                         try append(allocator, &new_params, new_param);
                     }
@@ -689,6 +952,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
+        fn obtainTranslatedType(self: *@This(), t: *Type) std.mem.Allocator.Error!*Type {
+            return self.old_to_new_type_map.get(t) orelse add: {
+                const new_t = try createType(try self.translateType(t));
+                try self.old_to_new_type_map.put(t, new_t);
+                break :add new_t;
+            };
+        }
+
         const WriteError = std.fs.File.WriteError;
 
         fn printDeclarations(self: *@This()) WriteError!void {
@@ -703,15 +974,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 try self.printTypeRef(t);
             }
             try self.print(" = ", .{});
-            try self.printExpr(decl.expr);
-            try self.print(";\n\n", .{});
-        }
-
-        fn printExpr(self: *@This(), expr: Expr) WriteError!void {
-            switch (expr) {
+            switch (decl.expr) {
                 .type => |t| try self.printTypeDecl(t),
                 .unknown => |u| try self.print("{s}", .{u}),
             }
+            try self.print(";\n\n", .{});
         }
 
         fn printTypeRef(self: *@This(), t: *Type) WriteError!void {
@@ -1027,8 +1294,4 @@ fn remove(allocator: std.mem.Allocator, slice_ptr: anytype, index: usize) void {
         slice_ptr.* = allocator.realloc(slice_before, new_capacity) catch unreachable;
     }
     slice_ptr.*.len = new_len;
-}
-
-fn returnArg(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
-    return arg;
 }

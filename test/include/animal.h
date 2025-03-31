@@ -34,7 +34,7 @@ typedef struct {
     int32_t number3;
 } animal_pig;
 
-int animal_mate(animal_cow, animal_hen);
+animal_status animal_mate(animal_cow, animal_hen, animal_pig*);
 int animal_random(int, int, int);
 
 animal_status animal_launch(animal_pig *pig);
