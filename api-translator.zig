@@ -607,6 +607,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         pub fn generateDiff(self: *@This()) !bool {
             // obtain declarations from header files
             try self.processHeaderFiles();
+            // resolve forward declarations
+            try self.resolveForwardDecls();
             // create new declarations with new names
             try self.translateDeclarations();
             // print out differences
@@ -820,6 +822,26 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (node == 0) return null;
             const span = tree.nodeToSpan(node);
             return tree.source[span.start..span.end];
+        }
+
+        fn resolveForwardDecls(self: *@This()) !void {
+            while (true) {
+                var unresolved: usize = 0;
+                var resolved: usize = 0;
+                for (self.old_root.container.decls) |*decl| {
+                    if (decl.expr == .unknown and decl.expr.unknown.len > 0) {
+                        if (self.old_type_map.get(decl.expr.unknown)) |t| {
+                            decl.expr = .{ .type = t };
+                            try self.old_type_map.put(decl.name, t);
+                            try self.old_name_map.put(t, decl.name);
+                            resolved += 1;
+                        } else {
+                            unresolved += 1;
+                        }
+                    }
+                }
+                if (unresolved == 0 or resolved == 0) break;
+            }
         }
 
         fn translateDeclarations(self: *@This()) !void {
