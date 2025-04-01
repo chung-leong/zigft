@@ -282,7 +282,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             const pig = options.substitutions[4];
             const ErrorSet = options.error_scheme.ErrorSet;
             const func1 = translate(c.animal_mate, true, false, .{});
-            try expectEqual(@TypeOf(func1), fn (cow.new, hen.new) ErrorSet!pig.new);
+            try expectEqual(@TypeOf(func1), fn (cow.new, hen.new) ErrorSet!std.meta.Tuple(&.{ pig.new, pig.new }));
         }
 
         pub fn translateCallback(
@@ -534,14 +534,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 items: []EnumItem = &.{},
                 is_signed: bool,
             },
-            error_set: struct {
-                names: [][]const u8 = &.{},
-            },
             function: struct {
                 parameters: []Parameter = &.{},
                 return_type: *Type,
                 alignment: ?[]const u8,
             },
+            error_union: struct {
+                payload_type: *Type,
+                error_set: *Type,
+            },
+            error_set: [][]const u8,
+            type_tuple: []*Type,
             unknown: []const u8,
         };
         const Field = struct {
@@ -566,7 +569,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         };
 
         print_count: usize,
-        indent_needed: bool,
         indent_level: usize,
         indented: bool,
         old_root: *Type,
@@ -575,12 +577,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         old_to_new_type_map: std.AutoArrayHashMap(*Type, *Type),
         new_root: *Type,
         new_name_map: std.AutoArrayHashMap(*Type, []const u8),
+        new_error_set: *Type,
+        non_error_enums: []const []const u8,
+        void_type: *Type,
         writer: options.writer_type,
 
         pub fn init(writer: options.writer_type) !@This() {
             return .{
                 .print_count = 0,
-                .indent_needed = false,
                 .indent_level = 0,
                 .indented = false,
                 .old_root = try createType(.{ .container = .{ .kind = "struct" } }),
@@ -589,6 +593,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .old_to_new_type_map = .init(allocator),
                 .new_root = try createType(.{ .container = .{ .kind = "struct" } }),
                 .new_name_map = .init(allocator),
+                .new_error_set = try createType(.{ .error_set = &.{} }),
+                .non_error_enums = &.{},
+                .void_type = try createType(.{ .unknown = "void" }),
                 .writer = writer,
             };
         }
@@ -817,10 +824,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateDeclarations(self: *@This()) !void {
             // add error set
-            const error_set = try self.deriveErrorSet();
+            try self.deriveErrorSet();
             try append(&self.new_root.container.decls, .{
                 .name = options.error_set,
-                .expr = .{ .type = error_set },
+                .expr = .{ .type = self.new_error_set },
             });
             // add remaining
             for (self.old_root.container.decls) |decl| {
@@ -924,24 +931,43 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 },
                 .function => |f| {
                     var new_params: []Parameter = &.{};
+                    // look for writable pointer
                     var output_types: []*Type = &.{};
                     const output_start = for (0..f.parameters.len) |offset| {
                         const index = f.parameters.len - offset - 1;
                         const param = f.parameters[index];
-                        if (param.type.* != .pointer or param.type.pointer.is_const) {
-                            break index + 1;
-                        }
+                        if (!self.isWritable(param.type)) break index + 1;
                     } else 0;
                     for (f.parameters, 0..) |output, index| {
-                        if (index >= output_start) try append(&output_types, output.type);
+                        if (index >= output_start) {
+                            const output_type = try self.obtainTranslatedType(output.type);
+                            try append(&output_types, output_type);
+                        }
                     }
-                    const arg_count = f.parameters.len - output_types.len;
+                    // see if the translated function return
+                    const can_fail = self.isReturningError(t);
+                    const status_type = try self.obtainTranslatedType(f.return_type);
+                    const extra: usize = if (!can_fail or self.non_error_enums.len > 1) 1 else 0;
+                    if (extra == 1) try append(&output_types, status_type);
+                    const arg_count = f.parameters.len + extra - output_types.len;
                     for (f.parameters[0..arg_count]) |param| {
                         const new_param = try self.translateParameter(param);
                         try append(&new_params, new_param);
                     }
-                    // TODO change type
-                    const return_type = try self.obtainTranslatedType(f.return_type);
+                    const payload_type = switch (output_types.len) {
+                        0 => self.void_type,
+                        1 => output_types[0],
+                        else => try createType(.{ .type_tuple = output_types }),
+                    };
+                    const return_type = switch (can_fail) {
+                        true => try createType(.{
+                            .error_union = .{
+                                .payload_type = payload_type,
+                                .error_set = self.new_error_set,
+                            },
+                        }),
+                        false => payload_type,
+                    };
                     return .{
                         .function = .{
                             .parameters = new_params,
@@ -957,14 +983,37 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
-        fn deriveErrorSet(self: *@This()) !*Type {
+        fn isWritable(_: *@This(), t: *const Type) bool {
+            return switch (t.*) {
+                .pointer => |p| check: {
+                    if (p.is_const) break :check false;
+                    if (p.child_type.* == .container) {
+                        if (p.child_type.container.fields.len == 0) break :check false;
+                    }
+                    break :check true;
+                },
+                else => false,
+            };
+        }
+
+        fn isReturningError(self: *@This(), t: *const Type) bool {
+            if (self.old_name_map.get(t.function.return_type)) |name| {
+                return std.mem.eql(u8, options.c_error_type, name);
+            } else return false;
+        }
+
+        fn deriveErrorSet(self: *@This()) !void {
             var names: [][]const u8 = &.{};
+            var non_errors: [][]const u8 = &.{};
             if (self.old_type_map.get(options.c_error_type)) |t| {
                 if (t.* == .enumeration) {
                     for (t.enumeration.items) |item| {
                         if (options.enum_is_error(item.name, item.value)) {
                             const name = try options.error_name_fn(allocator, item.name);
                             try append(&names, name);
+                        } else {
+                            const name = try options.enum_name_fn(allocator, item.name);
+                            try append(&non_errors, name);
                         }
                     }
                 }
@@ -973,19 +1022,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 if (std.mem.eql(u8, n, "Unexpected")) break true;
             } else false;
             if (!has_unexpected) try append(&names, "Unexpected");
-            const t = try createType(.{ .error_set = .{ .names = names } });
-            try self.new_name_map.put(t, options.error_set);
-            return t;
-        }
-
-        fn isReturningErrorType(self: *@This(), t: *const Type) bool {
-            const f = t.function;
-            const return_type_name = self.old_name_map.get(f.return_type) orelse "";
-            return std.mem.eql(u8, options.c_error_type, return_type_name);
+            self.new_error_set.error_set = names;
+            try self.new_name_map.put(self.new_error_set, options.error_set);
+            self.non_error_enums = non_errors;
         }
 
         fn getTranslateCall(self: *@This(), decl: Decl, new_t: *const Type) !Expr {
-            const can_fail = self.isReturningErrorType(decl.type.?);
+            const can_fail = self.isReturningError(decl.type.?);
             const ignore_status = false;
             var non_unique_args: [][]const u8 = &.{};
             for (new_t.function.parameters, 0..) |param, index| {
@@ -1140,10 +1183,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                     try self.print("}}", .{});
                 },
-                .error_set => |e| {
+                .error_set => |names| {
                     try self.print("error{{\n", .{});
-                    for (e.names) |n| try self.print("{s},\n", .{n});
+                    for (names) |n| try self.print("{s},\n", .{n});
                     try self.print("}}", .{});
+                },
+                .error_union => |e| {
+                    try self.printTypeRef(e.error_set);
+                    try self.print("!", .{});
+                    try self.printTypeRef(e.payload_type);
                 },
                 .function => |f| {
                     try self.print("fn (\n", .{});
@@ -1156,6 +1204,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     if (f.alignment) |a| try self.print("align({s}) ", .{a});
                     try self.printTypeRef(f.return_type);
                 },
+                .type_tuple => |types| {
+                    try self.print("std.meta.Tuple(&.{{ ", .{});
+                    for (types, 0..) |tt, i| {
+                        try self.printTypeRef(tt);
+                        if (i != types.len - 1) try self.print(", ", .{});
+                    }
+                    try self.print(" }})", .{});
+                },
                 .unknown => |u| {
                     try self.print("{s}", .{u});
                 },
@@ -1165,7 +1221,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
             self.print_count += 1;
             if (std.mem.startsWith(u8, fmt, "}") or std.mem.startsWith(u8, fmt, ")")) {
-                self.indent_needed = false;
                 self.indent_level -= 1;
             }
             if (self.indent_level > 0 and !self.indented) {
@@ -1176,7 +1231,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
             try self.writer.print(fmt, args);
             if (std.mem.endsWith(u8, fmt, "{\n") or std.mem.endsWith(u8, fmt, "(\n")) {
-                self.indent_needed = true;
                 self.indent_level += 1;
             }
             if (std.mem.endsWith(u8, fmt, "\n")) {
