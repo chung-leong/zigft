@@ -27,59 +27,44 @@ pub const CodeGeneratorOptions = struct {
     writer_type: type = std.fs.File.Writer,
 
     filter_fn: fn ([]const u8) bool,
+    enum_is_error: fn ([]const u8, i128) bool = isNonZero,
+
     fn_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
     type_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
     const_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
     param_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
     field_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    enum_item_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    enum_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    error_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
 
     fn none(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
         return arg;
     }
+
+    fn isNonZero(_: []const u8, value: i128) bool {
+        return value != 0;
+    }
 };
 
-pub fn inferErrorScheme(
-    comptime OldStatusEnum: type,
-    def_status: OldStatusEnum,
-    comptime NewErrorSet: type,
-    def_error: NewErrorSet,
+pub fn BasicErrorScheme(
+    old_enum_type: type,
+    new_error_set: type,
+    options: struct {
+        non_error_statuses: []const old_enum_type,
+        default_status: old_enum_type,
+        default_error: new_error_set,
+    },
 ) type {
-    const pos_statuses, const neg_statuses = comptime find: {
-        const e = @typeInfo(OldStatusEnum).@"enum";
-        var p_statuses: [e.fields.len]OldStatusEnum = undefined;
-        var n_statuses: [e.fields.len]OldStatusEnum = undefined;
-        var p_count: usize = 0;
-        var n_count: usize = 0;
-        for (e.fields) |field| {
-            if (field.value > 0) {
-                p_statuses[p_count] = @field(OldStatusEnum, field.name);
-                p_count += 1;
-            } else if (field.value < 0) {
-                n_statuses[n_count] = @field(OldStatusEnum, field.name);
-                n_count += 1;
-            }
-        }
-        var p_array: [p_count]OldStatusEnum = undefined;
-        var n_array: [n_count]OldStatusEnum = undefined;
-        for (&p_array, 0..) |*ptr, i| ptr.* = p_statuses[i];
-        for (&n_array, 0..) |*ptr, i| ptr.* = n_statuses[i];
-        break :find .{ p_array, n_array };
-    };
     return struct {
-        pub const Status = OldStatusEnum;
-        pub const ErrorSet = NewErrorSet;
-        pub const PositiveStatus = if (neg_statuses.len == 0 or pos_statuses.len == 0)
-            void
-        else if (neg_statuses.len > 0 and pos_statuses.len == 1)
-            bool
-        else
-            Status;
+        pub const Status = old_enum_type;
+        pub const ErrorSet = new_error_set;
+        pub const PositiveStatus = if (options.non_error_statuses.len > 1) Status else void;
         pub const Result = union {
-            value: PositiveStatus,
+            status: PositiveStatus,
             err: ErrorSet,
+
+            const default: PositiveStatus = if (PositiveStatus == void) {} else options.non_error_status[0];
         };
-        pub const ok: Status = @enumFromInt(0);
 
         const error_list = init: {
             const es = @typeInfo(ErrorSet).error_set.?;
@@ -89,50 +74,55 @@ pub fn inferErrorScheme(
             }
             break :init list;
         };
-        const status_list = init: {
-            const slice = if (neg_statuses.len == 0)
-                // positive statuses are error code
-                pos_statuses
-            else
-                // negative statuses are error code
-                neg_statuses;
-            var array: [slice.len]Status = undefined;
-            for (slice, 0..) |value, index| array[index] = value;
-            break :init array;
+        const error_status_list = init: {
+            switch (@typeInfo(Status)) {
+                .@"enum" => |en| {
+                    // leave out ones that appear in non_error_status
+                    var values: [en.fields.len - options.non_error_statuses.len]Status = undefined;
+                    var index: usize = 0;
+                    for (en.fields) |field| {
+                        const value = @field(Status, field.name);
+                        if (std.mem.indexOfScalar(Status, &options.non_error_statuses, value) == null) {
+                            values[index] = value;
+                            index += 1;
+                        }
+                    }
+                    break :init values;
+                },
+                .bool => {
+                    break :init [1]bool{false};
+                },
+                .int => {
+                    // assume 0 means success
+                    var values: [error_list.len]Status = undefined;
+                    var value: Status = 1;
+                    for (&values) |*ptr| {
+                        ptr.* = value;
+                        value += 1;
+                    }
+                    break :init values;
+                },
+            }
         };
 
         pub fn fromEnum(arg: Status) Result {
-            const int = @intFromEnum(arg);
-            if (int != 0) {
-                const index = std.mem.indexOfScalar(@TypeOf(int), &status_list, int) orelse std.math.maxInt(usize);
-                return .{ .err = switch (index < error_list.len) {
-                    true => error_list[index],
-                    false => def_error,
-                } };
+            const status = if (@typeInfo(Status) == .int) @abs(arg) else arg;
+            if (std.mem.indexOfScale(Status, options.non_error_statuses, status)) |_| {
+                return .{ .status = if (PositiveStatus == void) {} else status };
+            } else if (std.mem.indexOfScalar(Status, &error_status_list, status)) |index| {
+                return .{ .err = error_list[index] };
+            } else {
+                return .{ .err = options.default_error };
             }
-            return .{
-                .value = switch (PositiveStatus) {
-                    void => {},
-                    bool => int == 0,
-                    Status => @enumFromInt(int),
-                },
-            };
         }
 
         pub fn toEnum(arg: Result) Status {
             return switch (arg) {
-                .value => switch (PositiveStatus) {
-                    void => @enumFromInt(0),
-                    bool => @enumFromInt(if (arg) 0 else 1),
-                    Status => arg,
-                },
-                .err => get: {
-                    const err_index = std.mem.indexOfScalar(ErrorSet, error_list, arg) orelse std.math.maxInt(usize);
-                    break :get if (err_index < status_list.len)
-                        @enumFromInt(status_list[err_index])
-                    else
-                        def_status;
-                },
+                .status => |s| if (PositiveStatus == void) options.non_error_statuses[0] else s,
+                .err => |e| if (std.mem.indexOfScalar(ErrorSet, error_list, e)) |index|
+                    error_status_list[index]
+                else
+                    options.default_status,
             };
         }
     };
@@ -267,13 +257,9 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                         const status: options.error_scheme.Status = @bitCast(old_rv);
                         switch (options.error_scheme.fromStatus(status)) {
                             .err => |e| return e,
-                            .value => |v| if (extra > 0) {
-                                // add status to result
-                                if (last > 0) {
-                                    payload[last] = v;
-                                } else {
-                                    payload = v;
-                                }
+                            .status => |s| if (extra > 0) {
+                                // add positive status to result
+                                if (last > 0) payload[last] = s else payload = s;
                             },
                         }
                     } else if (extra > 0) {
@@ -332,11 +318,12 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                             const ptr = old_args[i].*;
                             if (ptr != null) ptr.* = payload[j];
                         }
-                        if (extra > 0) {
-                            result = .{ .value = if (last > 0) payload[last] else payload };
-                        } else {
-                            result = .{ .value = {} };
-                        }
+                        result = .{
+                            .status = switch (extra > 0) {
+                                true => if (last > 0) payload[last] else payload,
+                                false => options.error_scheme.Result.default,
+                            },
+                        };
                     } else |err| {
                         result = .{ .err = err };
                     }
@@ -508,7 +495,11 @@ test "Translator" {
             .{ .old = c.animal_hen, .new = Self.Hen },
             .{ .old = c.animal_pig, .new = Self.Pig },
         },
-        .error_scheme = inferErrorScheme(Self.Status, Self.Status.ok, Self.ErrorSet, Self.ErrorSet.Unknown),
+        .error_scheme = BasicErrorScheme(Self.Status, Self.ErrorSet, .{
+            .non_error_statuses = &.{Self.Status.ok},
+            .default_status = Self.Status.unknown,
+            .default_error = Self.ErrorSet.Unknown,
+        }),
     });
 }
 
@@ -542,6 +533,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             enumeration: struct {
                 items: []EnumItem = &.{},
                 is_signed: bool,
+            },
+            error_set: struct {
+                names: [][]const u8 = &.{},
             },
             function: struct {
                 parameters: []Parameter = &.{},
@@ -655,7 +649,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const expr = try self.processExprNode(tree, param);
                 // see if there's a colon in front of the param type
                 const before = tree.tokenSlice(tree.firstToken(param) - 1);
-                try append(allocator, &params, .{
+                try append(&params, .{
                     .name = switch (std.mem.eql(u8, before, ":")) {
                         true => tree.tokenSlice(tree.firstToken(param) - 2),
                         false => null,
@@ -696,7 +690,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 var fields: []Field = &.{};
                 for (decl.ast.members) |member| {
                     if (tree.fullContainerField(member)) |field| {
-                        try append(allocator, &fields, .{
+                        try append(&fields, .{
                             .name = tree.tokenSlice(field.ast.main_token),
                             .type = try self.obtainType(nodeSlice(tree, field.ast.type_expr).?),
                             .alignment = nodeSlice(tree, field.ast.align_expr),
@@ -733,8 +727,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 for (0..count) |_| {
                     const decl = self.old_root.container.decls[index];
                     const value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable;
-                    try append(allocator, &items, .{ .name = decl.name, .value = value });
-                    remove(allocator, &self.old_root.container.decls, index);
+                    try append(&items, .{ .name = decl.name, .value = value });
+                    remove(&self.old_root.container.decls, index);
                 }
                 const ptr = try createType(.{
                     .enumeration = .{
@@ -793,7 +787,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.old_name_map.put(decl.expr.type, decl.name);
                 }
             }
-            try append(allocator, &self.old_root.container.decls, copy);
+            try append(&self.old_root.container.decls, copy);
         }
 
         fn obtainTypeOrNull(self: *@This(), name: ?[]const u8) !?*Type {
@@ -822,17 +816,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateDeclarations(self: *@This()) !void {
+            // add error set
+            const error_set = try self.deriveErrorSet();
+            try append(&self.new_root.container.decls, .{
+                .name = options.error_set,
+                .expr = .{ .type = error_set },
+            });
+            // add remaining
             for (self.old_root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
+                    const is_function = decl.type != null and decl.type.?.* == .function;
                     // get name in target namespace
-                    const new_name = if (decl.type != null and decl.type.?.* == .function)
+                    const new_name = if (is_function)
                         try options.fn_name_fn(allocator, decl.name)
                     else switch (decl.expr) {
                         .type => try options.type_name_fn(allocator, decl.name),
                         .unknown => try options.const_name_fn(allocator, decl.name),
                     };
                     const new_decl_t = if (decl.type) |t| try self.obtainTranslatedType(t) else null;
-                    const expr: Expr = switch (decl.expr) {
+                    const expr: Expr = if (is_function)
+                        try self.getTranslateCall(decl, new_decl_t.?)
+                    else switch (decl.expr) {
                         .type => |t| translate: {
                             const new_t = try self.obtainTranslatedType(t);
                             try self.new_name_map.put(new_t, new_name);
@@ -840,7 +844,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         },
                         .unknown => |u| .{ .unknown = u },
                     };
-                    try append(allocator, &self.new_root.container.decls, .{
+                    try append(&self.new_root.container.decls, .{
                         .name = new_name,
                         .type = new_decl_t,
                         .alignment = decl.alignment,
@@ -869,7 +873,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateEnumItem(_: *@This(), item: EnumItem) !EnumItem {
-            const new_name = try options.enum_item_name_fn(allocator, item.name);
+            const new_name = try options.enum_name_fn(allocator, item.name);
             return .{
                 .name = new_name,
                 .value = item.value,
@@ -882,7 +886,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     var new_fields: []Field = &.{};
                     for (c.fields) |field| {
                         const new_field = try self.translateField(field);
-                        try append(allocator, &new_fields, new_field);
+                        try append(&new_fields, new_field);
                     }
                     return .{
                         .container = .{
@@ -909,7 +913,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     var new_items: []EnumItem = &.{};
                     for (e.items) |item| {
                         const new_field = try self.translateEnumItem(item);
-                        try append(allocator, &new_items, new_field);
+                        try append(&new_items, new_field);
                     }
                     return .{
                         .enumeration = .{
@@ -929,12 +933,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         }
                     } else 0;
                     for (f.parameters, 0..) |output, index| {
-                        if (index >= output_start) try append(allocator, &output_types, output.type);
+                        if (index >= output_start) try append(&output_types, output.type);
                     }
                     const arg_count = f.parameters.len - output_types.len;
                     for (f.parameters[0..arg_count]) |param| {
                         const new_param = try self.translateParameter(param);
-                        try append(allocator, &new_params, new_param);
+                        try append(&new_params, new_param);
                     }
                     // TODO change type
                     const return_type = try self.obtainTranslatedType(f.return_type);
@@ -949,7 +953,77 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .unknown => |u| {
                     return .{ .unknown = u };
                 },
+                else => unreachable,
             }
+        }
+
+        fn deriveErrorSet(self: *@This()) !*Type {
+            var names: [][]const u8 = &.{};
+            if (self.old_type_map.get(options.c_error_type)) |t| {
+                if (t.* == .enumeration) {
+                    for (t.enumeration.items) |item| {
+                        if (options.enum_is_error(item.name, item.value)) {
+                            const name = try options.error_name_fn(allocator, item.name);
+                            try append(&names, name);
+                        }
+                    }
+                }
+            }
+            const has_unexpected = for (names) |n| {
+                if (std.mem.eql(u8, n, "Unexpected")) break true;
+            } else false;
+            if (!has_unexpected) try append(&names, "Unexpected");
+            const t = try createType(.{ .error_set = .{ .names = names } });
+            try self.new_name_map.put(t, options.error_set);
+            return t;
+        }
+
+        fn isReturningErrorType(self: *@This(), t: *const Type) bool {
+            const f = t.function;
+            const return_type_name = self.old_name_map.get(f.return_type) orelse "";
+            return std.mem.eql(u8, options.c_error_type, return_type_name);
+        }
+
+        fn getTranslateCall(self: *@This(), decl: Decl, new_t: *const Type) !Expr {
+            const can_fail = self.isReturningErrorType(decl.type.?);
+            const ignore_status = false;
+            var non_unique_args: [][]const u8 = &.{};
+            for (new_t.function.parameters, 0..) |param, index| {
+                switch (param.type.*) {
+                    .enumeration, .unknown => {
+                        if (self.new_name_map.get(param.type)) |name| {
+                            const pair = try std.fmt.allocPrint(allocator, ".@\"{d}\" = {s}", .{ index, name });
+                            try append(&non_unique_args, pair);
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (!can_fail) {
+                const return_type = new_t.function.return_type;
+                switch (return_type.*) {
+                    .enumeration, .unknown => {
+                        if (self.new_name_map.get(return_type)) |name| {
+                            const pair = try std.fmt.allocPrint(allocator, ".retval = {s}", .{name});
+                            try append(&non_unique_args, pair);
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const local_subs = if (non_unique_args.len > 0) get: {
+                const local_subs_pairs = try std.mem.join(allocator, ", ", non_unique_args);
+                break :get try std.fmt.allocPrint(allocator, " {s} ", .{local_subs_pairs});
+            } else "";
+            const code = try std.fmt.allocPrint(allocator, "{s}.translate({s}.{s}, {}, {}, .{{{s}}})", .{
+                options.translater,
+                options.c_import,
+                decl.name,
+                can_fail,
+                ignore_status,
+                local_subs,
+            });
+            return .{ .unknown = code };
         }
 
         fn obtainTranslatedType(self: *@This(), t: *Type) std.mem.Allocator.Error!*Type {
@@ -1066,6 +1140,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                     try self.print("}}", .{});
                 },
+                .error_set => |e| {
+                    try self.print("error{{\n", .{});
+                    for (e.names) |n| try self.print("{s},\n", .{n});
+                    try self.print("}}", .{});
+                },
                 .function => |f| {
                     try self.print("fn (\n", .{});
                     for (f.parameters) |param| {
@@ -1132,6 +1211,56 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const prefix = std.mem.sliceTo(options.header_paths[0], '.');
             try expect(std.mem.containsAtLeast(u8, code, 1, prefix));
         }
+
+        fn calcCapacity(len: usize) usize {
+            return if (len > 0) std.math.ceilPowerOfTwo(usize, len) catch unreachable else 0;
+        }
+
+        fn GrandchildOf(comptime T: type) type {
+            return switch (@typeInfo(T)) {
+                .pointer => |pt| check: {
+                    if (pt.is_const) @compileError("Cannot make modification through a const pointer");
+                    break :check switch (@typeInfo(pt.child)) {
+                        .pointer => |pt2| check2: {
+                            if (pt2.is_const) @compileError("Slice is const");
+                            break :check2 pt2.child;
+                        },
+                        else => @compileError("Not a pointer to a slice"),
+                    };
+                },
+                else => @compileError("Not a pointer"),
+            };
+        }
+
+        fn append(slice_ptr: anytype, value: GrandchildOf(@TypeOf(slice_ptr))) !void {
+            const len = slice_ptr.*.len;
+            const capacity = calcCapacity(len);
+            const new_len = len + 1;
+            const new_capacity = calcCapacity(new_len);
+            if (new_capacity != capacity) {
+                const slice_before = slice_ptr.*.ptr[0..capacity];
+                slice_ptr.* = try allocator.realloc(slice_before, new_capacity);
+            }
+            slice_ptr.*.len = new_len;
+            slice_ptr.*[len] = value;
+        }
+
+        fn remove(slice_ptr: anytype, index: usize) void {
+            _ = GrandchildOf(@TypeOf(slice_ptr));
+            const len = slice_ptr.*.len;
+            var i: usize = index;
+            while (i + 1 < len) : (i += 1) {
+                slice_ptr.*[i] = slice_ptr.*[i + 1];
+            }
+            const capacity = calcCapacity(len);
+            const new_len = len - 1;
+            const new_capacity = calcCapacity(new_len);
+            if (new_capacity != capacity) {
+                const slice_before = slice_ptr.*.ptr[0..capacity];
+                slice_ptr.* = allocator.realloc(slice_before, new_capacity) catch unreachable;
+            }
+            slice_ptr.*.len = new_len;
+        }
     };
 }
 
@@ -1149,9 +1278,13 @@ test "CodeGenerator" {
             return camelize(allocator, name, 7, true);
         }
 
-        fn getEnumItemName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
             const index = if (std.mem.lastIndexOfScalar(u8, name, '_')) |i| i + 1 else 0;
             return snakify(allocator, name, index);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, 7, true);
         }
     };
     _ = CodeGenerator(.{
@@ -1163,7 +1296,8 @@ test "CodeGenerator" {
         .filter_fn = ns.filter,
         .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
-        .enum_item_name_fn = ns.getEnumItemName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
         .writer_type = std.fs.File.Writer,
     });
 }
@@ -1244,54 +1378,4 @@ test "snakify" {
     try expectEqualSlices(u8, "animal_green_dragon", name1);
     const name2 = try snakify(allocator, "AnimalGreenDragon", 6);
     try expectEqualSlices(u8, "green_dragon", name2);
-}
-
-fn calcCapacity(len: usize) usize {
-    return if (len > 0) std.math.ceilPowerOfTwo(usize, len) catch unreachable else 0;
-}
-
-fn GrandchildOf(comptime T: type) type {
-    return switch (@typeInfo(T)) {
-        .pointer => |pt| check: {
-            if (pt.is_const) @compileError("Cannot make modification through a const pointer");
-            break :check switch (@typeInfo(pt.child)) {
-                .pointer => |pt2| check2: {
-                    if (pt2.is_const) @compileError("Slice is const");
-                    break :check2 pt2.child;
-                },
-                else => @compileError("Not a pointer to a slice"),
-            };
-        },
-        else => @compileError("Not a pointer"),
-    };
-}
-
-fn append(allocator: std.mem.Allocator, slice_ptr: anytype, value: GrandchildOf(@TypeOf(slice_ptr))) !void {
-    const len = slice_ptr.*.len;
-    const capacity = calcCapacity(len);
-    const new_len = len + 1;
-    const new_capacity = calcCapacity(new_len);
-    if (new_capacity != capacity) {
-        const slice_before = slice_ptr.*.ptr[0..capacity];
-        slice_ptr.* = try allocator.realloc(slice_before, new_capacity);
-    }
-    slice_ptr.*.len = new_len;
-    slice_ptr.*[len] = value;
-}
-
-fn remove(allocator: std.mem.Allocator, slice_ptr: anytype, index: usize) void {
-    _ = GrandchildOf(@TypeOf(slice_ptr));
-    const len = slice_ptr.*.len;
-    var i: usize = index;
-    while (i + 1 < len) : (i += 1) {
-        slice_ptr.*[i] = slice_ptr.*[i + 1];
-    }
-    const capacity = calcCapacity(len);
-    const new_len = len - 1;
-    const new_capacity = calcCapacity(new_len);
-    if (new_capacity != capacity) {
-        const slice_before = slice_ptr.*.ptr[0..capacity];
-        slice_ptr.* = allocator.realloc(slice_before, new_capacity) catch unreachable;
-    }
-    slice_ptr.*.len = new_len;
 }

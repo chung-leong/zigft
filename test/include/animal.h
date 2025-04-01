@@ -37,8 +37,10 @@ typedef struct {
 animal_status animal_mate(animal_cow, animal_hen, animal_pig*);
 int animal_random(int, int, int);
 
-animal_status animal_launch(animal_pig *pig);
+animal_status animal_launch(const animal_pig *pig, animal_enum state);
 void animal_smell(const animal_hen *hen);
+
+animal_enum animal_get_cow_appearance(const animal_cow *cow);
 
 inline int animal_add(int a, int b, int c) {
     return a + b + c;
