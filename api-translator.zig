@@ -496,8 +496,8 @@ test "Translator" {
             .{ .old = c.animal_pig, .new = Self.Pig },
         },
         .error_scheme = BasicErrorScheme(Self.Status, Self.ErrorSet, .{
-            .non_error_statuses = &.{Self.Status.ok},
-            .default_status = Self.Status.unknown,
+            .non_error_statuses = &.{.ok},
+            .default_status = .unknown,
             .default_error = Self.ErrorSet.Unknown,
         }),
     });
@@ -613,6 +613,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.translateDeclarations();
             // print out differences
             try self.printDeclarations();
+            // print code that sets up the translator
+            try self.printTrainslatorSetup();
             return self.print_count > 0;
         }
 
@@ -1233,6 +1235,62 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.print("{s}", .{u});
                 },
             }
+        }
+
+        fn printTrainslatorSetup(self: *@This()) !void {
+            const old_enum_t = self.old_type_map.get(options.c_error_type) orelse {
+                std.debug.print("Unable to find enum type: {s}\n", .{options.c_error_type});
+                return error.Unexpected;
+            };
+            var enum_name: []const u8 = options.c_error_type;
+            const is_bool = std.mem.eql(u8, enum_name, "bool");
+            var non_error_statuses: []const u8 = if (is_bool) ".{true}" else ".{0}";
+            var default_status: []const u8 = if (is_bool) "false" else "1";
+            const new_enum_t = try self.obtainTranslatedType(old_enum_t);
+            if (self.new_name_map.get(new_enum_t)) |name| enum_name = name;
+            if (new_enum_t.* == .enumeration) {
+                var literals: [][]const u8 = &.{};
+                for (self.non_error_enums) |name| {
+                    const literal = try std.fmt.allocPrint(allocator, ".{s}", .{name});
+                    try append(&literals, literal);
+                }
+                const list = try std.mem.join(allocator, ", ", literals);
+                non_error_statuses = switch (self.non_error_enums.len) {
+                    1 => try std.fmt.allocPrint(allocator, ".{{{s}}}", .{list}),
+                    else => try std.fmt.allocPrint(allocator, ".{{ {s} }}", .{list}),
+                };
+                for (new_enum_t.enumeration.items) |item| {
+                    const is_error = for (self.non_error_enums) |name| {
+                        if (std.mem.eql(u8, name, item.name)) break false;
+                    } else true;
+                    if (is_error) {
+                        default_status = try std.fmt.allocPrint(allocator, ".{s}", .{item.name});
+                        break;
+                    }
+                }
+            }
+            try self.print("const {s} = api_translator.Translator(.{{\n", .{options.translater});
+            try self.print(".substitutions = &.{{\n", .{});
+            for (self.old_root.container.decls) |decl| {
+                if (decl.expr == .type) {
+                    if (self.old_to_new_type_map.get(decl.expr.type)) |new_t| {
+                        if (self.new_name_map.get(new_t)) |new_name| {
+                            try self.print(".{{ .old = {s}.{s}, .new = {s} }},\n", .{
+                                options.c_import,
+                                decl.name,
+                                new_name,
+                            });
+                        }
+                    }
+                }
+            }
+            try self.print("}},\n", .{});
+            try self.print(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, .{{\n", .{ options.error_set, enum_name });
+            try self.print(".non_error_statuses = &{s},\n", .{non_error_statuses});
+            try self.print(".default_status = {s},\n", .{default_status});
+            try self.print(".default_error = {s}.Unexpected,\n", .{options.error_set});
+            try self.print("}}),\n", .{});
+            try self.print("}});\n", .{});
         }
 
         fn print(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
