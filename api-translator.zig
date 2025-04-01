@@ -15,7 +15,7 @@ pub const TranslatorOptions = struct {
     ignore_cb_status: bool = true,
 };
 pub const CodeGeneratorOptions = struct {
-    include_path: []const u8,
+    include_paths: []const []const u8,
     header_paths: []const []const u8,
     translater: []const u8 = "c_to_zig",
     c_error_type: []const u8,
@@ -623,13 +623,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn processHeaderFiles(self: *@This()) !void {
-            const base_path = try std.process.getCwdAlloc(allocator);
             for (options.header_paths) |path| {
-                const full_path = try std.fs.path.resolve(allocator, &.{
-                    base_path,
-                    options.include_path,
-                    path,
-                });
+                const full_path = try findHeadFile(path);
                 const output = try self.translateHeaderFile(full_path);
                 const source = try allocator.dupeZ(u8, output);
                 const tree = try Ast.parse(allocator, source, .zig);
@@ -1277,15 +1272,25 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var self: @This() = try .init(std.io.getStdOut().writer());
             defer self.deinit();
             const path = options.header_paths[0];
-            const base_path = try std.process.getCwdAlloc(allocator);
-            const full_path = try std.fs.path.resolve(allocator, &.{
-                base_path,
-                options.include_path,
-                path,
-            });
+            const full_path = try findHeadFile(path);
             const code = try self.translateHeaderFile(full_path);
             const prefix = std.mem.sliceTo(options.header_paths[0], '.');
             try expect(std.mem.containsAtLeast(u8, code, 1, prefix));
+        }
+
+        fn findHeadFile(path: []const u8) ![]const u8 {
+            const base_path = try std.process.getCwdAlloc(allocator);
+            for (options.include_paths) |include_path| {
+                const full_path = try std.fs.path.resolve(allocator, &.{
+                    base_path,
+                    include_path,
+                    path,
+                });
+                if (std.fs.accessAbsolute(full_path, .{})) |_| {
+                    return full_path;
+                } else |_| allocator.free(full_path);
+            }
+            return error.FileNotFound;
         }
 
         fn calcCapacity(len: usize) usize {
@@ -1364,7 +1369,7 @@ test "CodeGenerator" {
         }
     };
     _ = CodeGenerator(.{
-        .include_path = "./test/include",
+        .include_paths = &.{"./test/include"},
         .header_paths = &.{"animal.h"},
         .c_error_type = "animal_status",
         .c_error_none = "animal_ok",
