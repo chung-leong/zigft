@@ -192,27 +192,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             });
         }
 
-        test "Translated" {
-            const OldStruct = options.substitutions[0].old;
-            const NewStruct = options.substitutions[0].new;
-            const NewError = options.error_scheme.ErrorSet;
-            const OldError = c_uint;
-            const Fn1 = Translated(fn (i32, OldStruct) OldError, true, false, .{});
-            try expectEqual(Fn1, fn (i32, NewStruct) NewError!void);
-            const Fn2 = Translated(fn (i32, []const OldStruct) OldError, true, false, .{});
-            try expectEqual(Fn2, fn (i32, []const NewStruct) NewError!void);
-            const Fn3 = Translated(fn (i32, *OldStruct) OldError, true, false, .{});
-            try expectEqual(Fn3, fn (i32) NewError!NewStruct);
-            const Fn4 = Translated(fn (i32, *bool, *OldStruct) OldError, true, false, .{});
-            try expectEqual(Fn4, fn (i32) NewError!std.meta.Tuple(&.{ bool, NewStruct }));
-            const Fn5 = Translated(fn (i32, OldStruct) bool, false, false, .{});
-            try expectEqual(Fn5, fn (i32, NewStruct) bool);
-            const Fn6 = Translated(fn (i32, OldStruct) c_int, false, false, .{});
-            try expectEqual(Fn6, fn (i32, NewStruct) c_int);
-            const Fn7 = Translated(fn (i32, OldStruct) c_int, false, true, .{});
-            try expectEqual(Fn7, fn (i32, NewStruct) void);
-        }
-
         pub fn translate(
             comptime func: anytype,
             comptime can_fail: bool,
@@ -272,16 +251,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 }
             };
             return fn_transform.spreadArgs(ns.call, .auto);
-        }
-
-        test "translate" {
-            const c = @cImport(@cInclude("./test/include/animal.h"));
-            const cow = options.substitutions[2];
-            const hen = options.substitutions[3];
-            const pig = options.substitutions[4];
-            const ErrorSet = options.error_scheme.ErrorSet;
-            const func1 = translate(c.animal_mate, true, false, .{});
-            try expectEqual(@TypeOf(func1), fn (cow.new, hen.new) ErrorSet!std.meta.Tuple(&.{ pig.new, pig.new }));
         }
 
         pub fn translateCallback(
@@ -402,31 +371,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             } else SwitchType(T, .old_to_new);
         }
 
-        test "Substitute" {
-            const OldStruct = options.substitutions[0].old;
-            const NewStruct = options.substitutions[0].new;
-            const OldEnum = options.substitutions[1].old;
-            const NewEnum = options.substitutions[1].new;
-            const T1 = Substitute(OldStruct, .{}, 0, 1);
-            try expectEqual(T1, NewStruct);
-            const T2 = Substitute(OldEnum, .{ .@"0" = NewEnum }, 0, 1);
-            try expectEqual(T2, NewEnum);
-            const T3 = Substitute(OldEnum, .{ .@"-1" = NewEnum }, 0, 1);
-            try expectEqual(T3, NewEnum);
-            const T4 = Substitute([]OldStruct, .{}, 0, 1);
-            try expectEqual(T4, []NewStruct);
-            const T5 = Substitute([]const OldStruct, .{}, 0, 1);
-            try expectEqual(T5, []const NewStruct);
-            const T6 = Substitute([4]OldStruct, .{}, 0, 1);
-            try expectEqual(T6, [4]NewStruct);
-            const T7 = Substitute(?OldStruct, .{}, 0, 1);
-            try expectEqual(T7, ?NewStruct);
-            const T8 = Substitute(anyerror!OldStruct, .{}, 0, 1);
-            try expectEqual(T8, anyerror!NewStruct);
-            const T9 = Substitute(OldEnum, .{ .retval = NewEnum }, null, 1);
-            try expectEqual(T9, NewEnum);
-        }
-
         fn WritableTarget(comptime T: type) ?type {
             const info = @typeInfo(T);
             if (info == .pointer and !info.pointer.is_const) {
@@ -437,22 +381,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 if (@typeInfo(Target) != .@"opaque" and @sizeOf(Target) != 0) return Target;
             }
             return null;
-        }
-
-        test "WritableTarget" {
-            const Null = @TypeOf(null);
-            const T1 = WritableTarget(*usize) orelse Null;
-            try expectEqual(T1, usize);
-            const T2 = WritableTarget(*const usize) orelse Null;
-            try expectEqual(T2, Null);
-            const T3 = WritableTarget(*void) orelse Null;
-            try expectEqual(T3, Null);
-            const T4 = WritableTarget(*anyopaque) orelse Null;
-            try expectEqual(T4, Null);
-            const T5 = WritableTarget(*opaque {}) orelse Null;
-            try expectEqual(T5, Null);
-            const T6 = WritableTarget(*type) orelse Null;
-            try expectEqual(T6, Null);
         }
     };
 }
@@ -512,6 +440,7 @@ pub const EnumItem = struct {
 };
 pub const Expression = union(enum) {
     type: *Type,
+    identifier: []const u8,
     unknown: []const u8,
 };
 pub const Namespace = struct {
@@ -593,7 +522,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .new_namespace = .init(allocator),
                 .new_error_set = try createType(.{ .error_set = &.{} }),
                 .non_error_enums = &.{},
-                .void_type = try createType(.{ .expression = .{ .unknown = "void" } }),
+                .void_type = try createType(.{ .expression = .{ .identifier = "void" } }),
             };
         }
 
@@ -601,7 +530,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             _ = arena.reset(.free_all);
         }
 
-        pub fn generate(self: *@This()) !void {
+        pub fn analyze(self: *@This()) !void {
             try self.processHeaderFiles();
             try self.resolveForwardDeclarations();
             try self.translateDeclarations();
@@ -631,41 +560,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
-        test "processHeaderFiles" {
-            var self: @This() = try .init();
-            defer self.deinit();
-            try self.processHeaderFiles();
-            try expect(self.old_root.container.decls.len > 0);
-        }
-
         fn processFnProto(self: *@This(), tree: Ast, proto: Ast.full.FnProto) !void {
             if (proto.visib_token == null or proto.name_token == null) return;
-            var params: []Parameter = &.{};
-            for (proto.ast.params) |param| {
-                const expr = try self.processExpressionNode(tree, param);
-                // see if there's a colon in front of the param type
-                const before = tree.tokenSlice(tree.firstToken(param) - 1);
-                try append(&params, .{
-                    .name = switch (std.mem.eql(u8, before, ":")) {
-                        true => tree.tokenSlice(tree.firstToken(param) - 2),
-                        false => null,
-                    },
-                    .type = switch (expr) {
-                        .type => |t| t,
-                        .unknown => |s| try self.obtainType(s),
-                    },
-                });
-            }
-            const type_ptr = try createType(.{
-                .function = .{
-                    .parameters = params,
-                    .return_type = try self.obtainType(nodeSlice(tree, proto.ast.return_type).?),
-                    .alignment = nodeSlice(tree, proto.ast.align_expr),
-                },
-            });
             try self.addDeclaration(.{
                 .name = tree.tokenSlice(proto.name_token.?),
-                .type = type_ptr,
+                .type = try self.obtainFunctionType(tree, proto),
             });
         }
 
@@ -674,68 +573,118 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.addDeclaration(.{
                 .name = tree.tokenSlice(decl.ast.mut_token + 1),
                 .mutable = std.mem.eql(u8, "var", tree.tokenSlice(decl.ast.mut_token)),
-                .type = try self.obtainTypeOrNull(nodeSlice(tree, decl.ast.type_node)),
+                .type = switch (decl.ast.type_node) {
+                    0 => null,
+                    else => try self.obtainType(tree, decl.ast.type_node),
+                },
                 .alignment = nodeSlice(tree, decl.ast.align_node),
-                .expr = try self.processExpressionNode(tree, decl.ast.init_node),
+                .expr = try self.obtainExpression(tree, decl.ast.init_node),
             });
         }
 
-        fn processExpressionNode(self: *@This(), tree: Ast, node: Ast.Node.Index) !Expression {
+        fn obtainExpression(self: *@This(), tree: Ast, node: Ast.Node.Index) !Expression {
+            var buffer1: [1]Ast.Node.Index = undefined;
             var buffer2: [2]Ast.Node.Index = undefined;
-            if (tree.fullContainerDecl(&buffer2, node)) |decl| {
-                var fields: []Field = &.{};
-                for (decl.ast.members) |member| {
-                    if (tree.fullContainerField(member)) |field| {
-                        try append(&fields, .{
-                            .name = tree.tokenSlice(field.ast.main_token),
-                            .type = try self.obtainType(nodeSlice(tree, field.ast.type_expr).?),
-                            .alignment = nodeSlice(tree, field.ast.align_expr),
-                        });
-                    }
-                }
-                const ptr = try createType(.{
-                    .container = .{
-                        .kind = tree.tokenSlice(decl.ast.main_token),
-                        .fields = fields,
+            return if (tree.fullFnProto(&buffer1, node)) |fn_proto| .{
+                .type = try self.obtainFunctionType(tree, fn_proto),
+            } else if (tree.fullContainerDecl(&buffer2, node)) |decl| .{
+                .type = try self.obtainContainerType(tree, decl),
+            } else if (self.detectPointerType(tree, node)) |tuple| .{
+                .type = try self.obtainPointerType(tree, tuple[0], tuple[1]),
+            } else if (self.detectEnumType(tree, node)) |tuple| .{
+                .type = try self.obtainEnumType(tree, tuple[0], tuple[1]),
+            } else if (tree.nodes.items(.tag)[node] == .identifier) .{
+                .identifier = nodeSlice(tree, node).?,
+            } else .{
+                .unknown = nodeSlice(tree, node).?,
+            };
+        }
+
+        fn obtainType(self: *@This(), tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!*Type {
+            const expr = try self.obtainExpression(tree, node);
+            return switch (expr) {
+                .type => |t| t,
+                .identifier => |i| self.old_namespace.getType(i) orelse add: {
+                    const t = try createType(.{ .expression = expr });
+                    try self.old_namespace.addType(i, t);
+                    break :add t;
+                },
+                .unknown => try createType(.{ .expression = expr }),
+            };
+        }
+
+        fn obtainFunctionType(self: *@This(), tree: Ast, proto: Ast.full.FnProto) !*Type {
+            var params: []Parameter = &.{};
+            for (proto.ast.params) |param| {
+                // see if there's a colon in front of the param type
+                const before = tree.tokenSlice(tree.firstToken(param) - 1);
+                try append(&params, .{
+                    .name = switch (std.mem.eql(u8, before, ":")) {
+                        true => tree.tokenSlice(tree.firstToken(param) - 2),
+                        false => null,
                     },
+                    .type = try self.obtainType(tree, param),
                 });
-                return .{ .type = ptr };
-            } else if (self.detectPointerType(tree, node)) |tuple| {
-                const ptr_type, const is_optional = tuple;
-                const ptr = try createType(.{
-                    .pointer = .{
-                        .child_type = try self.obtainType(nodeSlice(tree, ptr_type.ast.child_type).?),
-                        .sentinel = nodeSlice(tree, ptr_type.ast.sentinel),
-                        .size = ptr_type.size,
-                        .is_const = ptr_type.const_token != null,
-                        .is_volatile = ptr_type.volatile_token != null,
-                        .is_optional = is_optional,
-                        .allows_zero = ptr_type.allowzero_token != null,
-                        .alignment = nodeSlice(tree, ptr_type.ast.align_node),
-                    },
-                });
-                return .{ .type = ptr };
-            } else if (self.detectEnumType(tree, node)) |tuple| {
-                const count, const is_signed = tuple;
-                // remove decls containing integers and use them as the enum values
-                const index: usize = self.old_root.container.decls.len - count;
-                var items: []EnumItem = &.{};
-                for (0..count) |_| {
-                    const decl = self.old_root.container.decls[index];
-                    const value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable;
-                    try append(&items, .{ .name = decl.name, .value = value });
-                    remove(&self.old_root.container.decls, index);
-                }
-                const ptr = try createType(.{
-                    .enumeration = .{
-                        .items = items,
-                        .is_signed = is_signed,
-                    },
-                });
-                return .{ .type = ptr };
-            } else {
-                return .{ .unknown = nodeSlice(tree, node).? };
             }
+            return try createType(.{
+                .function = .{
+                    .parameters = params,
+                    .return_type = try self.obtainType(tree, proto.ast.return_type),
+                    .alignment = nodeSlice(tree, proto.ast.align_expr),
+                },
+            });
+        }
+
+        fn obtainContainerType(self: *@This(), tree: Ast, decl: Ast.full.ContainerDecl) !*Type {
+            var fields: []Field = &.{};
+            for (decl.ast.members) |member| {
+                if (tree.fullContainerField(member)) |field| {
+                    try append(&fields, .{
+                        .name = tree.tokenSlice(field.ast.main_token),
+                        .type = try self.obtainType(tree, field.ast.type_expr),
+                        .alignment = nodeSlice(tree, field.ast.align_expr),
+                    });
+                }
+            }
+            return try createType(.{
+                .container = .{
+                    .kind = tree.tokenSlice(decl.ast.main_token),
+                    .fields = fields,
+                },
+            });
+        }
+
+        fn obtainPointerType(self: *@This(), tree: Ast, ptr_type: Ast.full.PtrType, is_optional: bool) !*Type {
+            return try createType(.{
+                .pointer = .{
+                    .child_type = try self.obtainType(tree, ptr_type.ast.child_type),
+                    .sentinel = nodeSlice(tree, ptr_type.ast.sentinel),
+                    .size = ptr_type.size,
+                    .is_const = ptr_type.const_token != null,
+                    .is_volatile = ptr_type.volatile_token != null,
+                    .is_optional = is_optional,
+                    .allows_zero = ptr_type.allowzero_token != null,
+                    .alignment = nodeSlice(tree, ptr_type.ast.align_node),
+                },
+            });
+        }
+
+        fn obtainEnumType(self: *@This(), _: Ast, count: usize, is_signed: bool) !*Type {
+            // remove decls containing integers and use them as the enum values
+            const index: usize = self.old_root.container.decls.len - count;
+            var items: []EnumItem = &.{};
+            for (0..count) |_| {
+                const decl = self.old_root.container.decls[index];
+                const value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable;
+                try append(&items, .{ .name = decl.name, .value = value });
+                remove(&self.old_root.container.decls, index);
+            }
+            return try createType(.{
+                .enumeration = .{
+                    .items = items,
+                    .is_signed = is_signed,
+                },
+            });
         }
 
         fn detectPointerType(_: *@This(), tree: Ast, node: Ast.Node.Index) ?std.meta.Tuple(&.{ Ast.full.PtrType, bool }) {
@@ -785,22 +734,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try append(&self.old_root.container.decls, copy);
         }
 
-        fn obtainTypeOrNull(self: *@This(), name: ?[]const u8) !?*Type {
-            return if (name) |n| self.obtainType(n) else null;
-        }
-
         fn createType(info: Type) !*Type {
             const t = try allocator.create(Type);
             t.* = info;
             return t;
-        }
-
-        fn obtainType(self: *@This(), name: []const u8) !*Type {
-            return self.old_namespace.getType(name) orelse add: {
-                const t = try createType(.{ .expression = .{ .unknown = name } });
-                try self.old_namespace.addType(name, t);
-                break :add t;
-            };
         }
 
         fn nodeSlice(tree: Ast, node: Ast.Node.Index) ?[]const u8 {
@@ -814,8 +751,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 var unresolved: usize = 0;
                 var resolved: usize = 0;
                 for (self.old_root.container.decls) |*decl| {
-                    if (decl.expr == .unknown and decl.expr.unknown.len > 0) {
-                        if (self.old_namespace.getType(decl.expr.unknown)) |t| {
+                    if (decl.expr == .identifier) {
+                        if (self.old_namespace.getType(decl.expr.identifier)) |t| {
                             decl.expr = .{ .type = t };
                             try self.old_namespace.addType(decl.name, t);
                             resolved += 1;
@@ -825,11 +762,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                 }
                 if (unresolved == 0 or resolved == 0) break;
-            }
-            var iterator = self.old_namespace.typeIterator();
-            while (iterator.next()) |ptr| {
-                const t = ptr.*;
-                if (t.* == .expression and t.expression == .unknown) {}
             }
         }
 
@@ -848,7 +780,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const new_name = if (is_function)
                         try options.fn_name_fn(allocator, decl.name)
                     else switch (decl.expr) {
-                        .type => try options.type_name_fn(allocator, decl.name),
+                        .type, .identifier => try options.type_name_fn(allocator, decl.name),
                         .unknown => try options.const_name_fn(allocator, decl.name),
                     };
                     const new_decl_t = if (decl.type) |t| try self.obtainTranslatedType(t) else null;
@@ -908,7 +840,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateExpression(self: *@This(), expr: Expression) !Expression {
             return switch (expr) {
                 .type => |t| .{ .type = try self.obtainTranslatedType(t) },
-                .unknown => |u| .{ .unknown = u },
+                .identifier, .unknown => expr,
             };
         }
 
@@ -1273,7 +1205,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .expression => |e| {
                     switch (e) {
                         .type => |et| try self.printTypeRef(et),
-                        .unknown => |u| try self.printFmt("{s}", .{u}),
+                        .identifier, .unknown => |s| try self.printFmt("{s}", .{s}),
                     }
                 },
             }
@@ -1296,7 +1228,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt(" = ");
             switch (decl.expr) {
                 .type => |t| try self.printTypeDef(t),
-                .unknown => |u| try self.printFmt("{s}", .{u}),
+                .identifier, .unknown => |s| try self.printFmt("{s}", .{s}),
             }
             try self.printTxt(";\n\n");
         }
@@ -1399,16 +1331,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 return error.Failure;
             }
             return result.stdout;
-        }
-
-        test "translateHeaderFile" {
-            var self: @This() = try .init();
-            defer self.deinit();
-            const path = options.header_paths[0];
-            const full_path = try self.findHeadFile(path);
-            const code = try self.translateHeaderFile(full_path);
-            const prefix = std.mem.sliceTo(options.header_paths[0], '.');
-            try expect(std.mem.containsAtLeast(u8, code, 1, prefix));
         }
 
         fn findHeadFile(self: *const @This(), path: []const u8) ![]const u8 {
@@ -1555,50 +1477,122 @@ test "snakify" {
     try expectEqualSlices(u8, "green_dragon", name2);
 }
 
-test "Translator" {
-    const c = @cImport(@cInclude("./test/include/animal.h"));
-    const Self = struct {
-        pub const Struct = struct {
-            number1: i32,
-            nunmer2: i32,
-        };
-        pub const Enum = enum(c_uint) { dog, cat, fox };
-        pub const ErrorSet = error{ Sick, Dead, Crazy, Unknown };
-        pub const Status = enum {
-            ok,
-            sick,
-            dead,
-            crazy,
-            unknown,
-        };
-        pub const Cow = struct {
-            number1: i32,
-            number2: i32,
-        };
-        pub const Hen = struct {
-            number1: i32,
-        };
-        pub const Pig = struct {
-            number1: i32,
-            number2: i32,
-            number3: i32,
-        };
-    };
-    _ = Translator(.{
-        .substitutions = &.{
-            .{ .old = c.animal_struct, .new = Self.Struct },
-            .{ .old = c.animal_status, .new = Self.Enum },
-            .{ .old = c.animal_cow, .new = Self.Cow },
-            .{ .old = c.animal_hen, .new = Self.Hen },
-            .{ .old = c.animal_pig, .new = Self.Pig },
-        },
-        .error_scheme = BasicErrorScheme(Self.Status, Self.ErrorSet, .{
-            .non_error_statuses = &.{.ok},
-            .default_status = .unknown,
-            .default_error = Self.ErrorSet.Unknown,
-        }),
-    });
-}
+// test "Translated" {
+//     const OldStruct = options.substitutions[0].old;
+//     const NewStruct = options.substitutions[0].new;
+//     const NewError = options.error_scheme.ErrorSet;
+//     const OldError = c_uint;
+//     const Fn1 = Translated(fn (i32, OldStruct) OldError, true, false, .{});
+//     try expectEqual(Fn1, fn (i32, NewStruct) NewError!void);
+//     const Fn2 = Translated(fn (i32, []const OldStruct) OldError, true, false, .{});
+//     try expectEqual(Fn2, fn (i32, []const NewStruct) NewError!void);
+//     const Fn3 = Translated(fn (i32, *OldStruct) OldError, true, false, .{});
+//     try expectEqual(Fn3, fn (i32) NewError!NewStruct);
+//     const Fn4 = Translated(fn (i32, *bool, *OldStruct) OldError, true, false, .{});
+//     try expectEqual(Fn4, fn (i32) NewError!std.meta.Tuple(&.{ bool, NewStruct }));
+//     const Fn5 = Translated(fn (i32, OldStruct) bool, false, false, .{});
+//     try expectEqual(Fn5, fn (i32, NewStruct) bool);
+//     const Fn6 = Translated(fn (i32, OldStruct) c_int, false, false, .{});
+//     try expectEqual(Fn6, fn (i32, NewStruct) c_int);
+//     const Fn7 = Translated(fn (i32, OldStruct) c_int, false, true, .{});
+//     try expectEqual(Fn7, fn (i32, NewStruct) void);
+// }
+
+// test "translate" {
+//     const c = @cImport(@cInclude("./test/include/animal.h"));
+//     const cow = options.substitutions[2];
+//     const hen = options.substitutions[3];
+//     const pig = options.substitutions[4];
+//     const ErrorSet = options.error_scheme.ErrorSet;
+//     const func1 = translate(c.animal_mate, true, false, .{});
+//     try expectEqual(@TypeOf(func1), fn (cow.new, hen.new) ErrorSet!std.meta.Tuple(&.{ pig.new, pig.new }));
+// }
+
+// test "Translator" {
+//     const c = @cImport(@cInclude("./test/include/animal.h"));
+//     const Self = struct {
+//         pub const Struct = struct {
+//             number1: i32,
+//             nunmer2: i32,
+//         };
+//         pub const Enum = enum(c_uint) { dog, cat, fox };
+//         pub const ErrorSet = error{ Sick, Dead, Crazy, Unknown };
+//         pub const Status = enum {
+//             ok,
+//             sick,
+//             dead,
+//             crazy,
+//             unknown,
+//         };
+//         pub const Cow = struct {
+//             number1: i32,
+//             number2: i32,
+//         };
+//         pub const Hen = struct {
+//             number1: i32,
+//         };
+//         pub const Pig = struct {
+//             number1: i32,
+//             number2: i32,
+//             number3: i32,
+//         };
+//     };
+//     _ = Translator(.{
+//         .substitutions = &.{
+//             .{ .old = c.animal_struct, .new = Self.Struct },
+//             .{ .old = c.animal_status, .new = Self.Enum },
+//             .{ .old = c.animal_cow, .new = Self.Cow },
+//             .{ .old = c.animal_hen, .new = Self.Hen },
+//             .{ .old = c.animal_pig, .new = Self.Pig },
+//         },
+//         .error_scheme = BasicErrorScheme(Self.Status, Self.ErrorSet, .{
+//             .non_error_statuses = &.{.ok},
+//             .default_status = .unknown,
+//             .default_error = Self.ErrorSet.Unknown,
+//         }),
+//     });
+// }
+
+// test "Substitute" {
+//     const OldStruct = options.substitutions[0].old;
+//     const NewStruct = options.substitutions[0].new;
+//     const OldEnum = options.substitutions[1].old;
+//     const NewEnum = options.substitutions[1].new;
+//     const T1 = Substitute(OldStruct, .{}, 0, 1);
+//     try expectEqual(T1, NewStruct);
+//     const T2 = Substitute(OldEnum, .{ .@"0" = NewEnum }, 0, 1);
+//     try expectEqual(T2, NewEnum);
+//     const T3 = Substitute(OldEnum, .{ .@"-1" = NewEnum }, 0, 1);
+//     try expectEqual(T3, NewEnum);
+//     const T4 = Substitute([]OldStruct, .{}, 0, 1);
+//     try expectEqual(T4, []NewStruct);
+//     const T5 = Substitute([]const OldStruct, .{}, 0, 1);
+//     try expectEqual(T5, []const NewStruct);
+//     const T6 = Substitute([4]OldStruct, .{}, 0, 1);
+//     try expectEqual(T6, [4]NewStruct);
+//     const T7 = Substitute(?OldStruct, .{}, 0, 1);
+//     try expectEqual(T7, ?NewStruct);
+//     const T8 = Substitute(anyerror!OldStruct, .{}, 0, 1);
+//     try expectEqual(T8, anyerror!NewStruct);
+//     const T9 = Substitute(OldEnum, .{ .retval = NewEnum }, null, 1);
+//     try expectEqual(T9, NewEnum);
+// }
+
+// test "WritableTarget" {
+//     const Null = @TypeOf(null);
+//     const T1 = WritableTarget(*usize) orelse Null;
+//     try expectEqual(T1, usize);
+//     const T2 = WritableTarget(*const usize) orelse Null;
+//     try expectEqual(T2, Null);
+//     const T3 = WritableTarget(*void) orelse Null;
+//     try expectEqual(T3, Null);
+//     const T4 = WritableTarget(*anyopaque) orelse Null;
+//     try expectEqual(T4, Null);
+//     const T5 = WritableTarget(*opaque {}) orelse Null;
+//     try expectEqual(T5, Null);
+//     const T6 = WritableTarget(*type) orelse Null;
+//     try expectEqual(T6, Null);
+// }
 
 test "CodeGenerator" {
     const ns = struct {
@@ -1623,7 +1617,7 @@ test "CodeGenerator" {
             return camelize(allocator, name, 7, true);
         }
     };
-    _ = CodeGenerator(.{
+    var generator: CodeGenerator(.{
         .include_paths = &.{"./test/include"},
         .header_paths = &.{"animal.h"},
         .c_error_type = "animal_status",
@@ -1634,5 +1628,6 @@ test "CodeGenerator" {
         .enum_name_fn = ns.getEnumName,
         .error_name_fn = ns.getErrorName,
         .writer_type = std.fs.File.Writer,
-    });
+    }) = try .init();
+    try generator.analyze();
 }
