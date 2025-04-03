@@ -480,24 +480,15 @@ pub const Namespace = struct {
             _ = self.to_name.remove(t);
         }
     }
-
-    pub fn nameIterator(self: *@This()) std.AutoHashMap(*Type, []const u8).ValueIterator {
-        return self.to_name.valueIterator();
-    }
-
-    pub fn typeIterator(self: *@This()) std.StringHashMap(*Type).ValueIterator {
-        return self.to_type.valueIterator();
-    }
 };
 
 pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
     return struct {
-        var gpa: std.heap.DebugAllocator(.{}) = .init;
-        var arena: std.heap.ArenaAllocator = .init(gpa.allocator());
-        const allocator = arena.allocator();
         const Ast = std.zig.Ast;
 
-        base_path: []const u8,
+        arena: std.heap.ArenaAllocator,
+        allocator: std.mem.Allocator,
+        cwd_path: []const u8,
         indent_level: usize,
         indented: bool,
         old_root: *Type,
@@ -510,24 +501,28 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         void_type: *Type,
         writer: options.writer_type = undefined,
 
-        pub fn init() !@This() {
-            return .{
-                .base_path = try std.process.getCwdAlloc(allocator),
-                .indent_level = 0,
-                .indented = false,
-                .old_root = try createType(.{ .container = .{ .kind = "struct" } }),
-                .old_namespace = .init(allocator),
-                .old_to_new_type_map = .init(allocator),
-                .new_root = try createType(.{ .container = .{ .kind = "struct" } }),
-                .new_namespace = .init(allocator),
-                .new_error_set = try createType(.{ .error_set = &.{} }),
-                .non_error_enums = &.{},
-                .void_type = try createType(.{ .expression = .{ .identifier = "void" } }),
-            };
+        pub fn init(allocator: std.mem.Allocator) !*@This() {
+            var arena: std.heap.ArenaAllocator = .init(allocator);
+            var self = try arena.allocator().create(@This());
+            self.arena = arena;
+            self.allocator = self.arena.allocator();
+            self.cwd_path = try std.process.getCwdAlloc(self.allocator);
+            self.indent_level = 0;
+            self.indented = false;
+            self.old_root = try self.createType(.{ .container = .{ .kind = "struct" } });
+            self.old_namespace = .init(self.allocator);
+            self.old_to_new_type_map = .init(self.allocator);
+            self.new_root = try self.createType(.{ .container = .{ .kind = "struct" } });
+            self.new_namespace = .init(self.allocator);
+            self.new_error_set = try self.createType(.{ .error_set = &.{} });
+            self.non_error_enums = &.{};
+            self.void_type = try self.createType(.{ .expression = .{ .identifier = "void" } });
+            return self;
         }
 
-        pub fn deinit(_: *@This()) void {
-            _ = arena.reset(.free_all);
+        pub fn deinit(self: *@This()) void {
+            var arena = self.arena;
+            arena.deinit();
         }
 
         pub fn analyze(self: *@This()) !void {
@@ -545,10 +540,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn processHeaderFiles(self: *@This()) !void {
             for (options.header_paths) |path| {
-                const full_path = try self.findHeadFile(path);
+                const full_path = try self.findSourceFile(path);
                 const output = try self.translateHeaderFile(full_path);
-                const source = try allocator.dupeZ(u8, output);
-                const tree = try Ast.parse(allocator, source, .zig);
+                const source = try self.allocator.dupeZ(u8, output);
+                const tree = try Ast.parse(self.allocator, source, .zig);
                 for (tree.rootDecls()) |node| {
                     var buffer1: [1]Ast.Node.Index = undefined;
                     if (tree.fullFnProto(&buffer1, node)) |proto| {
@@ -605,11 +600,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return switch (expr) {
                 .type => |t| t,
                 .identifier => |i| self.old_namespace.getType(i) orelse add: {
-                    const t = try createType(.{ .expression = expr });
+                    const t = try self.createType(.{ .expression = expr });
                     try self.old_namespace.addType(i, t);
                     break :add t;
                 },
-                .unknown => try createType(.{ .expression = expr }),
+                .unknown => try self.createType(.{ .expression = expr }),
             };
         }
 
@@ -618,7 +613,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (proto.ast.params) |param| {
                 // see if there's a colon in front of the param type
                 const before = tree.tokenSlice(tree.firstToken(param) - 1);
-                try append(&params, .{
+                try self.append(&params, .{
                     .name = switch (std.mem.eql(u8, before, ":")) {
                         true => tree.tokenSlice(tree.firstToken(param) - 2),
                         false => null,
@@ -626,7 +621,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .type = try self.obtainType(tree, param),
                 });
             }
-            return try createType(.{
+            return try self.createType(.{
                 .function = .{
                     .parameters = params,
                     .return_type = try self.obtainType(tree, proto.ast.return_type),
@@ -639,14 +634,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var fields: []Field = &.{};
             for (decl.ast.members) |member| {
                 if (tree.fullContainerField(member)) |field| {
-                    try append(&fields, .{
+                    try self.append(&fields, .{
                         .name = tree.tokenSlice(field.ast.main_token),
                         .type = try self.obtainType(tree, field.ast.type_expr),
                         .alignment = nodeSlice(tree, field.ast.align_expr),
                     });
                 }
             }
-            return try createType(.{
+            return try self.createType(.{
                 .container = .{
                     .kind = tree.tokenSlice(decl.ast.main_token),
                     .fields = fields,
@@ -655,7 +650,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn obtainPointerType(self: *@This(), tree: Ast, ptr_type: Ast.full.PtrType, is_optional: bool) !*Type {
-            return try createType(.{
+            return try self.createType(.{
                 .pointer = .{
                     .child_type = try self.obtainType(tree, ptr_type.ast.child_type),
                     .sentinel = nodeSlice(tree, ptr_type.ast.sentinel),
@@ -676,10 +671,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (0..count) |_| {
                 const decl = self.old_root.container.decls[index];
                 const value = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch unreachable;
-                try append(&items, .{ .name = decl.name, .value = value });
-                remove(&self.old_root.container.decls, index);
+                try self.append(&items, .{ .name = decl.name, .value = value });
+                self.remove(&self.old_root.container.decls, index);
             }
-            return try createType(.{
+            return try self.createType(.{
                 .enumeration = .{
                     .items = items,
                     .is_signed = is_signed,
@@ -748,11 +743,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.old_namespace.addType(decl.name, decl.expr.type);
                 }
             }
-            try append(&self.old_root.container.decls, copy);
+            try self.append(&self.old_root.container.decls, copy);
         }
 
-        fn createType(info: Type) !*Type {
-            const t = try allocator.create(Type);
+        fn createType(self: *@This(), info: Type) !*Type {
+            const t = try self.allocator.create(Type);
             t.* = info;
             return t;
         }
@@ -785,7 +780,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateDeclarations(self: *@This()) !void {
             // add error set
             try self.deriveErrorSet();
-            try append(&self.new_root.container.decls, .{
+            try self.append(&self.new_root.container.decls, .{
                 .name = options.error_set,
                 .expr = .{ .type = self.new_error_set },
             });
@@ -795,10 +790,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const is_function = decl.type != null and decl.type.?.* == .function;
                     // get name in target namespace
                     const new_name = if (is_function)
-                        try options.fn_name_fn(allocator, decl.name)
+                        try options.fn_name_fn(self.allocator, decl.name)
                     else switch (decl.expr) {
-                        .type, .identifier => try options.type_name_fn(allocator, decl.name),
-                        .unknown => try options.const_name_fn(allocator, decl.name),
+                        .type, .identifier => try options.type_name_fn(self.allocator, decl.name),
+                        .unknown => try options.const_name_fn(self.allocator, decl.name),
                     };
                     const new_decl_t = if (decl.type) |t| try self.obtainTranslatedType(t) else null;
                     const expr = if (is_function)
@@ -812,7 +807,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         }
                         try self.new_namespace.addType(new_name, expr.type);
                     }
-                    try append(&self.new_root.container.decls, .{
+                    try self.append(&self.new_root.container.decls, .{
                         .name = new_name,
                         .type = new_decl_t,
                         .alignment = decl.alignment,
@@ -843,7 +838,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 if (new_t.* == .pointer) {
                     for (new_root.container.decls, 0..) |decl, i| {
                         if (decl.expr == .type and decl.expr.type == new_t) {
-                            remove(&new_root.container.decls, i);
+                            self.remove(&new_root.container.decls, i);
                             self.new_namespace.removeType(new_t);
                             break;
                         }
@@ -862,7 +857,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateField(self: *@This(), field: Field) !Field {
-            const new_name = try options.field_name_fn(allocator, field.name);
+            const new_name = try options.field_name_fn(self.allocator, field.name);
             return .{
                 .name = new_name,
                 .type = try self.obtainTranslatedType(field.type),
@@ -871,15 +866,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateParameter(self: *@This(), param: Parameter) !Parameter {
-            const new_name = if (param.name) |n| try options.param_name_fn(allocator, n) else null;
+            const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
             return .{
                 .name = new_name,
                 .type = try self.obtainTranslatedType(param.type),
             };
         }
 
-        fn translateEnumItem(_: *@This(), item: EnumItem) !EnumItem {
-            const new_name = try options.enum_name_fn(allocator, item.name);
+        fn translateEnumItem(self: *@This(), item: EnumItem) !EnumItem {
+            const new_name = try options.enum_name_fn(self.allocator, item.name);
             return .{
                 .name = new_name,
                 .value = item.value,
@@ -892,7 +887,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     var new_fields: []Field = &.{};
                     for (c.fields) |field| {
                         const new_field = try self.translateField(field);
-                        try append(&new_fields, new_field);
+                        try self.append(&new_fields, new_field);
                     }
                     return .{
                         .container = .{
@@ -919,7 +914,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     var new_items: []EnumItem = &.{};
                     for (e.items) |item| {
                         const new_field = try self.translateEnumItem(item);
-                        try append(&new_items, new_field);
+                        try self.append(&new_items, new_field);
                     }
                     return .{
                         .enumeration = .{
@@ -935,32 +930,31 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const output_start = for (0..f.parameters.len) |offset| {
                         const index = f.parameters.len - offset - 1;
                         const param = f.parameters[index];
-                        if (!self.isWritable(param.type)) break index + 1;
+                        if (!self.isWriteTarget(param.type)) break index + 1;
                     } else 0;
                     for (f.parameters, 0..) |param, index| {
                         if (index >= output_start) {
-                            const output_ptr = try self.obtainTranslatedType(param.type);
-                            const output_type = output_ptr.pointer.child_type;
-                            try append(&output_types, output_type);
+                            const output_type = try self.obtainTranslatedType(param.type);
+                            try self.append(&output_types, output_type.pointer.child_type);
                         }
                     }
                     // see if the translated function should return an error union
                     const can_fail = self.isReturningError(t);
                     const status_type = try self.obtainTranslatedType(f.return_type);
                     const extra: usize = if (!can_fail or self.non_error_enums.len > 1) 1 else 0;
-                    if (extra == 1) try append(&output_types, status_type);
+                    if (extra == 1) try self.append(&output_types, status_type);
                     const arg_count = f.parameters.len + extra - output_types.len;
                     for (f.parameters[0..arg_count]) |param| {
                         const new_param = try self.translateParameter(param);
-                        try append(&new_params, new_param);
+                        try self.append(&new_params, new_param);
                     }
                     const payload_type = switch (output_types.len) {
                         0 => self.void_type,
                         1 => output_types[0],
-                        else => try createType(.{ .type_tuple = output_types }),
+                        else => try self.createType(.{ .type_tuple = output_types }),
                     };
                     const return_type = switch (can_fail) {
-                        true => try createType(.{
+                        true => try self.createType(.{
                             .error_union = .{
                                 .payload_type = payload_type,
                                 .error_set = self.new_error_set,
@@ -985,14 +979,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
-        fn isWritable(_: *@This(), t: *const Type) bool {
+        fn isWriteTarget(_: *@This(), t: *const Type) bool {
             return switch (t.*) {
-                .pointer => |p| check: {
-                    if (p.is_const) break :check false;
-                    if (p.child_type.* == .container) {
-                        if (p.child_type.container.fields.len == 0) break :check false;
-                    }
-                    break :check true;
+                .pointer => |p| !p.is_const and !isOpaque(p.child_type),
+                else => false,
+            };
+        }
+
+        fn isOpaque(t: *const Type) bool {
+            return switch (t.*) {
+                .container => |c| c.fields.len == 0,
+                .expression => |e| switch (e) {
+                    .type => |ref_t| isOpaque(ref_t),
+                    .identifier => |i| std.mem.eql(u8, i, "anyopaque"),
+                    .unknown => false,
                 },
                 else => false,
             };
@@ -1011,11 +1011,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 if (t.* == .enumeration) {
                     for (t.enumeration.items) |item| {
                         if (options.enum_is_error(item.name, item.value)) {
-                            const name = try options.error_name_fn(allocator, item.name);
-                            try append(&names, name);
+                            const name = try options.error_name_fn(self.allocator, item.name);
+                            try self.append(&names, name);
                         } else {
-                            const name = try options.enum_name_fn(allocator, item.name);
-                            try append(&non_errors, name);
+                            const name = try options.enum_name_fn(self.allocator, item.name);
+                            try self.append(&non_errors, name);
                         }
                     }
                 }
@@ -1023,7 +1023,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const has_unexpected = for (names) |n| {
                 if (std.mem.eql(u8, n, "Unexpected")) break true;
             } else false;
-            if (!has_unexpected) try append(&names, "Unexpected");
+            if (!has_unexpected) try self.append(&names, "Unexpected");
             self.new_error_set.error_set = names;
             try self.new_namespace.addType(options.error_set, self.new_error_set);
             self.non_error_enums = non_errors;
@@ -1037,8 +1037,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 switch (param.type.*) {
                     .enumeration, .expression => {
                         if (self.new_namespace.getName(param.type)) |name| {
-                            const pair = try std.fmt.allocPrint(allocator, ".@\"{d}\" = {s}", .{ index, name });
-                            try append(&non_unique_args, pair);
+                            const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ index, name });
+                            try self.append(&non_unique_args, pair);
                         }
                     },
                     else => {},
@@ -1049,18 +1049,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 switch (return_type.*) {
                     .enumeration, .expression => {
                         if (self.new_namespace.getName(return_type)) |name| {
-                            const pair = try std.fmt.allocPrint(allocator, ".retval = {s}", .{name});
-                            try append(&non_unique_args, pair);
+                            const pair = try std.fmt.allocPrint(self.allocator, ".retval = {s}", .{name});
+                            try self.append(&non_unique_args, pair);
                         }
                     },
                     else => {},
                 }
             }
             const local_subs = if (non_unique_args.len > 0) get: {
-                const local_subs_pairs = try std.mem.join(allocator, ", ", non_unique_args);
-                break :get try std.fmt.allocPrint(allocator, " {s} ", .{local_subs_pairs});
+                const local_subs_pairs = try std.mem.join(self.allocator, ", ", non_unique_args);
+                break :get try std.fmt.allocPrint(self.allocator, " {s} ", .{local_subs_pairs});
             } else "";
-            const code = try std.fmt.allocPrint(allocator, "{s}.translate({s}.{s}, {}, {}, .{{{s}}})", .{
+            const code = try std.fmt.allocPrint(self.allocator, "{s}.translate({s}.{s}, {}, {}, .{{{s}}})", .{
                 options.translater,
                 options.c_import,
                 decl.name,
@@ -1073,7 +1073,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn obtainTranslatedType(self: *@This(), t: *Type) std.mem.Allocator.Error!*Type {
             return self.old_to_new_type_map.get(t) orelse add: {
-                const new_t = try createType(try self.translateType(t));
+                const new_t = try self.createType(try self.translateType(t));
                 try self.old_to_new_type_map.put(t, new_t);
                 break :add new_t;
             };
@@ -1082,9 +1082,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         const WriteError = std.fs.File.WriteError;
 
         fn printImports(self: *@This()) WriteError!void {
-            try self.printTxt("const std = import(\"std\");\n");
-            try self.printTxt("const api_translator = import(\"api-translator.zig\");\n");
-            try self.printTxt("\n");
+            try self.printTxt("const std = @import(\"std\");\n");
+            try self.printTxt("const api_translator = @import(\"api-translator.zig\");\n");
+            try self.printFmt("const {s} = @cImport({{\n", .{options.c_import});
+            for (options.header_paths) |path| {
+                try self.printFmt("@cInclude(\"{s}\");\n", .{path});
+            }
+            try self.printTxt("}});\n\n");
         }
 
         fn printTypeRef(self: *@This(), t: *Type) WriteError!void {
@@ -1264,20 +1268,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (new_enum_t.* == .enumeration) {
                 var literals: [][]const u8 = &.{};
                 for (self.non_error_enums) |name| {
-                    const literal = try std.fmt.allocPrint(allocator, ".{s}", .{name});
-                    try append(&literals, literal);
+                    const literal = try std.fmt.allocPrint(self.allocator, ".{s}", .{name});
+                    try self.append(&literals, literal);
                 }
-                const list = try std.mem.join(allocator, ", ", literals);
+                const list = try std.mem.join(self.allocator, ", ", literals);
                 non_error_statuses = switch (self.non_error_enums.len) {
-                    1 => try std.fmt.allocPrint(allocator, ".{{{s}}}", .{list}),
-                    else => try std.fmt.allocPrint(allocator, ".{{ {s} }}", .{list}),
+                    1 => try std.fmt.allocPrint(self.allocator, ".{{{s}}}", .{list}),
+                    else => try std.fmt.allocPrint(self.allocator, ".{{ {s} }}", .{list}),
                 };
                 for (new_enum_t.enumeration.items) |item| {
                     const is_error = for (self.non_error_enums) |name| {
                         if (std.mem.eql(u8, name, item.name)) break false;
                     } else true;
                     if (is_error) {
-                        default_status = try std.fmt.allocPrint(allocator, ".{s}", .{item.name});
+                        default_status = try std.fmt.allocPrint(self.allocator, ".{s}", .{item.name});
                         break;
                     }
                 }
@@ -1329,17 +1333,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return self.printFmt(txt, .{});
         }
 
-        fn translateHeaderFile(_: *@This(), full_path: []const u8) ![]const u8 {
+        fn translateHeaderFile(self: *@This(), full_path: []const u8) ![]const u8 {
             var argv: [][]const u8 = &.{};
-            try append(&argv, "zig");
-            try append(&argv, "translate-c");
-            try append(&argv, full_path);
+            try self.append(&argv, "zig");
+            try self.append(&argv, "translate-c");
+            try self.append(&argv, full_path);
             for (options.include_paths) |include_path| {
-                const arg = try std.fmt.allocPrint(allocator, "-I{s}", .{include_path});
-                try append(&argv, arg);
+                const arg = try std.fmt.allocPrint(self.allocator, "-I{s}", .{include_path});
+                try self.append(&argv, arg);
             }
             const result = try std.process.Child.run(.{
-                .allocator = allocator,
+                .allocator = self.allocator,
                 .argv = argv,
                 .max_output_bytes = 1024 * 1024 * 128,
             });
@@ -1350,18 +1354,48 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return result.stdout;
         }
 
-        fn findHeadFile(self: *const @This(), path: []const u8) ![]const u8 {
+        fn findSourceFile(self: *@This(), path: []const u8) ![]const u8 {
             for (options.include_paths) |include_path| {
-                const full_path = try std.fs.path.resolve(allocator, &.{
-                    self.base_path,
+                const full_path = try std.fs.path.resolve(self.allocator, &.{
+                    self.cwd_path,
                     include_path,
                     path,
                 });
                 if (std.fs.accessAbsolute(full_path, .{})) |_| {
                     return full_path;
-                } else |_| allocator.free(full_path);
+                } else |_| self.allocator.free(full_path);
             }
             return error.FileNotFound;
+        }
+
+        fn append(self: *@This(), slice_ptr: anytype, value: GrandchildOf(@TypeOf(slice_ptr))) !void {
+            const len = slice_ptr.*.len;
+            const capacity = calcCapacity(len);
+            const new_len = len + 1;
+            const new_capacity = calcCapacity(new_len);
+            if (new_capacity != capacity) {
+                const slice_before = slice_ptr.*.ptr[0..capacity];
+                slice_ptr.* = try self.allocator.realloc(slice_before, new_capacity);
+            }
+            slice_ptr.*.len = new_len;
+            slice_ptr.*[len] = value;
+        }
+
+        fn remove(self: *@This(), slice_ptr: anytype, index: usize) void {
+            _ = GrandchildOf(@TypeOf(slice_ptr));
+            const len = slice_ptr.*.len;
+            var i: usize = index;
+            while (i + 1 < len) : (i += 1) {
+                slice_ptr.*[i] = slice_ptr.*[i + 1];
+            }
+            const capacity = calcCapacity(len);
+            const new_len = len - 1;
+            const new_capacity = calcCapacity(new_len);
+            if (new_capacity != capacity) {
+                const slice_before = slice_ptr.*.ptr[0..capacity];
+                slice_ptr.* = self.allocator.realloc(slice_before, new_capacity) catch unreachable;
+            }
+            slice_ptr.*.len = new_len;
         }
 
         fn calcCapacity(len: usize) usize {
@@ -1382,36 +1416,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 },
                 else => @compileError("Not a pointer"),
             };
-        }
-
-        fn append(slice_ptr: anytype, value: GrandchildOf(@TypeOf(slice_ptr))) !void {
-            const len = slice_ptr.*.len;
-            const capacity = calcCapacity(len);
-            const new_len = len + 1;
-            const new_capacity = calcCapacity(new_len);
-            if (new_capacity != capacity) {
-                const slice_before = slice_ptr.*.ptr[0..capacity];
-                slice_ptr.* = try allocator.realloc(slice_before, new_capacity);
-            }
-            slice_ptr.*.len = new_len;
-            slice_ptr.*[len] = value;
-        }
-
-        fn remove(slice_ptr: anytype, index: usize) void {
-            _ = GrandchildOf(@TypeOf(slice_ptr));
-            const len = slice_ptr.*.len;
-            var i: usize = index;
-            while (i + 1 < len) : (i += 1) {
-                slice_ptr.*[i] = slice_ptr.*[i + 1];
-            }
-            const capacity = calcCapacity(len);
-            const new_len = len - 1;
-            const new_capacity = calcCapacity(new_len);
-            if (new_capacity != capacity) {
-                const slice_before = slice_ptr.*.ptr[0..capacity];
-                slice_ptr.* = allocator.realloc(slice_before, new_capacity) catch unreachable;
-            }
-            slice_ptr.*.len = new_len;
         }
     };
 }
@@ -1634,7 +1638,8 @@ test "CodeGenerator" {
             return camelize(allocator, name, 7, true);
         }
     };
-    var generator: CodeGenerator(.{
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
         .include_paths = &.{"./test/include"},
         .header_paths = &.{"animal.h"},
         .c_error_type = "animal_status",
@@ -1645,6 +1650,7 @@ test "CodeGenerator" {
         .enum_name_fn = ns.getEnumName,
         .error_name_fn = ns.getErrorName,
         .writer_type = std.fs.File.Writer,
-    }) = try .init();
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
     try generator.analyze();
 }
