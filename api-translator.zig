@@ -499,6 +499,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         new_error_set: *Type,
         non_error_enums: []const []const u8,
         void_type: *Type,
+        type_lookup: ?*Type,
         writer: options.writer_type = undefined,
 
         pub fn init(allocator: std.mem.Allocator) !*@This() {
@@ -517,6 +518,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.new_error_set = try self.createType(.{ .error_set = &.{} });
             self.non_error_enums = &.{};
             self.void_type = try self.createType(.{ .expression = .{ .identifier = "void" } });
+            self.type_lookup = null;
             return self;
         }
 
@@ -712,7 +714,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const is_signed_int = std.mem.eql(u8, rhs, "c_int");
             const is_unsigned_int = std.mem.eql(u8, rhs, "c_uint");
             if (is_signed_int or is_unsigned_int) {
-
                 // enum items are declared ahead of the type;
                 // scan backward looking for int values
                 const decls = self.old_root.container.decls;
@@ -759,21 +760,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn resolveForwardDeclarations(self: *@This()) !void {
-            while (true) {
-                var unresolved: usize = 0;
-                var resolved: usize = 0;
-                for (self.old_root.container.decls) |*decl| {
-                    if (decl.expr == .identifier) {
-                        if (self.old_namespace.getType(decl.expr.identifier)) |t| {
-                            decl.expr = .{ .type = t };
-                            try self.old_namespace.addType(decl.name, t);
-                            resolved += 1;
-                        } else {
-                            unresolved += 1;
-                        }
-                    }
+            for (self.old_root.container.decls) |*decl| {
+                if (decl.expr == .identifier) {
+                    const t = self.old_namespace.getType(decl.expr.identifier) orelse add: {
+                        // assume that undefined identifiers refer to types
+                        break :add try self.createType(.{ .expression = decl.expr });
+                    };
+                    try self.old_namespace.addType(decl.name, t);
                 }
-                if (unresolved == 0 or resolved == 0) break;
             }
         }
 
@@ -852,7 +846,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateExpression(self: *@This(), expr: Expression) !Expression {
             return switch (expr) {
                 .type => |t| .{ .type = try self.obtainTranslatedType(t) },
-                .identifier, .unknown => expr,
+                .identifier => |i| if (self.old_namespace.getType(i)) |t| .{
+                    .type = translate: {
+                        // if the attempt to translate the type comes back here, then
+                        // just use the old name, which should refer to a builtin type
+                        if (self.type_lookup == t) {
+                            break :translate t;
+                        } else {
+                            self.type_lookup = t;
+                            defer self.type_lookup = null;
+                            break :translate try self.obtainTranslatedType(t);
+                        }
+                    },
+                } else expr,
+                .unknown => expr,
             };
         }
 
