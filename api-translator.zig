@@ -23,6 +23,7 @@ pub const CodeGeneratorOptions = struct {
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
     target_ns: type,
+    add_simple_test: bool = true,
     writer_type: type = std.fs.File.Writer,
 
     filter_fn: fn ([]const u8) bool,
@@ -374,10 +375,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         fn WritableTarget(comptime T: type) ?type {
             const info = @typeInfo(T);
             if (info == .pointer and !info.pointer.is_const) {
-                const Target = switch (@typeInfo(info.pointer.child)) {
-                    .optional => |op| op.child,
-                    else => info.pointer.child,
-                };
+                const Target = info.pointer.child;
                 if (@typeInfo(Target) != .@"opaque" and @sizeOf(Target) != 0) return Target;
             }
             return null;
@@ -538,6 +536,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printImports();
             try self.printTypeDef(self.new_root);
             try self.printTrainslatorSetup();
+            if (options.add_simple_test) try self.printSimpleTest();
         }
 
         fn processHeaderFiles(self: *@This()) !void {
@@ -1309,12 +1308,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 }
             }
             try self.printTxt("}},\n");
-            try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, .{{\n", .{ options.error_set, enum_name });
+            try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, .{{\n", .{ enum_name, options.error_set });
             try self.printFmt(".non_error_statuses = &{s},\n", .{non_error_statuses});
             try self.printFmt(".default_status = {s},\n", .{default_status});
             try self.printFmt(".default_error = {s}.Unexpected,\n", .{options.error_set});
             try self.printTxt("}}),\n");
             try self.printTxt("}});\n");
+        }
+
+        fn printSimpleTest(self: *@This()) !void {
+            try self.printTxt("\ntest {{\n");
+            try self.printTxt("inline for (comptime std.meta.declarations(@This())) |decl| {{\n");
+            try self.printTxt("_ = @field(@This(), decl.name);\n");
+            try self.printTxt("}}\n");
+            try self.printTxt("}}\n");
         }
 
         fn printFmt(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
