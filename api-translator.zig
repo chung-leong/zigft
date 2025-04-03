@@ -578,21 +578,21 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     else => try self.obtainType(tree, decl.ast.type_node),
                 },
                 .alignment = nodeSlice(tree, decl.ast.align_node),
-                .expr = try self.obtainExpression(tree, decl.ast.init_node),
+                .expr = try self.obtainExpression(tree, decl.ast.init_node, true),
             });
         }
 
-        fn obtainExpression(self: *@This(), tree: Ast, node: Ast.Node.Index) !Expression {
+        fn obtainExpression(self: *@This(), tree: Ast, node: Ast.Node.Index, is_rhs: bool) !Expression {
             var buffer1: [1]Ast.Node.Index = undefined;
             var buffer2: [2]Ast.Node.Index = undefined;
             return if (tree.fullFnProto(&buffer1, node)) |fn_proto| .{
                 .type = try self.obtainFunctionType(tree, fn_proto),
             } else if (tree.fullContainerDecl(&buffer2, node)) |decl| .{
                 .type = try self.obtainContainerType(tree, decl),
-            } else if (self.detectPointerType(tree, node)) |tuple| .{
-                .type = try self.obtainPointerType(tree, tuple[0], tuple[1]),
-            } else if (self.detectEnumType(tree, node)) |tuple| .{
-                .type = try self.obtainEnumType(tree, tuple[0], tuple[1]),
+            } else if (self.detectPointerType(tree, node)) |p| .{
+                .type = try self.obtainPointerType(tree, p.ptr_type, p.is_optional),
+            } else if (self.detectEnumType(tree, node, is_rhs)) |e| .{
+                .type = try self.obtainEnumType(tree, e.item_count, e.is_signed),
             } else if (tree.nodes.items(.tag)[node] == .identifier) .{
                 .identifier = nodeSlice(tree, node).?,
             } else .{
@@ -601,7 +601,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn obtainType(self: *@This(), tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!*Type {
-            const expr = try self.obtainExpression(tree, node);
+            const expr = try self.obtainExpression(tree, node, false);
             return switch (expr) {
                 .type => |t| t,
                 .identifier => |i| self.old_namespace.getType(i) orelse add: {
@@ -687,23 +687,37 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
-        fn detectPointerType(_: *@This(), tree: Ast, node: Ast.Node.Index) ?std.meta.Tuple(&.{ Ast.full.PtrType, bool }) {
-            if (tree.fullPtrType(node)) |ptr_type| return .{ ptr_type, false } else {
+        fn detectPointerType(_: *@This(), tree: Ast, node: Ast.Node.Index) ?struct {
+            ptr_type: Ast.full.PtrType,
+            is_optional: bool,
+        } {
+            if (tree.fullPtrType(node)) |pt| return .{
+                .ptr_type = pt,
+                .is_optional = false,
+            } else {
                 const tag = tree.nodes.items(.tag)[node];
                 if (tag == .optional_type) {
                     const data = tree.nodes.items(.data)[node];
-                    if (tree.fullPtrType(data.lhs)) |ptr_type| return .{ ptr_type, true };
+                    if (tree.fullPtrType(data.lhs)) |pt| return .{
+                        .ptr_type = pt,
+                        .is_optional = true,
+                    };
                 }
             }
             return null;
         }
 
-        fn detectEnumType(self: *@This(), tree: Ast, node: Ast.Node.Index) ?std.meta.Tuple(&.{ usize, bool }) {
+        fn detectEnumType(self: *@This(), tree: Ast, node: Ast.Node.Index, is_rhs: bool) ?struct {
+            item_count: usize,
+            is_signed: bool,
+        } {
+            if (!is_rhs) return null;
             // C enums get translated as either c_uint or c_int
-            const expr = nodeSlice(tree, node).?;
-            const is_signed_int = std.mem.eql(u8, expr, "c_int");
-            const is_unsigned_int = std.mem.eql(u8, expr, "c_uint");
+            const rhs = nodeSlice(tree, node).?;
+            const is_signed_int = std.mem.eql(u8, rhs, "c_int");
+            const is_unsigned_int = std.mem.eql(u8, rhs, "c_uint");
             if (is_signed_int or is_unsigned_int) {
+
                 // enum items are declared ahead of the type;
                 // scan backward looking for int values
                 const decls = self.old_root.container.decls;
@@ -714,7 +728,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         _ = std.fmt.parseInt(i128, decl.expr.unknown, 10) catch break;
                     } else break;
                 }
-                if (count > 0) return .{ count, is_signed_int };
+                if (count > 0) return .{
+                    .item_count = count,
+                    .is_signed = is_signed_int,
+                };
             }
             return null;
         }
