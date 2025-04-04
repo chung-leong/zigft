@@ -22,27 +22,49 @@ pub const CodeGeneratorOptions = struct {
     c_error_type: []const u8,
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
-    target_ns: type,
     add_simple_test: bool = true,
-    writer_type: type = std.fs.File.Writer,
 
     filter_fn: fn ([]const u8) bool,
-    enum_is_error: fn ([]const u8, i128) bool = isNonZero,
 
-    fn_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    type_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    const_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    param_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    field_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    enum_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
-    error_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = none,
+    enum_is_error_fn: fn ([]const u8, i128) bool = nonZero,
+    ptr_is_many_fn: fn ([]const u8, []const u8) bool = ifCharType,
+    ptr_is_null_terminated_fn: fn ([]const u8, []const u8) bool = ifCharType,
+    ptr_is_optional_fn: fn ([]const u8, []const u8) bool = neverOptional,
+    param_is_input_fn: fn ([]const u8, ?[]const u8, usize, []const u8) bool = alwaysOutput,
 
-    fn none(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+    fn_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    type_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    const_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    param_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    field_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    enum_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    error_name_fn: fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+
+    pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
         return arg;
     }
 
-    fn isNonZero(_: []const u8, value: i128) bool {
+    pub fn nonZero(_: []const u8, value: i128) bool {
         return value != 0;
+    }
+
+    pub fn neverOptional(_: []const u8, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+        return true;
+    }
+
+    pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn ifCharType(_: []const u8, target_type: []const u8) bool {
+        const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
+        return for (char_types) |char_type| {
+            if (std.mem.eql(u8, target_type, char_type)) break true;
+        } else false;
     }
 };
 
@@ -59,7 +81,7 @@ pub fn BasicErrorScheme(
         pub const Status = old_enum_type;
         pub const ErrorSet = new_error_set;
         pub const PositiveStatus = if (options.non_error_statuses.len > 1) Status else void;
-        pub const Result = union {
+        pub const Result = union(enum) {
             status: PositiveStatus,
             err: ErrorSet,
 
@@ -82,7 +104,7 @@ pub fn BasicErrorScheme(
                     var index: usize = 0;
                     for (en.fields) |field| {
                         const value = @field(Status, field.name);
-                        if (std.mem.indexOfScalar(Status, &options.non_error_statuses, value) == null) {
+                        if (std.mem.indexOfScalar(Status, options.non_error_statuses, value) == null) {
                             values[index] = value;
                             index += 1;
                         }
@@ -102,12 +124,13 @@ pub fn BasicErrorScheme(
                     }
                     break :init values;
                 },
+                else => @compileLog("Unrecognized status type"),
             }
         };
 
         pub fn fromEnum(arg: Status) Result {
             const status = if (@typeInfo(Status) == .int) @abs(arg) else arg;
-            if (std.mem.indexOfScale(Status, options.non_error_statuses, status)) |_| {
+            if (std.mem.indexOfScalar(Status, options.non_error_statuses, status)) |_| {
                 return .{ .status = if (PositiveStatus == void) {} else status };
             } else if (std.mem.indexOfScalar(Status, &error_status_list, status)) |index| {
                 return .{ .err = error_list[index] };
@@ -233,8 +256,8 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     const old_rv = @call(.auto, func, old_args);
                     if (can_fail) {
                         // see if the call encountered an error
-                        const status: options.error_scheme.Status = @bitCast(old_rv);
-                        switch (options.error_scheme.fromStatus(status)) {
+                        const status = cast(options.error_scheme.Status, old_rv);
+                        switch (options.error_scheme.fromEnum(status)) {
                             .err => |e| return e,
                             .status => |s| if (extra > 0) {
                                 // add positive status to result
@@ -306,11 +329,14 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         fn cast(comptime T: type, arg: anytype) T {
+            const AT = @TypeOf(arg);
             return switch (@typeInfo(T)) {
                 .pointer => |pt| switch (@typeInfo(pt.child)) {
                     .@"fn" => &translateCallback(pt.child, arg),
                     else => @ptrCast(arg),
                 },
+                .@"enum" => @enumFromInt(arg),
+                .int => if (@typeInfo(AT) == .@"enum") @intFromEnum(arg) else arg,
                 else => @bitCast(arg),
             };
         }
@@ -489,6 +515,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         cwd_path: []const u8,
         indent_level: usize,
         indented: bool,
+        current_root: *Type,
         old_root: *Type,
         old_namespace: Namespace,
         old_to_new_type_map: std.AutoHashMap(*Type, *Type),
@@ -498,7 +525,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         non_error_enums: []const []const u8,
         void_type: *Type,
         type_lookup: ?*Type,
-        writer: options.writer_type = undefined,
+        write_to_byte_array: bool,
+        byte_array: std.ArrayList(u8),
+        output_writer: std.io.AnyWriter,
 
         pub fn init(allocator: std.mem.Allocator) !*@This() {
             var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -517,6 +546,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.non_error_enums = &.{};
             self.void_type = try self.createType(.{ .expression = .{ .identifier = "void" } });
             self.type_lookup = null;
+            self.write_to_byte_array = false;
+            self.byte_array = .init(self.allocator);
+            self.current_root = self.old_root;
             return self;
         }
 
@@ -527,12 +559,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         pub fn analyze(self: *@This()) !void {
             try self.processHeaderFiles();
-            try self.resolveForwardDeclarations();
             try self.translateDeclarations();
         }
 
-        pub fn print(self: *@This(), writer: options.writer_type) !void {
-            self.writer = writer;
+        pub fn print(self: *@This(), writer: anytype) anyerror!void {
+            self.output_writer = writer.any();
+            self.current_root = self.new_root;
             try self.printImports();
             try self.printTypeDef(self.new_root);
             try self.printTrainslatorSetup();
@@ -733,15 +765,24 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn addDeclaration(self: *@This(), decl: Declaration) !void {
             var copy = decl;
-            if (decl.expr == .type) {
-                if (self.old_namespace.getType(decl.name)) |t| {
-                    // copy type info into the existing Type object
-                    t.* = decl.expr.type.*;
-                    copy.expr.type = t;
-                } else {
-                    // add the type under the decl name
-                    try self.old_namespace.addType(decl.name, decl.expr.type);
-                }
+            switch (decl.expr) {
+                .type => |t| {
+                    if (self.old_namespace.getType(decl.name)) |existing_t| {
+                        // copy type info into the Type object that's there because
+                        // of forward declaration
+                        existing_t.* = decl.expr.type.*;
+                        copy.expr.type = existing_t;
+                    } else {
+                        // add the type under the decl name
+                        try self.old_namespace.addType(decl.name, t);
+                    }
+                },
+                .identifier => {
+                    // assume that it's referring to a type
+                    const t = try self.createType(.{ .expression = decl.expr });
+                    try self.old_namespace.addType(decl.name, t);
+                },
+                else => {},
             }
             try self.append(&self.old_root.container.decls, copy);
         }
@@ -756,18 +797,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (node == 0) return null;
             const span = tree.nodeToSpan(node);
             return tree.source[span.start..span.end];
-        }
-
-        fn resolveForwardDeclarations(self: *@This()) !void {
-            for (self.old_root.container.decls) |*decl| {
-                if (decl.expr == .identifier) {
-                    const t = self.old_namespace.getType(decl.expr.identifier) orelse add: {
-                        // assume that undefined identifiers refer to types
-                        break :add try self.createType(.{ .expression = decl.expr });
-                    };
-                    try self.old_namespace.addType(decl.name, t);
-                }
-            }
         }
 
         fn translateDeclarations(self: *@This()) !void {
@@ -903,15 +932,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     };
                 },
                 .pointer => |p| {
+                    const ptr_name = try self.obtainTypeName(t);
+                    const target_name = try self.obtainTypeName(p.child_type);
+                    const is_null_terminated = options.ptr_is_null_terminated_fn(ptr_name, target_name);
+                    const is_many = options.ptr_is_many_fn(ptr_name, target_name);
+                    const is_optional = options.ptr_is_optional_fn(ptr_name, target_name);
                     return .{
                         .pointer = .{
                             .child_type = try self.obtainTranslatedType(p.child_type),
                             .alignment = p.alignment,
-                            .sentinel = p.sentinel,
-                            .size = p.size,
+                            .sentinel = if (is_null_terminated) "0" else null,
+                            .size = if (is_many) .many else .one,
                             .is_const = p.is_const,
                             .is_volatile = p.is_volatile,
-                            .is_optional = p.is_optional,
+                            .is_optional = is_optional,
                             .allows_zero = p.allows_zero,
                         },
                     };
@@ -937,6 +971,24 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         const index = f.parameters.len - offset - 1;
                         const param = f.parameters[index];
                         if (!self.isWriteTarget(param.type)) break index + 1;
+                        // maybe it's a in/out pointer--need to ask the callback function;
+                        // first, we need a name
+                        const fn_name = for (self.old_root.container.decls) |decl| {
+                            // function prototype
+                            if (decl.type == t) break decl.name;
+                            if (decl.expr == .type) {
+                                // function definition
+                                if (decl.expr.type == t) break decl.name;
+                                if (decl.expr.type.* == .pointer) {
+                                    // function pointer
+                                    if (decl.expr.type == t) break decl.name;
+                                }
+                            }
+                        } else try self.obtainTypeName(t);
+                        const type_name = try self.obtainTypeName(param.type.pointer.child_type);
+                        if (options.param_is_input_fn(fn_name, param.name, index, type_name)) {
+                            break index + 1;
+                        }
                     } else 0;
                     for (f.parameters, 0..) |param, index| {
                         if (index >= output_start) {
@@ -1004,10 +1056,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn isReturningError(self: *@This(), t: *const Type) bool {
-            if (self.old_namespace.getName(t.function.return_type)) |name| {
-                return std.mem.eql(u8, options.c_error_type, name);
-            } else return false;
+        fn isReturningError(self: *@This(), t: *Type) bool {
+            const name = self.obtainTypeName(t.function.return_type) catch return false;
+            return std.mem.eql(u8, options.c_error_type, name);
         }
 
         fn deriveErrorSet(self: *@This()) !void {
@@ -1016,7 +1067,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (self.old_namespace.getType(options.c_error_type)) |t| {
                 if (t.* == .enumeration) {
                     for (t.enumeration.items) |item| {
-                        if (options.enum_is_error(item.name, item.value)) {
+                        if (options.enum_is_error_fn(item.name, item.value)) {
                             const name = try options.error_name_fn(self.allocator, item.name);
                             try self.append(&names, name);
                         } else {
@@ -1085,9 +1136,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        const WriteError = std.fs.File.WriteError;
+        fn obtainTypeName(self: *@This(), t: *Type) ![]const u8 {
+            self.write_to_byte_array = true;
+            defer self.write_to_byte_array = false;
+            self.byte_array.clearRetainingCapacity();
+            self.printTypeRef(t) catch {};
+            return try self.allocator.dupe(u8, self.byte_array.items);
+        }
 
-        fn printImports(self: *@This()) WriteError!void {
+        fn printImports(self: *@This()) anyerror!void {
             try self.printTxt("const std = @import(\"std\");\n");
             try self.printTxt("const api_translator = @import(\"api-translator.zig\");\n");
             try self.printFmt("const {s} = @cImport({{\n", .{options.c_import});
@@ -1097,17 +1154,23 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt("}});\n\n");
         }
 
-        fn printTypeRef(self: *@This(), t: *Type) WriteError!void {
-            if (t == self.new_root) {
+        fn printTypeRef(self: *@This(), t: *Type) anyerror!void {
+            if (t == self.current_root) {
                 try self.printTxt("@This()");
+            } else if (t == self.old_root) {
+                try self.printTxt(options.c_import);
             } else {
-                if (self.new_namespace.getName(t)) |name| {
+                const namespace = if (self.current_root == self.new_root)
+                    self.new_namespace
+                else
+                    self.old_namespace;
+                if (namespace.getName(t)) |name| {
                     try self.printFmt("{s}", .{name});
                 } else try self.printTypeDef(t);
             }
         }
 
-        fn printTypeDef(self: *@This(), t: *Type) WriteError!void {
+        fn printTypeDef(self: *@This(), t: *Type) anyerror!void {
             switch (t.*) {
                 .container => |c| {
                     if (t != self.new_root) {
@@ -1238,14 +1301,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
-        fn printField(self: *@This(), field: Field) WriteError!void {
+        fn printField(self: *@This(), field: Field) anyerror!void {
             try self.printFmt("{s}: ", .{field.name});
             try self.printTypeRef(field.type);
             if (field.alignment) |a| try self.printFmt(" align({s})", .{a});
             try self.printTxt(",\n");
         }
 
-        fn printDeclaration(self: *@This(), decl: Declaration) WriteError!void {
+        fn printDeclaration(self: *@This(), decl: Declaration) anyerror!void {
             const mut = if (decl.mutable) "var" else "const";
             try self.printFmt("pub {s} {s}", .{ mut, decl.name });
             if (decl.type) |t| {
@@ -1324,17 +1387,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt("}}\n");
         }
 
-        fn printFmt(self: *@This(), comptime fmt: []const u8, args: anytype) WriteError!void {
+        fn printFmt(self: *@This(), comptime fmt: []const u8, args: anytype) anyerror!void {
             if (std.mem.startsWith(u8, fmt, "}") or std.mem.startsWith(u8, fmt, ")")) {
                 self.indent_level -= 1;
             }
             if (self.indent_level > 0 and !self.indented) {
                 for (0..self.indent_level) |_| {
-                    try self.writer.print("    ", .{});
+                    try self.write("    ", .{});
                 }
                 self.indented = true;
             }
-            try self.writer.print(fmt, args);
+            try self.write(fmt, args);
             if (std.mem.endsWith(u8, fmt, "{\n") or std.mem.endsWith(u8, fmt, "(\n")) {
                 self.indent_level += 1;
             }
@@ -1343,8 +1406,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
-        fn printTxt(self: *@This(), comptime txt: []const u8) WriteError!void {
+        fn printTxt(self: *@This(), comptime txt: []const u8) anyerror!void {
             return self.printFmt(txt, .{});
+        }
+
+        fn write(self: *@This(), comptime fmt: []const u8, args: anytype) anyerror!void {
+            const writer = if (self.write_to_byte_array)
+                self.byte_array.writer().any()
+            else
+                self.output_writer;
+            return writer.print(fmt, args);
         }
 
         fn translateHeaderFile(self: *@This(), full_path: []const u8) ![]const u8 {
@@ -1512,36 +1583,100 @@ test "snakify" {
     try expectEqualSlices(u8, "green_dragon", name2);
 }
 
-// test "Translated" {
-//     const OldStruct = options.substitutions[0].old;
-//     const NewStruct = options.substitutions[0].new;
-//     const NewError = options.error_scheme.ErrorSet;
-//     const OldError = c_uint;
-//     const Fn1 = Translated(fn (i32, OldStruct) OldError, true, false, .{});
-//     try expectEqual(Fn1, fn (i32, NewStruct) NewError!void);
-//     const Fn2 = Translated(fn (i32, []const OldStruct) OldError, true, false, .{});
-//     try expectEqual(Fn2, fn (i32, []const NewStruct) NewError!void);
-//     const Fn3 = Translated(fn (i32, *OldStruct) OldError, true, false, .{});
-//     try expectEqual(Fn3, fn (i32) NewError!NewStruct);
-//     const Fn4 = Translated(fn (i32, *bool, *OldStruct) OldError, true, false, .{});
-//     try expectEqual(Fn4, fn (i32) NewError!std.meta.Tuple(&.{ bool, NewStruct }));
-//     const Fn5 = Translated(fn (i32, OldStruct) bool, false, false, .{});
-//     try expectEqual(Fn5, fn (i32, NewStruct) bool);
-//     const Fn6 = Translated(fn (i32, OldStruct) c_int, false, false, .{});
-//     try expectEqual(Fn6, fn (i32, NewStruct) c_int);
-//     const Fn7 = Translated(fn (i32, OldStruct) c_int, false, true, .{});
-//     try expectEqual(Fn7, fn (i32, NewStruct) void);
-// }
+test "Translator.Translated" {
+    const OldStruct = extern struct {
+        number1: i32,
+        number2: i32,
+    };
+    const NewStruct = extern struct {
+        a: i32,
+        b: i32,
+    };
+    const StatusEnum = enum(c_uint) {
+        ok,
+        failure,
+        unexpected,
+    };
+    const ErrorSet = error{
+        Failure,
+        Unexpected,
+    };
+    const c_to_zig = Translator(.{
+        .substitutions = &.{
+            .{ .old = OldStruct, .new = NewStruct },
+        },
+        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, .{
+            .non_error_statuses = &.{.ok},
+            .default_status = .unexpected,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const Fn1 = c_to_zig.Translated(fn (i32, OldStruct) StatusEnum, true, false, .{});
+    try expectEqual(Fn1, fn (i32, NewStruct) ErrorSet!void);
+    const Fn2 = c_to_zig.Translated(fn (i32, []const OldStruct) StatusEnum, true, false, .{});
+    try expectEqual(Fn2, fn (i32, []const NewStruct) ErrorSet!void);
+    const Fn3 = c_to_zig.Translated(fn (i32, *OldStruct) StatusEnum, true, false, .{});
+    try expectEqual(Fn3, fn (i32) ErrorSet!NewStruct);
+    const Fn4 = c_to_zig.Translated(fn (i32, *bool, *OldStruct) StatusEnum, true, false, .{});
+    try expectEqual(Fn4, fn (i32) ErrorSet!std.meta.Tuple(&.{ bool, NewStruct }));
+    const Fn5 = c_to_zig.Translated(fn (i32, OldStruct) bool, false, false, .{});
+    try expectEqual(Fn5, fn (i32, NewStruct) bool);
+    const Fn6 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, false, .{});
+    try expectEqual(Fn6, fn (i32, NewStruct) c_int);
+    const Fn7 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, true, .{});
+    try expectEqual(Fn7, fn (i32, NewStruct) void);
+    const Fn8 = c_to_zig.Translated(fn (i32, *bool, ?*const OldStruct) StatusEnum, true, false, .{});
+    try expectEqual(Fn8, fn (i32, *bool, ?*const NewStruct) ErrorSet!void);
+}
 
-// test "translate" {
-//     const c = @cImport(@cInclude("./test/include/animal.h"));
-//     const cow = options.substitutions[2];
-//     const hen = options.substitutions[3];
-//     const pig = options.substitutions[4];
-//     const ErrorSet = options.error_scheme.ErrorSet;
-//     const func1 = translate(c.animal_mate, true, false, .{});
-//     try expectEqual(@TypeOf(func1), fn (cow.new, hen.new) ErrorSet!std.meta.Tuple(&.{ pig.new, pig.new }));
-// }
+test "translate" {
+    const OldStruct = extern struct {
+        number1: i32,
+        number2: i32,
+    };
+    const NewStruct = extern struct {
+        a: i32 = 1,
+        b: i32 = 2,
+    };
+    const StatusEnum = enum(c_uint) {
+        ok,
+        failure,
+        unexpected,
+    };
+    const ErrorSet = error{
+        Failure,
+        Unexpected,
+    };
+    const ActionEnum = enum(c_uint) {
+        eat,
+        leave,
+        shoot,
+    };
+    const c_to_zig = Translator(.{
+        .substitutions = &.{
+            .{ .old = OldStruct, .new = NewStruct },
+        },
+        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, .{
+            .non_error_statuses = &.{.ok},
+            .default_status = .unexpected,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const ns = struct {
+        fn hello(_: OldStruct, _: i32) c_uint {
+            return 0;
+        }
+
+        fn world(_: i32, ptr: *OldStruct) c_uint {
+            ptr.* = .{ .number1 = 123, .number2 = 456 };
+            return 0;
+        }
+    };
+    _ = ActionEnum;
+    const func1 = c_to_zig.translate(ns.hello, true, false, .{});
+    try expectEqual(@TypeOf(func1), fn (NewStruct, i32) ErrorSet!void);
+    try func1(.{}, 123);
+}
 
 // test "Translator" {
 //     const c = @cImport(@cInclude("./test/include/animal.h"));
@@ -1572,20 +1707,6 @@ test "snakify" {
 //             number3: i32,
 //         };
 //     };
-//     _ = Translator(.{
-//         .substitutions = &.{
-//             .{ .old = c.animal_struct, .new = Self.Struct },
-//             .{ .old = c.animal_status, .new = Self.Enum },
-//             .{ .old = c.animal_cow, .new = Self.Cow },
-//             .{ .old = c.animal_hen, .new = Self.Hen },
-//             .{ .old = c.animal_pig, .new = Self.Pig },
-//         },
-//         .error_scheme = BasicErrorScheme(Self.Status, Self.ErrorSet, .{
-//             .non_error_statuses = &.{.ok},
-//             .default_status = .unknown,
-//             .default_error = Self.ErrorSet.Unknown,
-//         }),
-//     });
 // }
 
 // test "Substitute" {
@@ -1657,13 +1778,11 @@ test "CodeGenerator" {
         .include_paths = &.{"./test/include"},
         .header_paths = &.{"animal.h"},
         .c_error_type = "animal_status",
-        .target_ns = @This(),
         .filter_fn = ns.filter,
         .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
         .enum_name_fn = ns.getEnumName,
         .error_name_fn = ns.getErrorName,
-        .writer_type = std.fs.File.Writer,
     }) = try .init(gpa.allocator());
     defer generator.deinit();
     try generator.analyze();
