@@ -84,80 +84,95 @@ pub fn BasicErrorScheme(
     old_enum_type: type,
     new_error_set: type,
     options: struct {
-        non_error_statuses: []const old_enum_type,
-        default_status: old_enum_type,
+        default_success_status: old_enum_type,
+        default_failure_status: old_enum_type,
         default_error: new_error_set,
     },
 ) type {
+    const es_info = @typeInfo(new_error_set);
+    if (es_info != .error_set) @compileError("Error set expected, found '" ++ @typeName(new_error_set) ++ "'");
+    const en_info = @typeInfo(old_enum_type);
+    const en_count = switch (en_info) {
+        .@"enum" => |en| en.fields.len,
+        .int, .bool => 1,
+        else => @compileError("Enum, int, or bool expected, found '" ++ @typeName(old_enum_type) ++ "'"),
+    };
+    const error_set = es_info.error_set orelse &.{};
+    var error_enum_buffer: [error_set.len]struct {
+        status: old_enum_type,
+        err: new_error_set,
+    } = undefined;
+    var signatures: [error_set.len]comptime_int = undefined;
+    for (error_set, 0..) |e, index| {
+        error_enum_buffer[index] = .{
+            .status = options.default_failure_status,
+            .err = @field(new_error_set, e.name),
+        };
+        signatures[index] = asComptimeInt(e.name);
+    }
+    var non_error_status_buffer: [en_count]old_enum_type = undefined;
+    var non_error_status_count = 0;
+    switch (en_info) {
+        .@"enum" => |en| {
+            for (en.fields) |field| {
+                const status = @field(old_enum_type, field.name);
+                const sig = asComptimeInt(field.name);
+                if (std.mem.indexOfScalar(comptime_int, &signatures, sig)) |i| {
+                    error_enum_buffer[i].status = status;
+                } else {
+                    non_error_status_buffer[non_error_status_count] = status;
+                    non_error_status_count += 1;
+                }
+            }
+            if (non_error_status_count == 0) @compileError("No success status");
+        },
+        .int => {
+            non_error_status_buffer[0] = 0;
+            non_error_status_count += 1;
+        },
+        .bool => {
+            non_error_status_buffer[0] = true;
+            non_error_status_count += 1;
+        },
+        .void => {
+            non_error_status_buffer[0] = {};
+            non_error_status_count += 1;
+        },
+        else => unreachable,
+    }
+    const non_error_statuses = init: {
+        var list: [non_error_status_count]old_enum_type = undefined;
+        @memcpy(&list, non_error_status_buffer[0..non_error_status_count]);
+        break :init list;
+    };
+    const error_enum_table = error_enum_buffer;
     return struct {
         pub const Status = old_enum_type;
         pub const ErrorSet = new_error_set;
-        pub const PositiveStatus = if (options.non_error_statuses.len > 1) Status else void;
+        pub const PositiveStatus = if (non_error_statuses.len > 1) Status else void;
         pub const Result = union(enum) {
             status: PositiveStatus,
-            err: ErrorSet,
+            err: anyerror,
 
-            const default: PositiveStatus = if (PositiveStatus == void) {} else options.non_error_status[0];
-        };
-
-        const error_list = init: {
-            const es = @typeInfo(ErrorSet).error_set.?;
-            var list: [es.len]ErrorSet = undefined;
-            for (es, 0..) |e, index| {
-                list[index] = @field(ErrorSet, e.name);
-            }
-            break :init list;
-        };
-        const error_status_list = init: {
-            switch (@typeInfo(Status)) {
-                .@"enum" => |en| {
-                    // leave out ones that appear in non_error_status
-                    var values: [en.fields.len - options.non_error_statuses.len]Status = undefined;
-                    var index: usize = 0;
-                    for (en.fields) |field| {
-                        const value = @field(Status, field.name);
-                        if (std.mem.indexOfScalar(Status, options.non_error_statuses, value) == null) {
-                            values[index] = value;
-                            index += 1;
-                        }
-                    }
-                    break :init values;
-                },
-                .bool => {
-                    break :init [1]bool{false};
-                },
-                .int => {
-                    // assume 0 means success
-                    var values: [error_list.len]Status = undefined;
-                    var value: Status = 1;
-                    for (&values) |*ptr| {
-                        ptr.* = value;
-                        value += 1;
-                    }
-                    break :init values;
-                },
-                else => @compileLog("Unrecognized status type"),
-            }
+            const default: PositiveStatus = if (PositiveStatus == void) {} else options.default_success_status;
         };
 
         pub fn fromEnum(arg: Status) Result {
-            const status = if (@typeInfo(Status) == .int) @abs(arg) else arg;
-            if (std.mem.indexOfScalar(Status, options.non_error_statuses, status)) |_| {
-                return .{ .status = if (PositiveStatus == void) {} else status };
-            } else if (std.mem.indexOfScalar(Status, &error_status_list, status)) |index| {
-                return .{ .err = error_list[index] };
-            } else {
-                return .{ .err = options.default_error };
-            }
+            return if (std.mem.indexOfScalar(Status, &non_error_statuses, arg)) |_| .{
+                .status = if (PositiveStatus == void) {} else arg,
+            } else for (error_enum_table) |entry| {
+                if (entry.status == arg) break .{ .err = entry.err };
+            } else .{
+                .err = options.default_error,
+            };
         }
 
         pub fn toEnum(arg: Result) Status {
             return switch (arg) {
-                .status => |s| if (PositiveStatus == void) options.non_error_statuses[0] else s,
-                .err => |e| if (std.mem.indexOfScalar(ErrorSet, error_list, e)) |index|
-                    error_status_list[index]
-                else
-                    options.default_status,
+                .status => |s| if (PositiveStatus == void) options.default_success_status else s,
+                .err => |e| for (error_enum_table) |entry| {
+                    if (entry.err == e) break entry.status;
+                } else options.default_failure_status,
             };
         }
     };
@@ -189,6 +204,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             comptime can_fail: bool,
             comptime ignore_status: bool,
             comptime local_subs: anytype,
+            comptime is_callback: bool,
         ) type {
             const old_fn = @typeInfo(OldFn).@"fn";
             const OldRT = old_fn.return_type.?;
@@ -238,8 +254,8 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 1 => OutputTypes[0],
                 else => std.meta.Tuple(OutputTypes),
             };
-            const NewError = options.error_scheme.ErrorSet;
-            const NewRT = if (can_fail) NewError!Payload else Payload;
+            const Error = if (is_callback) anyerror else options.error_scheme.ErrorSet;
+            const NewRT = if (can_fail) Error!Payload else Payload;
             return @Type(.{
                 .@"fn" = .{
                     .calling_convention = .auto,
@@ -256,9 +272,9 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             comptime can_fail: bool,
             comptime ignore_status: bool,
             local_subs: anytype,
-        ) Translated(@TypeOf(func), can_fail, ignore_status, local_subs) {
+        ) Translated(@TypeOf(func), can_fail, ignore_status, local_subs, false) {
             const OldFn = @TypeOf(func);
-            const NewFn = Translated(OldFn, can_fail, ignore_status, local_subs);
+            const NewFn = Translated(OldFn, can_fail, ignore_status, local_subs, false);
             const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
             const Payload = @typeInfo(NewRT).error_union.payload;
             const ns = struct {
@@ -293,7 +309,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                         // see if the call encountered an error
                         const status = convert(options.error_scheme.Status, old_rv);
                         switch (options.error_scheme.fromEnum(status)) {
-                            .err => |e| return e,
+                            .err => |e| return @errorCast(e),
                             .status => |s| if (extra > 0) {
                                 // add positive status to result
                                 if (last > 0) payload[last] = s else payload = s;
@@ -314,7 +330,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
         pub fn translateCallback(
             comptime FT: type,
-            comptime func: Translated(FT, true, options.ignore_cb_status, .{}),
+            comptime func: Translated(FT, true, options.ignore_cb_status, .{}, true),
         ) *const FT {
             const NewCallbackFn = @TypeOf(func);
             const OldCallbackFn = FT;
@@ -356,7 +372,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     }
                     if (OldRT != void) {
                         const status = options.error_scheme.toEnum(result);
-                        return @bitCast(status);
+                        return convert(OldRT, status);
                     }
                 }
             };
@@ -373,7 +389,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     else => @bitCast(arg),
                 },
                 .pointer => |pt| switch (@typeInfo(pt.child)) {
-                    .@"fn" => &translateCallback(pt.child, arg),
+                    .@"fn" => translateCallback(pt.child, arg),
                     inline .@"struct", .@"union" => switch (@typeInfo(a.pointer.child)) {
                         inline .@"struct", .@"union" => |st| switch (st.layout) {
                             .@"extern" => @ptrCast(arg),
@@ -443,43 +459,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 } else {
                     if (T == sub.new) break sub.old;
                 }
-            } else switch (@typeInfo(T)) {
-                .pointer => |pt| define: {
-                    if (@typeInfo(pt.child) == .@"fn" and dir == .old_to_new) {
-                        // use function type of translated callback, since translation
-                        // requires the actual function
-                        break :define Translated(pt.child, true, options.ignore_cb_status, .{});
-                    }
-                    var new_pt = pt;
-                    if (pt.is_const) {
-                        // look for substitution of non-const pointer
-                        new_pt.is_const = false;
-                        const PT = SwitchType(@Type(.{ .pointer = new_pt }), dir);
-                        new_pt = @typeInfo(PT).pointer;
-                        new_pt.is_const = true;
-                    } else {
-                        // look for substitution of child
-                        new_pt.child = SwitchType(pt.child, dir);
-                    }
-                    break :define @Type(.{ .pointer = new_pt });
-                },
-                .array => |ar| define: {
-                    var new_ar = ar;
-                    new_ar.child = SwitchType(ar.child, dir);
-                    break :define @Type(.{ .array = new_ar });
-                },
-                .optional => |op| define: {
-                    var new_op = op;
-                    new_op.child = SwitchType(op.child, dir);
-                    break :define @Type(.{ .optional = new_op });
-                },
-                .error_union => |eu| define: {
-                    var new_eu = eu;
-                    new_eu.payload = SwitchType(eu.payload, dir);
-                    break :define @Type(.{ .error_union = new_eu });
-                },
-                else => T,
-            };
+            } else T;
         }
 
         fn getTypeWithAttributes(tuple: anytype, arg_index: ?usize, arg_count: usize) ?TypeWithAttributes {
@@ -628,6 +608,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         new_root: *Type,
         new_namespace: Namespace,
         new_error_set: *Type,
+        error_enums: []const []const u8,
         non_error_enums: []const []const u8,
         void_type: *Type,
         type_lookup: ?*Type,
@@ -651,6 +632,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.new_root = try self.createType(.{ .container = .{ .kind = "struct" } });
             self.new_namespace = .init(self.allocator);
             self.new_error_set = try self.createType(.{ .error_set = &.{} });
+            self.error_enums = &.{};
             self.non_error_enums = &.{};
             self.void_type = try self.createType(.{ .expression = .{ .identifier = "void" } });
             self.type_lookup = null;
@@ -1188,16 +1170,19 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn deriveErrorSet(self: *@This()) !void {
             var names: [][]const u8 = &.{};
+            var errors: [][]const u8 = &.{};
             var non_errors: [][]const u8 = &.{};
             if (self.old_namespace.getType(options.c_error_type)) |t| {
                 if (t.* == .enumeration) {
                     for (t.enumeration.items) |item| {
                         if (options.enum_is_error_fn(item.name, item.value)) {
-                            const name = try options.error_name_fn(self.allocator, item.name);
-                            try self.append(&names, name);
+                            const err_name = try options.error_name_fn(self.allocator, item.name);
+                            try self.append(&names, err_name);
+                            const en_name = try options.enum_name_fn(self.allocator, item.name);
+                            try self.append(&errors, en_name);
                         } else {
-                            const name = try options.enum_name_fn(self.allocator, item.name);
-                            try self.append(&non_errors, name);
+                            const en_name = try options.enum_name_fn(self.allocator, item.name);
+                            try self.append(&non_errors, en_name);
                         }
                     }
                 }
@@ -1208,6 +1193,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (!has_unexpected) try self.append(&names, "Unexpected");
             self.new_error_set.error_set = names;
             try self.new_namespace.addType(options.error_set, self.new_error_set);
+            self.error_enums = errors;
             self.non_error_enums = non_errors;
         }
 
@@ -1458,37 +1444,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printTrainslatorSetup(self: *@This()) !void {
-            const old_enum_t = self.old_namespace.getType(options.c_error_type) orelse {
-                std.debug.print("Unable to find enum type '{s}'\n", .{options.c_error_type});
-                return error.Unexpected;
-            };
-            var enum_name: []const u8 = options.c_error_type;
-            const is_bool = std.mem.eql(u8, enum_name, "bool");
-            var non_error_statuses: []const u8 = if (is_bool) ".{true}" else ".{0}";
-            var default_status: []const u8 = if (is_bool) "false" else "1";
-            const new_enum_t = try self.obtainTranslatedType(old_enum_t);
-            if (self.new_namespace.getName(new_enum_t)) |name| enum_name = name;
-            if (new_enum_t.* == .enumeration) {
-                var literals: [][]const u8 = &.{};
-                for (self.non_error_enums) |name| {
-                    const literal = try std.fmt.allocPrint(self.allocator, ".{s}", .{name});
-                    try self.append(&literals, literal);
-                }
-                const list = try std.mem.join(self.allocator, ", ", literals);
-                non_error_statuses = switch (self.non_error_enums.len) {
-                    1 => try std.fmt.allocPrint(self.allocator, ".{{{s}}}", .{list}),
-                    else => try std.fmt.allocPrint(self.allocator, ".{{ {s} }}", .{list}),
-                };
-                for (new_enum_t.enumeration.items) |item| {
-                    const is_error = for (self.non_error_enums) |name| {
-                        if (std.mem.eql(u8, name, item.name)) break false;
-                    } else true;
-                    if (is_error) {
-                        default_status = try std.fmt.allocPrint(self.allocator, ".{s}", .{item.name});
-                        break;
-                    }
-                }
-            }
             try self.printFmt("const {s} = api_translator.Translator(.{{\n", .{options.translater});
             var iterator = self.new_to_old_param_map.iterator();
             try self.printTxt(".substitutions = &.{{\n");
@@ -1506,9 +1461,28 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 }
             }
             try self.printTxt("}},\n");
+            const old_enum_t = self.old_namespace.getType(options.c_error_type) orelse {
+                std.debug.print("Unable to find enum type '{s}'\n", .{options.c_error_type});
+                return error.Unexpected;
+            };
+            const new_enum_t = try self.obtainTranslatedType(old_enum_t);
+            const enum_name = try self.obtainTypeName(new_enum_t);
             try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, .{{\n", .{ enum_name, options.error_set });
-            try self.printFmt(".non_error_statuses = &{s},\n", .{non_error_statuses});
-            try self.printFmt(".default_status = {s},\n", .{default_status});
+            const def_pos_status, const def_neg_status = if (new_enum_t.* == .enumeration) .{
+                try std.fmt.allocPrint(self.allocator, ".{s}", .{self.non_error_enums[0]}),
+                try std.fmt.allocPrint(self.allocator, ".{s}", .{self.error_enums[0]}),
+            } else if (std.mem.eql(u8, enum_name, "bool")) .{
+                "true",
+                "false",
+            } else if (std.mem.eql(u8, enum_name, "void")) .{
+                "{}",
+                "{}",
+            } else .{
+                "0",
+                "1",
+            };
+            try self.printFmt(".default_success_status = {s},\n", .{def_pos_status});
+            try self.printFmt(".default_failure_status = {s},\n", .{def_neg_status});
             try self.printFmt(".default_error = {s}.Unexpected,\n", .{options.error_set});
             try self.printTxt("}}),\n");
             try self.printTxt("}});\n");
@@ -1718,16 +1692,36 @@ test "snakify" {
     try expectEqualSlices(u8, "green_dragon", name2);
 }
 
-test "Translator.convert" {
+fn asComptimeInt(comptime s: []const u8) comptime_int {
+    return comptime calc: {
+        var value = 0;
+        for (s) |c| {
+            const a: ?comptime_int = switch (c) {
+                '0'...'9', 'A'...'Z' => c,
+                'a'...'z' => std.ascii.toUpper(c),
+                else => null,
+            };
+            if (a) |v| value = value * 128 + v;
+        }
+        break :calc value;
+    };
+}
+
+test "asComptimeInt" {
+    try expectEqual(asComptimeInt("HelloWorld"), asComptimeInt("hello world"));
+    try expectEqual(asComptimeInt("hello_world"), asComptimeInt("helloworld"));
+}
+
+test "Translator.convert (basic)" {
     const c_to_zig = Translator(.{
         .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, .{
-            .non_error_statuses = &.{},
-            .default_status = 0,
+            .default_success_status = 0,
+            .default_failure_status = 1,
             .default_error = error.Unexpected,
         }),
     });
     const convert = c_to_zig.convert;
-    const OldStruct = extern struct {
+    const OldStruct1 = extern struct {
         number1: i32,
         number2: i32,
     };
@@ -1751,14 +1745,14 @@ test "Translator.convert" {
         unexpected,
     };
     const new1: NewStruct1 = .{ .a = 123, .b = 456 };
-    const old1: OldStruct = convert(OldStruct, new1);
+    const old1: OldStruct1 = convert(OldStruct1, new1);
     try expectEqual(old1.number2, 456);
-    const old_ptr1 = convert(*const OldStruct, &new1);
+    const old_ptr1 = convert(*const OldStruct1, &new1);
     try expectEqual(old_ptr1.number2, 456);
     const new2: NewStruct2 = .{ .a = 123, .b = 456 };
-    const old2: OldStruct = convert(OldStruct, new2);
+    const old2: OldStruct1 = convert(OldStruct1, new2);
     try expectEqual(old2.number2, 456);
-    const old_ptr2 = convert(*const OldStruct, &new2);
+    const old_ptr2 = convert(*const OldStruct1, &new2);
     try expectEqual(old_ptr2.number2, 456);
     const enum1: StatusEnum = .failure;
     const old_enum1 = convert(c_uint, enum1);
@@ -1769,6 +1763,78 @@ test "Translator.convert" {
     const old_enum3: c_uint = 0b110;
     const new4 = convert(NewStruct3, old_enum3);
     try expectEqual(new4, NewStruct3{ .flag1 = false, .flag2 = true, .flag3 = true });
+}
+
+test "Translator.convert (function pointer)" {
+    const OldStruct1 = extern struct {
+        number1: i32,
+        number2: i32,
+    };
+    const NewStruct1 = extern struct {
+        a: i32,
+        b: i32,
+    };
+    const OldStruct2 = struct {
+        callback1: *const fn () callconv(.c) void,
+        callback2: *const fn (*const OldStruct1) callconv(.c) c_uint,
+    };
+    const ErrorSet = error{ Failure, Unexpected };
+    const NewStruct2 = struct {
+        cb1: fn () anyerror!void,
+        cb2: fn (*const NewStruct1) anyerror!void,
+    };
+    const StatusEnum = enum(c_uint) {
+        ok,
+        failure,
+        unexpected,
+    };
+    const c_to_zig = Translator(.{
+        .substitutions = &.{
+            .{ .old = *const OldStruct1, .new = *const NewStruct1 },
+        },
+        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, .{
+            .default_success_status = .ok,
+            .default_failure_status = .failure,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const convert = c_to_zig.convert;
+    const ns = struct {
+        var called1 = false;
+        var called2 = false;
+        var result2: ?NewStruct1 = null;
+
+        fn func1() anyerror!void {
+            called1 = true;
+        }
+
+        fn func2(ptr: *const NewStruct1) anyerror!void {
+            called2 = true;
+            result2 = ptr.*;
+        }
+
+        fn func3(_: *const NewStruct1) anyerror!void {
+            return error.Unexpected;
+        }
+
+        fn func4(_: *const NewStruct1) anyerror!void {
+            return error.Failure;
+        }
+    };
+    const old1 = convert(OldStruct2, NewStruct2{ .cb1 = ns.func1, .cb2 = ns.func2 });
+    old1.callback1();
+    try expectEqual(ns.called1, true);
+    const input: OldStruct1 = .{ .number1 = 123, .number2 = 456 };
+    const res1 = old1.callback2(&input);
+    try expectEqual(0, res1);
+    try expectEqual(true, ns.called2);
+    try expectEqual(NewStruct1{ .a = 123, .b = 456 }, ns.result2);
+    const old2 = convert(OldStruct2, NewStruct2{ .cb1 = ns.func1, .cb2 = ns.func3 });
+    const res2 = old2.callback2(&input);
+    try expectEqual(2, res2);
+    const old3 = convert(OldStruct2, NewStruct2{ .cb1 = ns.func1, .cb2 = ns.func4 });
+    const res3 = old3.callback2(&input);
+    try expectEqual(1, res3);
 }
 
 test "Translator.Translated" {
@@ -1792,29 +1858,34 @@ test "Translator.Translated" {
     const c_to_zig = Translator(.{
         .substitutions = &.{
             .{ .old = OldStruct, .new = NewStruct },
+            .{ .old = *OldStruct, .new = *NewStruct },
+            .{ .old = []const OldStruct, .new = []const NewStruct },
+            .{ .old = ?*const OldStruct, .new = *const NewStruct },
         },
         .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, .{
-            .non_error_statuses = &.{.ok},
-            .default_status = .unexpected,
+            .default_success_status = .ok,
+            .default_failure_status = .failure,
             .default_error = error.Unexpected,
         }),
     });
-    const Fn1 = c_to_zig.Translated(fn (i32, OldStruct) StatusEnum, true, false, .{});
+    const Fn1 = c_to_zig.Translated(fn (i32, OldStruct) StatusEnum, true, false, .{}, false);
     try expectEqual(Fn1, fn (i32, NewStruct) ErrorSet!void);
-    const Fn2 = c_to_zig.Translated(fn (i32, []const OldStruct) StatusEnum, true, false, .{});
+    const Fn2 = c_to_zig.Translated(fn (i32, []const OldStruct) StatusEnum, true, false, .{}, false);
     try expectEqual(Fn2, fn (i32, []const NewStruct) ErrorSet!void);
-    const Fn3 = c_to_zig.Translated(fn (i32, *OldStruct) StatusEnum, true, false, .{});
+    const Fn3 = c_to_zig.Translated(fn (i32, *OldStruct) StatusEnum, true, false, .{}, false);
     try expectEqual(Fn3, fn (i32) ErrorSet!NewStruct);
-    const Fn4 = c_to_zig.Translated(fn (i32, *bool, *OldStruct) StatusEnum, true, false, .{});
+    const Fn4 = c_to_zig.Translated(fn (i32, *bool, *OldStruct) StatusEnum, true, false, .{}, false);
     try expectEqual(Fn4, fn (i32) ErrorSet!std.meta.Tuple(&.{ bool, NewStruct }));
-    const Fn5 = c_to_zig.Translated(fn (i32, OldStruct) bool, false, false, .{});
+    const Fn5 = c_to_zig.Translated(fn (i32, OldStruct) bool, false, false, .{}, false);
     try expectEqual(Fn5, fn (i32, NewStruct) bool);
-    const Fn6 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, false, .{});
+    const Fn6 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, false, .{}, false);
     try expectEqual(Fn6, fn (i32, NewStruct) c_int);
-    const Fn7 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, true, .{});
+    const Fn7 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, true, .{}, false);
     try expectEqual(Fn7, fn (i32, NewStruct) void);
-    const Fn8 = c_to_zig.Translated(fn (i32, *bool, ?*const OldStruct) StatusEnum, true, false, .{});
-    try expectEqual(Fn8, fn (i32, *bool, ?*const NewStruct) ErrorSet!void);
+    const Fn8 = c_to_zig.Translated(fn (i32, *bool, ?*const OldStruct) StatusEnum, true, false, .{}, false);
+    try expectEqual(Fn8, fn (i32, *bool, *const NewStruct) ErrorSet!void);
+    const Fn9 = c_to_zig.Translated(fn (i32, *bool, ?*const OldStruct) StatusEnum, true, false, .{}, true);
+    try expectEqual(Fn9, fn (i32, *bool, *const NewStruct) anyerror!void);
 }
 
 test "translate" {
@@ -1845,8 +1916,8 @@ test "translate" {
             .{ .old = OldStruct, .new = NewStruct },
         },
         .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, .{
-            .non_error_statuses = &.{.ok},
-            .default_status = .unexpected,
+            .default_success_status = .ok,
+            .default_failure_status = .failure,
             .default_error = error.Unexpected,
         }),
     });
