@@ -495,6 +495,7 @@ pub const Declaration = struct {
 pub const Parameter = struct {
     type: *Type,
     name: ?[]const u8 = null,
+    is_inout: bool = false,
 };
 pub const EnumItem = struct {
     name: []const u8,
@@ -567,6 +568,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         write_to_byte_array: bool,
         byte_array: std.ArrayList(u8),
         output_writer: std.io.AnyWriter,
+        need_inout_import: bool,
 
         pub fn init(allocator: std.mem.Allocator) !*@This() {
             var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -589,6 +591,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.write_to_byte_array = false;
             self.byte_array = .init(self.allocator);
             self.current_root = self.old_root;
+            self.need_inout_import = false;
             return self;
         }
 
@@ -938,7 +941,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateParameter(self: *@This(), param: Parameter) !Parameter {
+        fn translateParameter(self: *@This(), param: Parameter, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
             const new_type = try self.obtainTranslatedType(param.type);
             const is_unique_type = switch (new_type.*) {
@@ -951,6 +954,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return .{
                 .name = new_name,
                 .type = new_type,
+                .is_inout = is_inout,
             };
         }
 
@@ -1013,6 +1017,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     var new_params: []Parameter = &.{};
                     // look for writable pointer
                     var output_types: []*Type = &.{};
+                    var inout_index: ?usize = null;
                     const output_start = for (0..f.parameters.len) |offset| {
                         const index = f.parameters.len - offset - 1;
                         const param = f.parameters[index];
@@ -1033,6 +1038,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         } else try self.obtainTypeName(t);
                         const type_name = try self.obtainTypeName(param.type.pointer.child_type);
                         if (options.param_is_input_fn(fn_name, param.name, index, type_name)) {
+                            inout_index = index;
+                            self.need_inout_import = true;
                             break index + 1;
                         }
                     } else 0;
@@ -1048,8 +1055,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const extra: usize = if (!can_fail or self.non_error_enums.len > 1) 1 else 0;
                     if (extra == 1) try self.append(&output_types, status_type);
                     const arg_count = f.parameters.len + extra - output_types.len;
-                    for (f.parameters[0..arg_count]) |param| {
-                        const new_param = try self.translateParameter(param);
+                    for (f.parameters[0..arg_count], 0..) |param, index| {
+                        const new_param = try self.translateParameter(param, inout_index == index);
                         try self.append(&new_params, new_param);
                     }
                     const payload_type = switch (output_types.len) {
@@ -1143,23 +1150,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const ignore_status = false;
             var non_unique_args: [][]const u8 = &.{};
             for (new_t.function.parameters, 0..) |param, index| {
-                if (self.new_to_old_param_map.get(param.type) == null) {
-                    if (self.new_namespace.getName(param.type)) |name| {
-                        const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ index, name });
-                        try self.append(&non_unique_args, pair);
-                    }
+                // we need to do local substitution when the original type isn't unique enough
+                // for global replacement and when a non-const pointer is use for input
+                if (self.new_to_old_param_map.get(param.type) == null or param.is_inout) {
+                    self.current_root = self.new_root;
+                    const name = try self.obtainTypeName(param.type);
+                    self.current_root = self.old_root;
+                    const pair = switch (param.is_inout) {
+                        true => try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = inout({s})", .{ index, name }),
+                        false => try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ index, name }),
+                    };
+                    try self.append(&non_unique_args, pair);
                 }
             }
             if (!can_fail) {
                 const return_type = new_t.function.return_type;
-                switch (return_type.*) {
-                    .enumeration, .expression => {
-                        if (self.new_namespace.getName(return_type)) |name| {
-                            const pair = try std.fmt.allocPrint(self.allocator, ".retval = {s}", .{name});
-                            try self.append(&non_unique_args, pair);
-                        }
-                    },
-                    else => {},
+                if (self.new_to_old_param_map.get(return_type) == null) {
+                    self.current_root = self.new_root;
+                    const name = try self.obtainTypeName(return_type);
+                    self.current_root = self.old_root;
+                    const pair = try std.fmt.allocPrint(self.allocator, ".retval = {s}", .{name});
+                    try self.append(&non_unique_args, pair);
                 }
             }
             const local_subs = if (non_unique_args.len > 0) get: {
@@ -1199,6 +1210,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn printImports(self: *@This()) anyerror!void {
             try self.printTxt("const std = @import(\"std\");\n");
             try self.printTxt("const api_translator = @import(\"api-translator.zig\");\n");
+            if (self.need_inout_import) {
+                try self.printTxt("const inout = api_translator.inout;\n");
+            }
             try self.printFmt("const {s} = @cImport({{\n", .{options.c_import});
             for (options.header_paths) |path| {
                 try self.printFmt("@cInclude(\"{s}\");\n", .{path});
