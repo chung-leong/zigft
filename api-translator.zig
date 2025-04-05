@@ -27,7 +27,9 @@ pub const CodeGeneratorOptions = struct {
     filter_fn: fn (name: []const u8) bool,
 
     // callback for determining which enum items represent errors
-    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZero,
+    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
+    // callback for determining if an enum type should be a bitflags packed struct
+    enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
 
     // callbacks for setting pointer attributes
     ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
@@ -50,8 +52,12 @@ pub const CodeGeneratorOptions = struct {
         return arg;
     }
 
-    pub fn nonZero(_: []const u8, value: i128) bool {
+    pub fn nonZeroValue(_: []const u8, value: i128) bool {
         return value != 0;
+    }
+
+    pub fn neverPackedStruct(_: []const u8) bool {
+        return false;
     }
 
     pub fn neverOptional(_: []const u8, _: []const u8) bool {
@@ -208,7 +214,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     const i = old_fn.params.len - j - 1;
                     const Target = WritableTarget(old_fn.params[i].type.?) orelse break i + 1;
                     // see if the pointer is attributed as in/out
-                    if (getTypeWithAttributes(local_subs)) |type_wa| {
+                    if (getTypeWithAttributes(local_subs, null, 0)) |type_wa| {
                         if (type_wa.is_inout) break i + 1;
                     }
                     types[i] = Substitute(Target, local_subs, i, old_fn.params.len);
@@ -261,7 +267,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     // copy arguments
                     inline for (new_args, 0..) |new_arg, i| {
                         const ArgT = @TypeOf(old_args[i]);
-                        old_args[i] = cast(ArgT, new_arg);
+                        old_args[i] = convert(ArgT, new_arg);
                     }
                     var payload: Payload = if (Payload == void) {} else undefined;
                     // see how many pointers and tuple fields there're
@@ -278,14 +284,14 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                         1 => old_args[new_args.len] = @ptrCast(&payload),
                         else => for (new_args.len..old_args.len) |i| {
                             const ArgT = @TypeOf(old_args[i]);
-                            old_args[i] = cast(ArgT, &payload[i - new_args.len]);
+                            old_args[i] = convert(ArgT, &payload[i - new_args.len]);
                         },
                     }
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
                     if (can_fail) {
                         // see if the call encountered an error
-                        const status = cast(options.error_scheme.Status, old_rv);
+                        const status = convert(options.error_scheme.Status, old_rv);
                         switch (options.error_scheme.fromEnum(status)) {
                             .err => |e| return e,
                             .status => |s| if (extra > 0) {
@@ -295,9 +301,9 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                         }
                     } else if (extra > 0) {
                         if (last > 0) {
-                            payload[last] = cast(@TypeOf(payload[last]), old_rv);
+                            payload[last] = convert(@TypeOf(payload[last]), old_rv);
                         } else {
-                            payload = cast(@TypeOf(payload), old_rv);
+                            payload = convert(@TypeOf(payload), old_rv);
                         }
                     }
                     return payload;
@@ -320,7 +326,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     var new_args: std.meta.ArgsTuple(NewCallbackFn) = undefined;
                     // copy arguments
                     inline for (0..new_args.len) |i| {
-                        new_args[i] = cast(@TypeOf(new_args[i]), old_args[i]);
+                        new_args[i] = convert(@TypeOf(new_args[i]), old_args[i]);
                     }
                     // call new callback
                     var result: options.error_scheme.Result = undefined;
@@ -357,17 +363,77 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             return fn_transform.spreadArgs(ns.call, .c);
         }
 
-        fn cast(comptime T: type, arg: anytype) T {
+        inline fn convert(comptime T: type, arg: anytype) T {
             const AT = @TypeOf(arg);
+            const a = @typeInfo(AT);
             return switch (@typeInfo(T)) {
+                .int => switch (@typeInfo(AT)) {
+                    .@"enum" => @intFromEnum(arg),
+                    .bool => if (arg) 1 else 0,
+                    else => @bitCast(arg),
+                },
                 .pointer => |pt| switch (@typeInfo(pt.child)) {
                     .@"fn" => &translateCallback(pt.child, arg),
+                    inline .@"struct", .@"union" => switch (@typeInfo(a.pointer.child)) {
+                        inline .@"struct", .@"union" => |st| switch (st.layout) {
+                            .@"extern" => @ptrCast(arg),
+                            else => &copyContainer(pt.child, arg.*),
+                        },
+                        else => @ptrCast(arg),
+                    },
                     else => @ptrCast(arg),
                 },
+                inline .@"struct", .@"union" => switch (a) {
+                    inline .@"struct", .@"union" => |st| switch (st.layout) {
+                        .@"extern" => @bitCast(arg),
+                        else => copyContainer(T, arg),
+                    },
+                    else => @bitCast(arg),
+                },
                 .@"enum" => @enumFromInt(arg),
-                .int => if (@typeInfo(AT) == .@"enum") @intFromEnum(arg) else arg,
                 else => @bitCast(arg),
             };
+        }
+
+        inline fn copyContainer(comptime T: type, src: anytype) T {
+            var dst: T = undefined;
+            switch (@typeInfo(@TypeOf(src))) {
+                .@"struct" => |src_st| {
+                    const dst_st = @typeInfo(T).@"struct";
+                    inline for (src_st.fields, 0..) |src_field, i| {
+                        const dst_field = dst_st.fields[i];
+                        const src_value = @field(src, src_field.name);
+                        @field(dst, dst_field.name) = convert(dst_field.type, src_value);
+                    }
+                },
+                .@"union" => |src_un| {
+                    const dst_un = @typeInfo(T).@"union";
+                    if (src_un.tag_type) |TT| {
+                        const tag: TT = src;
+                        inline for (src_un.fields, 0..) |src_field, i| {
+                            if (tag == @field(TT, src_field.name)) {
+                                const dst_field = dst_un.fields[i];
+                                const src_value = @field(src, src_field.name);
+                                @field(dst, dst_field.name) = convert(dst_field.type, src_value);
+                                break;
+                            }
+                        }
+                    } else {
+                        var sel_field = undefined;
+                        var dst_field = undefined;
+                        inline for (src_un.fields, 0..) |src_field, i| {
+                            if (i == 0 or @sizeOf(src_field.type) > @sizeOf(sel_field.type)) {
+                                sel_field = src_field;
+                                dst_field = dst_un.fields[i];
+                            }
+                        }
+                        const src_value = @field(src, sel_field.name);
+                        @field(dst, dst_field.name) = convert(dst_field.type, src_value);
+                    }
+                },
+                else => @compileError("Unexpected type"),
+            }
+            return dst;
         }
 
         fn SwitchType(comptime T: type, comptime dir: enum { old_to_new, new_to_old }) type {
@@ -1650,6 +1716,59 @@ test "snakify" {
     try expectEqualSlices(u8, "animal_green_dragon", name1);
     const name2 = try snakify(allocator, "AnimalGreenDragon", 6);
     try expectEqualSlices(u8, "green_dragon", name2);
+}
+
+test "Translator.convert" {
+    const c_to_zig = Translator(.{
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, .{
+            .non_error_statuses = &.{},
+            .default_status = 0,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const convert = c_to_zig.convert;
+    const OldStruct = extern struct {
+        number1: i32,
+        number2: i32,
+    };
+    const NewStruct1 = extern struct {
+        a: i32,
+        b: i32,
+    };
+    const NewStruct2 = struct {
+        a: i32,
+        b: i32,
+    };
+    const NewStruct3 = packed struct(u32) {
+        flag1: bool = true,
+        flag2: bool = false,
+        flag3: bool = true,
+        _: u29 = 0,
+    };
+    const StatusEnum = enum(c_uint) {
+        ok,
+        failure,
+        unexpected,
+    };
+    const new1: NewStruct1 = .{ .a = 123, .b = 456 };
+    const old1: OldStruct = convert(OldStruct, new1);
+    try expectEqual(old1.number2, 456);
+    const old_ptr1 = convert(*const OldStruct, &new1);
+    try expectEqual(old_ptr1.number2, 456);
+    const new2: NewStruct2 = .{ .a = 123, .b = 456 };
+    const old2: OldStruct = convert(OldStruct, new2);
+    try expectEqual(old2.number2, 456);
+    const old_ptr2 = convert(*const OldStruct, &new2);
+    try expectEqual(old_ptr2.number2, 456);
+    const enum1: StatusEnum = .failure;
+    const old_enum1 = convert(c_uint, enum1);
+    try expectEqual(old_enum1, 1);
+    const new3: NewStruct3 = .{};
+    const old_enum2 = convert(c_uint, new3);
+    try expectEqual(old_enum2, 0b101);
+    const old_enum3: c_uint = 0b110;
+    const new4 = convert(NewStruct3, old_enum3);
+    try expectEqual(new4, NewStruct3{ .flag1 = false, .flag2 = true, .flag3 = true });
 }
 
 test "Translator.Translated" {
