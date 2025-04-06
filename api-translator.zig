@@ -495,6 +495,8 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
 pub const Type = union(enum) {
     container: struct {
+        layout: ?[]const u8 = null,
+        backing_type: ?[]const u8 = null,
         kind: []const u8,
         fields: []Field = &.{},
         decls: []Declaration = &.{},
@@ -512,6 +514,7 @@ pub const Type = union(enum) {
     enumeration: struct {
         items: []EnumItem = &.{},
         is_signed: bool,
+        is_exhaustive: bool = false,
     },
     function: struct {
         parameters: []Parameter = &.{},
@@ -530,6 +533,7 @@ pub const Field = struct {
     name: []const u8,
     type: *Type,
     alignment: ?[]const u8 = null,
+    default_value: ?[]const u8 = null,
 };
 pub const Declaration = struct {
     name: []const u8,
@@ -767,6 +771,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
             return try self.createType(.{
                 .container = .{
+                    .layout = if (decl.layout_token) |t| tree.tokenSlice(t) else null,
                     .kind = tree.tokenSlice(decl.ast.main_token),
                     .fields = fields,
                 },
@@ -989,6 +994,26 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
+        fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
+            const t = get: {
+                if (width > 0) {
+                    const type_name = try std.fmt.allocPrint(self.allocator, "u{d}", .{width});
+                    break :get self.new_namespace.getType(type_name) orelse add: {
+                        const new_t = try self.createType(.{ .expression = .{ .identifier = type_name } });
+                        try self.new_namespace.addType(type_name, new_t);
+                        break :add new_t;
+                    };
+                } else {
+                    const expr = try std.fmt.allocPrint(self.allocator, "std.meta.Int(.unsigned, @bitSizeOf(c_uint) - {d})", .{-width});
+                    break :get try self.createType(.{ .expression = .{ .unknown = expr } });
+                }
+            };
+            return .{
+                .name = name,
+                .type = t,
+            };
+        }
+
         fn translateParameter(self: *@This(), param: Parameter, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
             const new_type = try self.obtainTranslatedType(param.type);
@@ -1022,9 +1047,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         const new_field = try self.translateField(field);
                         try self.append(&new_fields, new_field);
                     }
+                    // TODO don't use extern when struct contains function pointers
                     return try self.createType(.{
                         .container = .{
+                            .layout = c.layout,
                             .kind = c.kind,
+                            .backing_type = c.backing_type,
                             .fields = new_fields,
                         },
                     });
@@ -1049,17 +1077,80 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     });
                 },
                 .enumeration => |e| {
-                    var new_items: []EnumItem = &.{};
-                    for (e.items) |item| {
-                        const new_field = try self.translateEnumItem(item);
-                        try self.append(&new_items, new_field);
+                    const enum_name = try self.obtainTypeName(t);
+                    if (options.enum_is_packed_struct_fn(enum_name)) {
+                        var pow2_items: []EnumItem = &.{};
+                        for (e.items) |item| {
+                            if (item.value != 0 and std.math.isPowerOfTwo(item.value)) {
+                                try self.append(&pow2_items, item);
+                            }
+                        }
+                        std.mem.sort(EnumItem, pow2_items, {}, struct {
+                            fn compare(_: void, lhs: EnumItem, rhs: EnumItem) bool {
+                                return lhs.value < rhs.value;
+                            }
+                        }.compare);
+                        var blank_field_name: []const u8 = "_";
+                        var bits_used: isize = 0;
+                        var bit_fields: []Field = &.{};
+                        var new_fields: []Field = &.{};
+                        for (pow2_items) |item| {
+                            const pos = @ctz(item.value);
+                            if (bits_used != pos) {
+                                // insert filler
+                                const blank_field = try self.createBlankField(blank_field_name, pos - bits_used);
+                                try self.append(&new_fields, blank_field);
+                                blank_field_name = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ blank_field_name, "_" });
+                                bits_used = pos;
+                            }
+                            const new_field = try self.translateBitField(item);
+                            try self.append(&new_fields, new_field);
+                            try self.append(&bit_fields, new_field);
+                            bits_used += 1;
+                        }
+                        // insert final filler
+                        const blank_field = try self.createBlankField(blank_field_name, -bits_used);
+                        try self.append(&new_fields, blank_field);
+                        var new_decls: []Declaration = &.{};
+                        for (e.items) |item| {
+                            if (item.value == 0 or !std.math.isPowerOfTwo(item.value)) {
+                                var remaining = item.value;
+                                for (pow2_items) |other_item| remaining &= ~other_item.value;
+                                const decl = if (remaining == 0) create: {
+                                    // it can be represented as a combination of field items
+                                    var set_fields: []Field = &.{};
+                                    for (pow2_items, 0..) |pow2_item, i| {
+                                        if (item.value & pow2_item.value != 0) {
+                                            try self.append(&set_fields, bit_fields[i]);
+                                        }
+                                    }
+                                    break :create try self.createBitFieldDeclaration(item.name, set_fields);
+                                } else try self.createIntDeclaration(item.name, item.value);
+                                try self.append(&new_decls, decl);
+                            }
+                        }
+                        return self.createType(.{
+                            .container = .{
+                                .layout = "packed",
+                                .kind = "struct",
+                                .backing_type = "c_uint",
+                                .fields = new_fields,
+                                .decls = new_decls,
+                            },
+                        });
+                    } else {
+                        var new_items: []EnumItem = &.{};
+                        for (e.items) |item| {
+                            const new_field = try self.translateEnumItem(item);
+                            try self.append(&new_items, new_field);
+                        }
+                        return self.createType(.{
+                            .enumeration = .{
+                                .items = new_items,
+                                .is_signed = e.is_signed,
+                            },
+                        });
                     }
-                    return self.createType(.{
-                        .enumeration = .{
-                            .items = new_items,
-                            .is_signed = e.is_signed,
-                        },
-                    });
                 },
                 .function => |f| {
                     var new_params: []Parameter = &.{};
@@ -1142,6 +1233,52 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 },
                 else => unreachable,
             }
+        }
+
+        fn translateBitField(self: *@This(), item: EnumItem) !Field {
+            const new_name = try options.enum_name_fn(self.allocator, item.name);
+            const t = self.new_namespace.getType("bool") orelse add: {
+                const new_t = try self.createType(.{ .expression = .{ .identifier = "bool" } });
+                try self.new_namespace.addType("bool", new_t);
+                break :add new_t;
+            };
+            return .{
+                .name = new_name,
+                .type = t,
+                .default_value = "false",
+            };
+        }
+
+        fn createBitFieldDeclaration(self: *@This(), name: []const u8, fields: []Field) !Declaration {
+            const new_name = try options.enum_name_fn(self.allocator, name);
+            var pairs: [][]const u8 = &.{};
+            for (fields) |field| {
+                const assign = try std.fmt.allocPrint(self.allocator, ".{s} = true", .{field.name});
+                try self.append(&pairs, assign);
+            }
+            const set = switch (pairs.len) {
+                0 => ".{}",
+                else => try std.fmt.allocPrint(self.allocator, ".{s}", .{pairs}),
+            };
+            const t = self.new_namespace.getType("@This()") orelse add: {
+                const new_t = try self.createType(.{ .expression = .{ .identifier = "@This()" } });
+                try self.new_namespace.addType("@This()", new_t);
+                break :add new_t;
+            };
+            return .{
+                .name = new_name,
+                .type = t,
+                .expr = .{ .unknown = set },
+            };
+        }
+
+        fn createIntDeclaration(self: *@This(), name: []const u8, value: i128) !Declaration {
+            const new_name = try options.enum_name_fn(self.allocator, name);
+            const number = try std.fmt.allocPrint(self.allocator, "{d}", .{value});
+            return .{
+                .name = new_name,
+                .expr = .{ .unknown = number },
+            };
         }
 
         fn isWriteTarget(_: *@This(), t: *const Type) bool {
@@ -1294,11 +1431,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             switch (t.*) {
                 .container => |c| {
                     if (t != self.new_root) {
-                        if (!std.mem.eql(u8, c.kind, "opaque")) try self.printTxt("extern ");
+                        if (c.layout) |l| try self.printFmt("{s} ", .{l});
+                        try self.printFmt("{s}", .{c.kind});
+                        if (c.backing_type) |bt| try self.printFmt("({s})", .{bt});
                         if (c.fields.len == 0) {
-                            try self.printFmt("{s} {{}}", .{c.kind});
+                            try self.printTxt(" {{}}");
                         } else {
-                            try self.printFmt("{s} {{\n", .{c.kind});
+                            try self.printTxt(" {{\n");
                         }
                     }
                     for (c.fields) |field| try self.printField(field);
@@ -1329,23 +1468,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const is_sequential = for (e.items, 0..) |item, index| {
                         if (index > 0 and item.value != e.items[index - 1].value + 1) break false;
                     } else true;
-                    const is_binary = check: {
-                        var pow2_count: usize = 0;
-                        var not_pow2_count: usize = 0;
-                        for (e.items) |item| {
-                            if (item.value > 0) {
-                                if (std.math.isPowerOfTwo(item.value)) {
-                                    pow2_count += 1;
-                                } else {
-                                    not_pow2_count += 1;
-                                }
-                            }
-                            if (item.value < 0) {
-                                break :check false;
-                            }
-                        }
-                        break :check pow2_count > 3 and pow2_count > not_pow2_count;
-                    };
                     const is_hexidecimal = !is_sequential and for (e.items) |item| {
                         if (item.value < 0) break false;
                     } else true;
@@ -1359,15 +1481,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     for (e.items, 0..) |item, index| {
                         try self.printFmt("{s}", .{item.name});
                         if (!is_sequential or (index == 0 and item.value != 0)) {
-                            if (is_binary) {
-                                inline for (.{ 64, 32, 16, 8 }) |bits| {
-                                    if (max_width > (bits / 2) or bits == 8) {
-                                        const width = std.fmt.comptimePrint("{d}", .{bits});
-                                        try self.printFmt(" = 0b{b:0" ++ width ++ "}", .{@as(u128, @bitCast(item.value))});
-                                        break;
-                                    }
-                                }
-                            } else if (is_hexidecimal) {
+                            if (is_hexidecimal) {
                                 inline for (.{ 64, 32, 16, 8 }) |bits| {
                                     if (max_width > (bits / 2) or bits == 8) {
                                         const width = std.fmt.comptimePrint("{d}", .{bits / 4});
@@ -1380,6 +1494,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             }
                         }
                         try self.printTxt(",\n");
+                    }
+                    if (!e.is_exhaustive) {
+                        try self.printTxt("_,\n");
                     }
                     try self.printTxt("}}");
                 },
@@ -1425,6 +1542,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printFmt("{s}: ", .{field.name});
             try self.printTypeRef(field.type);
             if (field.alignment) |a| try self.printFmt(" align({s})", .{a});
+            if (field.default_value) |v| try self.printFmt(" = {s}", .{v});
             try self.printTxt(",\n");
         }
 
@@ -1440,7 +1558,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .type => |t| try self.printTypeDef(t),
                 .identifier, .unknown => |s| try self.printFmt("{s}", .{s}),
             }
-            try self.printTxt(";\n\n");
+            try self.printTxt(";\n");
         }
 
         fn printTrainslatorSetup(self: *@This()) !void {
