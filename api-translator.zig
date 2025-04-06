@@ -11,6 +11,8 @@ pub const TypeSubstitution = struct {
 };
 pub const TranslatorOptions = struct {
     substitutions: []const TypeSubstitution = &.{},
+    c_import_ns: type,
+    late_bind_fn: ?fn ([]const u8) *const anyopaque = null,
     error_scheme: type,
     ignore_cb_status: bool = true,
 };
@@ -268,12 +270,18 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         pub fn translate(
-            comptime func: anytype,
+            comptime fn_name: []const u8,
             comptime can_fail: bool,
             comptime ignore_status: bool,
             local_subs: anytype,
-        ) Translated(@TypeOf(func), can_fail, ignore_status, local_subs, false) {
-            const OldFn = @TypeOf(func);
+        ) Translated(
+            @TypeOf(@field(options.c_import_ns, fn_name)),
+            can_fail,
+            ignore_status,
+            local_subs,
+            false,
+        ) {
+            const OldFn = @TypeOf(@field(options.c_import_ns, fn_name));
             const NewFn = Translated(OldFn, can_fail, ignore_status, local_subs, false);
             const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
             const Payload = @typeInfo(NewRT).error_union.payload;
@@ -303,6 +311,20 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                             old_args[i] = convert(ArgT, &payload[i - new_args.len]);
                         },
                     }
+                    // get function
+                    const func = if (options.late_bind_fn) |get| bind: {
+                        const bind_ns = struct {
+                            var func_ptr: ?*const OldFn = null;
+                        };
+                        if (bind_ns.func_ptr) |ptr| {
+                            break :bind ptr;
+                        } else {
+                            const ptr: *const OldFn = @ptrCast(get(fn_name));
+                            bind_ns.func_ptr = ptr;
+                            break :bind ptr;
+                        }
+                    } else @field(options.c_import_ns, fn_name);
+
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
                     if (can_fail) {
@@ -1366,9 +1388,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const local_subs_pairs = try std.mem.join(self.allocator, ", ", non_unique_args);
                 break :get try std.fmt.allocPrint(self.allocator, " {s} ", .{local_subs_pairs});
             } else "";
-            const code = try std.fmt.allocPrint(self.allocator, "{s}.translate({s}.{s}, {}, {}, .{{{s}}})", .{
+            const code = try std.fmt.allocPrint(self.allocator, "{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
                 options.translater,
-                options.c_import,
                 decl.name,
                 can_fail,
                 ignore_status,
@@ -1563,8 +1584,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn printTrainslatorSetup(self: *@This()) !void {
             try self.printFmt("const {s} = api_translator.Translator(.{{\n", .{options.translater});
-            var iterator = self.new_to_old_param_map.iterator();
+            try self.printFmt(".c_import_ns = {s},\n", .{options.c_import});
             try self.printTxt(".substitutions = &.{{\n");
+            var iterator = self.new_to_old_param_map.iterator();
             var added: std.StringHashMap(bool) = .init(self.allocator);
             while (iterator.next()) |entry| {
                 const new_t = entry.key_ptr.*;
@@ -1831,7 +1853,9 @@ test "asComptimeInt" {
 }
 
 test "Translator.convert (basic)" {
+    const c = struct {};
     const c_to_zig = Translator(.{
+        .c_import_ns = c,
         .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, .{
             .default_success_status = 0,
             .default_failure_status = 1,
@@ -1906,7 +1930,9 @@ test "Translator.convert (function pointer)" {
         failure,
         unexpected,
     };
+    const c = struct {};
     const c_to_zig = Translator(.{
+        .c_import_ns = c,
         .substitutions = &.{
             .{ .old = *const OldStruct1, .new = *const NewStruct1 },
         },
@@ -1973,7 +1999,9 @@ test "Translator.Translated" {
         Failure,
         Unexpected,
     };
+    const c = struct {};
     const c_to_zig = Translator(.{
+        .c_import_ns = c,
         .substitutions = &.{
             .{ .old = OldStruct, .new = NewStruct },
             .{ .old = *OldStruct, .new = *NewStruct },
@@ -2029,7 +2057,18 @@ test "translate" {
         leave,
         shoot,
     };
+    const c = struct {
+        fn hello(_: OldStruct, _: i32) callconv(.c) c_uint {
+            return 0;
+        }
+
+        fn world(_: i32, ptr: *OldStruct) callconv(.c) c_uint {
+            ptr.* = .{ .number1 = 123, .number2 = 456 };
+            return 0;
+        }
+    };
     const c_to_zig = Translator(.{
+        .c_import_ns = c,
         .substitutions = &.{
             .{ .old = OldStruct, .new = NewStruct },
         },
@@ -2039,18 +2078,8 @@ test "translate" {
             .default_error = error.Unexpected,
         }),
     });
-    const ns = struct {
-        fn hello(_: OldStruct, _: i32) c_uint {
-            return 0;
-        }
-
-        fn world(_: i32, ptr: *OldStruct) c_uint {
-            ptr.* = .{ .number1 = 123, .number2 = 456 };
-            return 0;
-        }
-    };
     _ = ActionEnum;
-    const func1 = c_to_zig.translate(ns.hello, true, false, .{});
+    const func1 = c_to_zig.translate("hello", true, false, .{});
     try expectEqual(@TypeOf(func1), fn (NewStruct, i32) ErrorSet!void);
     try func1(.{}, 123);
 }
