@@ -5,6 +5,24 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
+pub const inout = TypeWithAttributes.inout;
+
+pub const TypeWithAttributes = struct {
+    type: type,
+    is_inout: bool = false,
+
+    fn inout(comptime T: type) @This() {
+        return .{ .type = T, .is_inout = true };
+    }
+
+    fn get(comptime arg: anytype) @This() {
+        return switch (@TypeOf(arg)) {
+            type => .{ .type = arg },
+            @This() => arg,
+            else => @compileError("Type expected, found  '" ++ @typeName(@TypeOf(arg)) ++ "'"),
+        };
+    }
+};
 pub const TypeSubstitution = struct {
     old: type,
     new: type,
@@ -14,74 +32,8 @@ pub const TranslatorOptions = struct {
     c_import_ns: type,
     late_bind_fn: ?fn ([]const u8) *const anyopaque = null,
     error_scheme: type,
-    ignore_cb_status: bool = true,
+    callbacks_return_default_success_status: bool = true,
 };
-pub const CodeGeneratorOptions = struct {
-    include_paths: []const []const u8,
-    header_paths: []const []const u8,
-    translater: []const u8 = "c_to_zig",
-    error_set: []const u8 = "Error",
-    c_error_type: []const u8,
-    c_import: []const u8 = "c",
-    c_root_struct: ?[]const u8 = null,
-    add_simple_test: bool = true,
-
-    filter_fn: fn (name: []const u8) bool,
-
-    // callback for determining which enum items represent errors
-    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
-    // callback for determining if an enum type should be a bitflags packed struct
-    enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
-
-    // callbacks for setting pointer attributes
-    ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
-    ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
-    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = neverOptional,
-
-    // callback for distinguishing in/out pointers from output pointers
-    param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
-
-    // callbacks for adjusting naming convention
-    fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    type_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    const_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    param_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-
-    pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
-        return arg;
-    }
-
-    pub fn nonZeroValue(_: []const u8, value: i128) bool {
-        return value != 0;
-    }
-
-    pub fn neverPackedStruct(_: []const u8) bool {
-        return false;
-    }
-
-    pub fn neverOptional(_: []const u8, _: []const u8) bool {
-        return false;
-    }
-
-    pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-        return true;
-    }
-
-    pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-        return false;
-    }
-
-    pub fn ifCharType(_: []const u8, target_type: []const u8) bool {
-        const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
-        return for (char_types) |char_type| {
-            if (std.mem.eql(u8, target_type, char_type)) break true;
-        } else false;
-    }
-};
-
 pub fn BasicErrorScheme(
     old_enum_type: type,
     new_error_set: type,
@@ -179,40 +131,91 @@ pub fn BasicErrorScheme(
         }
     };
 }
+pub const CodeGeneratorOptions = struct {
+    include_paths: []const []const u8,
+    header_paths: []const []const u8,
+    translater: []const u8 = "c_to_zig",
+    error_set: []const u8 = "Error",
+    c_error_type: []const u8,
+    c_import: []const u8 = "c",
+    c_root_struct: ?[]const u8 = null,
 
-pub const TypeWithAttributes = struct {
-    type: type,
-    is_inout: bool = false,
+    always_return_error_union: bool = false,
+    ignore_non_default_success_status: bool = true,
+    callbacks_return_default_success_status: bool = true,
+    add_simple_test: bool = true,
 
-    fn inout(comptime T: type) @This() {
-        return .{ .type = T, .is_inout = true };
+    // callback determining which declarations to include
+    filter_fn: fn (name: []const u8) bool,
+
+    // callback determining which enum items represent errors
+    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
+    // callback determining if an enum type should be a bitflags packed struct
+    enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
+
+    // callbacks setting pointer attributes
+    ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
+    ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
+    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = neverOptional,
+
+    // callback distinguishing in/out pointers from output pointers
+    param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
+
+    // callbacks adjusting naming convention
+    fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    type_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    const_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    param_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+
+    pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+        return arg;
     }
 
-    fn get(comptime arg: anytype) @This() {
-        return switch (@TypeOf(arg)) {
-            type => .{ .type = arg },
-            @This() => arg,
-            else => @compileError("Type expected, found  '" ++ @typeName(@TypeOf(arg)) ++ "'"),
-        };
+    pub fn nonZeroValue(_: []const u8, value: i128) bool {
+        return value != 0;
+    }
+
+    pub fn neverPackedStruct(_: []const u8) bool {
+        return false;
+    }
+
+    pub fn neverOptional(_: []const u8, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+        return true;
+    }
+
+    pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn ifCharType(_: []const u8, target_type: []const u8) bool {
+        const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
+        return for (char_types) |char_type| {
+            if (std.mem.eql(u8, target_type, char_type)) break true;
+        } else false;
     }
 };
-
-pub const inout = TypeWithAttributes.inout;
 
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
         pub fn Translated(
             comptime OldFn: anytype,
-            comptime can_fail: bool,
-            comptime ignore_status: bool,
+            comptime return_error_union: bool,
+            comptime ignore_non_error_return_value: bool,
             comptime local_subs: anytype,
             comptime is_callback: bool,
         ) type {
             const old_fn = @typeInfo(OldFn).@"fn";
             const OldRT = old_fn.return_type.?;
-            const extra = switch (ignore_status) {
+            const extra = switch (ignore_non_error_return_value) {
                 true => 0,
-                false => switch (can_fail) {
+                false => switch (return_error_union) {
                     // room for an extra type when there're multiple status codes indicating success
                     true => if (options.error_scheme.PositiveStatus != void) 1 else 0,
                     // room for an extra type when the return value isn't an error code or void
@@ -223,7 +226,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             const OutputTypes = init: {
                 var types: [old_fn.params.len + extra]type = undefined;
                 if (extra == 1) {
-                    types[old_fn.params.len] = switch (can_fail) {
+                    types[old_fn.params.len] = switch (return_error_union) {
                         true => options.error_scheme.PositiveStatus,
                         false => Substitute(OldRT, local_subs, null, old_fn.params.len),
                     };
@@ -257,7 +260,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 else => std.meta.Tuple(OutputTypes),
             };
             const Error = if (is_callback) anyerror else options.error_scheme.ErrorSet;
-            const NewRT = if (can_fail) Error!Payload else Payload;
+            const NewRT = if (return_error_union) Error!Payload else Payload;
             return @Type(.{
                 .@"fn" = .{
                     .calling_convention = .auto,
@@ -271,18 +274,24 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
         pub fn translate(
             comptime fn_name: []const u8,
-            comptime can_fail: bool,
-            comptime ignore_status: bool,
+            comptime return_error_union: bool,
+            comptime ignore_non_error_return_value: bool,
             local_subs: anytype,
         ) Translated(
             @TypeOf(@field(options.c_import_ns, fn_name)),
-            can_fail,
-            ignore_status,
+            return_error_union,
+            ignore_non_error_return_value,
             local_subs,
             false,
         ) {
             const OldFn = @TypeOf(@field(options.c_import_ns, fn_name));
-            const NewFn = Translated(OldFn, can_fail, ignore_status, local_subs, false);
+            const NewFn = Translated(
+                OldFn,
+                return_error_union,
+                ignore_non_error_return_value,
+                local_subs,
+                false,
+            );
             const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
             const Payload = @typeInfo(NewRT).error_union.payload;
             const ns = struct {
@@ -327,7 +336,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
-                    if (can_fail) {
+                    if (return_error_union) {
                         // see if the call encountered an error
                         const status = convert(options.error_scheme.Status, old_rv);
                         switch (options.error_scheme.fromEnum(status)) {
@@ -350,9 +359,16 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             return fn_transform.spreadArgs(ns.call, .auto);
         }
 
+        fn ignoreReturnValue(comptime FT: type) bool {
+            return if (@typeInfo(FT).@"fn".return_type == options.error_scheme.Status)
+                options.callbacks_return_default_success_status
+            else
+                false;
+        }
+
         pub fn translateCallback(
             comptime FT: type,
-            comptime func: Translated(FT, true, options.ignore_cb_status, .{}, true),
+            comptime func: Translated(FT, true, ignoreReturnValue(FT), .{}, true),
         ) *const FT {
             const NewCallbackFn = @TypeOf(func);
             const OldCallbackFn = FT;
@@ -548,6 +564,7 @@ pub const Type = union(enum) {
         error_set: *Type,
     },
     error_set: [][]const u8,
+    optional: *Type,
     type_tuple: []*Type,
     expression: Expression,
 };
@@ -637,6 +654,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         error_enums: []const []const u8,
         non_error_enums: []const []const u8,
         void_type: *Type,
+        full_error_set: *Type,
         type_lookup: ?*Type,
         write_to_byte_array: bool,
         byte_array: std.ArrayList(u8),
@@ -661,11 +679,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.error_enums = &.{};
             self.non_error_enums = &.{};
             self.void_type = try self.createType(.{ .expression = .{ .identifier = "void" } });
+            self.full_error_set = try self.createType(.{ .expression = .{ .identifier = "anyerror" } });
             self.type_lookup = null;
             self.write_to_byte_array = false;
             self.byte_array = .init(self.allocator);
             self.current_root = self.old_root;
             self.need_inout_import = false;
+            try self.new_namespace.addType("void", self.void_type);
+            try self.new_namespace.addType("anyerror", self.full_error_set);
             return self;
         }
 
@@ -935,7 +956,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .type, .identifier => try options.type_name_fn(self.allocator, decl.name),
                         .unknown => try options.const_name_fn(self.allocator, decl.name),
                     };
-                    const new_decl_t = if (decl.type) |t| try self.obtainTranslatedType(t) else null;
+                    const new_decl_t = if (decl.type) |t| try self.translateType(t, false) else null;
                     const expr = if (is_function)
                         try self.getTranslateCall(decl, new_decl_t.?)
                     else
@@ -991,7 +1012,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateExpression(self: *@This(), expr: Expression) !Expression {
             return switch (expr) {
-                .type => |t| .{ .type = try self.obtainTranslatedType(t) },
+                .type => |t| .{ .type = try self.translateType(t, false) },
                 .identifier => |i| if (self.old_namespace.getType(i)) |t| .{
                     .type = translate: {
                         // if the attempt to translate the type comes back here, then
@@ -999,7 +1020,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         if (self.type_lookup == t) break :translate t else {
                             self.type_lookup = t;
                             defer self.type_lookup = null;
-                            break :translate try self.obtainTranslatedType(t);
+                            break :translate try self.translateType(t, false);
                         }
                     },
                 } else expr,
@@ -1011,7 +1032,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const new_name = try options.field_name_fn(self.allocator, field.name);
             return .{
                 .name = new_name,
-                .type = try self.obtainTranslatedType(field.type),
+                .type = try self.translateType(field.type, false),
                 .alignment = field.alignment,
             };
         }
@@ -1038,7 +1059,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateParameter(self: *@This(), param: Parameter, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
-            const new_type = try self.obtainTranslatedType(param.type);
+            const new_type = try self.translateType(param.type, false);
             const is_unique_type = switch (new_type.*) {
                 .enumeration, .expression => false,
                 else => true,
@@ -1061,33 +1082,43 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateType(self: *@This(), t: *Type) !*Type {
-            switch (t.*) {
-                .container => |c| {
+        fn translateType(self: *@This(), t: *Type, is_pointer_target: bool) error{OutOfMemory}!*Type {
+            if (self.old_to_new_type_map.get(t)) |new_t| return new_t;
+            const new_t = switch (t.*) {
+                .container => |c| create: {
                     var new_fields: []Field = &.{};
                     for (c.fields) |field| {
                         const new_field = try self.translateField(field);
                         try self.append(&new_fields, new_field);
                     }
-                    // TODO don't use extern when struct contains function pointers
-                    return try self.createType(.{
+                    // don't use extern when resulting struct contains function
+                    const layout = for (new_fields) |field| {
+                        if (field.type.* == .function) break null;
+                    } else c.layout;
+                    break :create try self.createType(.{
                         .container = .{
-                            .layout = c.layout,
+                            .layout = layout,
                             .kind = c.kind,
                             .backing_type = c.backing_type,
                             .fields = new_fields,
                         },
                     });
                 },
-                .pointer => |p| {
+                .pointer => |p| create: {
+                    const child_t = try self.translateType(p.child_type, true);
+                    if (p.child_type.* == .function) {
+                        return if (p.is_optional) try self.createType(.{
+                            .optional = child_t,
+                        }) else child_t;
+                    }
                     const ptr_name = try self.obtainTypeName(t);
                     const target_name = try self.obtainTypeName(p.child_type);
                     const is_null_terminated = options.ptr_is_null_terminated_fn(ptr_name, target_name);
                     const is_many = options.ptr_is_many_fn(ptr_name, target_name);
                     const is_optional = options.ptr_is_optional_fn(ptr_name, target_name);
-                    return self.createType(.{
+                    break :create try self.createType(.{
                         .pointer = .{
-                            .child_type = try self.obtainTranslatedType(p.child_type),
+                            .child_type = child_t,
                             .alignment = p.alignment,
                             .sentinel = if (is_null_terminated) "0" else null,
                             .size = if (is_many) .many else .one,
@@ -1098,7 +1129,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         },
                     });
                 },
-                .enumeration => |e| {
+                .enumeration => |e| create: {
                     const enum_name = try self.obtainTypeName(t);
                     if (options.enum_is_packed_struct_fn(enum_name)) {
                         var pow2_items: []EnumItem = &.{};
@@ -1138,7 +1169,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             if (item.value == 0 or !std.math.isPowerOfTwo(item.value)) {
                                 var remaining = item.value;
                                 for (pow2_items) |other_item| remaining &= ~other_item.value;
-                                const decl = if (remaining == 0) create: {
+                                if (remaining == 0) {
                                     // it can be represented as a combination of field items
                                     var set_fields: []Field = &.{};
                                     for (pow2_items, 0..) |pow2_item, i| {
@@ -1146,12 +1177,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                                             try self.append(&set_fields, bit_fields[i]);
                                         }
                                     }
-                                    break :create try self.createBitFieldDeclaration(item.name, set_fields);
-                                } else try self.createIntDeclaration(item.name, item.value);
-                                try self.append(&new_decls, decl);
+                                    const decl = try self.createBitFieldDeclaration(item.name, set_fields);
+                                    try self.append(&new_decls, decl);
+                                } else {
+                                    const decl = try self.createIntDeclaration(item.name, item.value);
+                                    try self.append(&new_decls, decl);
+                                }
                             }
                         }
-                        return self.createType(.{
+                        break :create try self.createType(.{
                             .container = .{
                                 .layout = "packed",
                                 .kind = "struct",
@@ -1166,7 +1200,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             const new_field = try self.translateEnumItem(item);
                             try self.append(&new_items, new_field);
                         }
-                        return self.createType(.{
+                        break :create try self.createType(.{
                             .enumeration = .{
                                 .items = new_items,
                                 .is_signed = e.is_signed,
@@ -1174,7 +1208,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         });
                     }
                 },
-                .function => |f| {
+                .function => |f| create: {
                     var new_params: []Parameter = &.{};
                     // look for writable pointer
                     var output_types: []*Type = &.{};
@@ -1206,14 +1240,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     } else 0;
                     for (f.parameters, 0..) |param, index| {
                         if (index >= output_start) {
-                            const output_type = try self.obtainTranslatedType(param.type);
+                            const output_type = try self.translateType(param.type, false);
                             try self.append(&output_types, output_type.pointer.child_type);
                         }
                     }
                     // see if the translated function should return an error union
-                    const can_fail = self.isReturningError(t);
-                    const status_type = try self.obtainTranslatedType(f.return_type);
-                    const extra: usize = if (!can_fail or self.non_error_enums.len > 1) 1 else 0;
+                    const return_error_union = is_pointer_target or self.isReturningError(t);
+                    const status_type = try self.translateType(f.return_type, false);
+                    const extra: usize = if (!return_error_union or self.non_error_enums.len > 1) 1 else 0;
                     if (extra == 1) try self.append(&output_types, status_type);
                     const arg_count = f.parameters.len + extra - output_types.len;
                     for (f.parameters[0..arg_count], 0..) |param, index| {
@@ -1225,16 +1259,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         1 => output_types[0],
                         else => try self.createType(.{ .type_tuple = output_types }),
                     };
-                    const return_type = switch (can_fail) {
+                    const error_set = if (is_pointer_target) self.full_error_set else self.new_error_set;
+                    const return_type = switch (return_error_union) {
                         true => try self.createType(.{
                             .error_union = .{
                                 .payload_type = payload_type,
-                                .error_set = self.new_error_set,
+                                .error_set = error_set,
                             },
                         }),
                         false => payload_type,
                     };
-                    return self.createType(.{
+                    break :create try self.createType(.{
                         .function = .{
                             .parameters = new_params,
                             .return_type = return_type,
@@ -1242,7 +1277,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         },
                     });
                 },
-                .expression => |e| {
+                .expression => |e| create: {
                     const new_t = switch (try self.translateExpression(e)) {
                         .type => |new_t| new_t,
                         else => t,
@@ -1251,10 +1286,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         // add name to namespace
                         try self.new_namespace.addType(t.expression.identifier, t);
                     }
-                    return new_t;
+                    break :create new_t;
                 },
                 else => unreachable,
-            }
+            };
+            try self.old_to_new_type_map.put(t, new_t);
+            return new_t;
         }
 
         fn translateBitField(self: *@This(), item: EnumItem) !Field {
@@ -1323,6 +1360,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn isReturningError(self: *@This(), t: *Type) bool {
+            if (options.always_return_error_union) return true;
             const name = self.obtainTypeName(t.function.return_type) catch return false;
             return std.mem.eql(u8, options.c_error_type, name);
         }
@@ -1357,8 +1395,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn getTranslateCall(self: *@This(), decl: Declaration, new_t: *const Type) !Expression {
-            const can_fail = self.isReturningError(decl.type.?);
-            const ignore_status = false;
+            const return_error_union = self.isReturningError(decl.type.?);
+            const ignore_non_error_return_value = false;
             var non_unique_args: [][]const u8 = &.{};
             for (new_t.function.parameters, 0..) |param, index| {
                 // we need to do local substitution when the original type isn't unique enough
@@ -1374,7 +1412,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.append(&non_unique_args, pair);
                 }
             }
-            if (!can_fail) {
+            if (!return_error_union) {
                 const return_type = new_t.function.return_type;
                 if (self.new_to_old_param_map.get(return_type) == null) {
                     self.current_root = self.new_root;
@@ -1391,19 +1429,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const code = try std.fmt.allocPrint(self.allocator, "{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
                 options.translater,
                 decl.name,
-                can_fail,
-                ignore_status,
+                return_error_union,
+                ignore_non_error_return_value,
                 local_subs,
             });
             return .{ .unknown = code };
-        }
-
-        fn obtainTranslatedType(self: *@This(), t: *Type) std.mem.Allocator.Error!*Type {
-            return self.old_to_new_type_map.get(t) orelse add: {
-                const new_t = try self.translateType(t);
-                try self.old_to_new_type_map.put(t, new_t);
-                break :add new_t;
-            };
         }
 
         fn obtainTypeName(self: *@This(), t: *Type) ![]const u8 {
@@ -1542,6 +1572,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     if (f.alignment) |a| try self.printFmt("align({s}) ", .{a});
                     try self.printTypeRef(f.return_type);
                 },
+                .optional => |ot| {
+                    try self.printTxt("?");
+                    try self.printTypeRef(ot);
+                },
                 .type_tuple => |types| {
                     try self.printTxt("std.meta.Tuple(&.{{ ");
                     for (types, 0..) |tt, i| {
@@ -1605,7 +1639,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 std.debug.print("Unable to find enum type '{s}'\n", .{options.c_error_type});
                 return error.Unexpected;
             };
-            const new_enum_t = try self.obtainTranslatedType(old_enum_t);
+            const new_enum_t = try self.translateType(old_enum_t, false);
             const enum_name = try self.obtainTypeName(new_enum_t);
             try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, .{{\n", .{ enum_name, options.error_set });
             const def_pos_status, const def_neg_status = if (new_enum_t.* == .enumeration) .{
@@ -1625,6 +1659,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printFmt(".default_failure_status = {s},\n", .{def_neg_status});
             try self.printFmt(".default_error = {s}.Unexpected,\n", .{options.error_set});
             try self.printTxt("}}),\n");
+            if (!options.callbacks_return_default_success_status) {
+                try self.printTxt(".callbacks_return_default_success_status = false,\n");
+            }
             try self.printTxt("}});\n");
         }
 
