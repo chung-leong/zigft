@@ -956,16 +956,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             // add remaining
             for (self.old_root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
-                    const is_function = decl.type != null and decl.type.?.* == .function;
                     // get name in target namespace
-                    const new_name = if (is_function)
+                    const new_name = if (isFunctionDecl(decl))
                         try options.fn_name_fn(self.allocator, decl.name)
                     else switch (decl.expr) {
                         .type, .identifier => try options.type_name_fn(self.allocator, decl.name),
                         .unknown => try options.const_name_fn(self.allocator, decl.name),
                     };
                     const new_decl_t = if (decl.type) |t| try self.translateType(t, false) else null;
-                    const expr = if (is_function)
+                    const expr = if (isFunctionDecl(decl))
                         try self.getTranslateCall(decl, new_decl_t.?)
                     else
                         try self.translateExpression(decl.expr);
@@ -1354,6 +1353,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
+        fn isFunctionDecl(decl: Declaration) bool {
+            return decl.type != null and decl.type.?.* == .function;
+        }
+
         fn isWriteTarget(_: *@This(), t: *const Type) bool {
             return switch (t.*) {
                 .pointer => |p| !p.is_const and !isOpaque(p.child_type),
@@ -1507,7 +1510,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                     for (c.fields) |field| try self.printField(field);
                     if (c.fields.len > 0 and c.decls.len > 0) try self.printTxt("\n");
-                    for (c.decls) |decl| try self.printDeclaration(decl);
+                    for (c.decls, 0..) |decl, i| {
+                        if (i > 0) {
+                            if (isFunctionDecl(decl) or isFunctionDecl(c.decls[i - 1])) {
+                                try self.printTxt("\n");
+                            }
+                        }
+                        try self.printDeclaration(decl);
+                    }
                     if (t != self.new_root and c.fields.len != 0) {
                         try self.printTxt("}}");
                     }
@@ -1631,6 +1641,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printTrainslatorSetup(self: *@This()) !void {
+            try self.printTxt("\n");
             try self.printFmt("const {s} = api_translator.Translator(.{{\n", .{options.translater});
             try self.printFmt(".c_import_ns = {s},\n", .{options.c_import});
             try self.printTxt(".substitutions = &.{{\n");
