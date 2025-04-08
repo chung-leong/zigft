@@ -17,9 +17,23 @@ pub const Status = enum(c_uint) {
     unknown,
     _,
 };
+pub const Mood = enum(c_uint) {
+    lousy,
+    lazy,
+    happy,
+    bad,
+    _,
+};
 pub const acceptInt: fn (
     arg_arg0: c_int,
 ) Error!void = c_to_zig.translate("alpha_accept_int", true, false, .{});
+pub const getInt: fn (
+) c_int = c_to_zig.translate("alpha_get_int", false, false, .{});
+pub const acceptEnum: fn (
+    arg_arg0: Mood,
+) Error!void = c_to_zig.translate("alpha_accept_enum", true, false, .{ .@"0" = Mood });
+pub const getEnum: fn (
+) Mood = c_to_zig.translate("alpha_get_enum", false, false, .{ .retval = Mood });
 pub const Struct = extern struct {
     big_number: c_int,
     small_number: c_int,
@@ -38,6 +52,7 @@ const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
         .{ .old = [*c]const c.alpha_struct, .new = *const Struct },
+        .{ .old = c.alpha_struct, .new = Struct },
     },
     .error_scheme = api_translator.BasicErrorScheme(Status, Error, .{
         .default_success_status = .ok,

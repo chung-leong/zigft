@@ -293,7 +293,10 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 false,
             );
             const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
-            const Payload = @typeInfo(NewRT).error_union.payload;
+            const Payload = switch (@typeInfo(NewRT)) {
+                .error_union => |eu| eu.payload,
+                else => NewRT,
+            };
             const ns = struct {
                 inline fn call(new_args: std.meta.ArgsTuple(NewFn)) NewRT {
                     var old_args: std.meta.ArgsTuple(OldFn) = undefined;
@@ -313,9 +316,9 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     const extra = output_count - pointer_count;
                     const last = if (output_count > 1) payload.len - 1 else 0;
                     // add pointers to result
-                    switch (output_count) {
+                    switch (pointer_count) {
                         1 => old_args[new_args.len] = @ptrCast(&payload),
-                        else => for (new_args.len..old_args.len) |i| {
+                        else => inline for (new_args.len..old_args.len) |i| {
                             const ArgT = @TypeOf(old_args[i]);
                             old_args[i] = convert(ArgT, &payload[i - new_args.len]);
                         },
@@ -1061,13 +1064,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateParameter(self: *@This(), param: Parameter, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
             const new_type = try self.translateType(param.type, false);
-            const is_unique_type = switch (new_type.*) {
-                .enumeration, .expression => false,
-                else => true,
-            };
-            if (new_type == param.type or is_unique_type) {
-                try self.new_to_old_param_map.put(new_type, param.type);
-            }
             return .{
                 .name = new_name,
                 .type = new_type,
@@ -1241,8 +1237,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     } else 0;
                     for (f.parameters, 0..) |param, index| {
                         if (index >= output_start) {
-                            const output_type = try self.translateType(param.type, false);
-                            try self.append(&output_types, output_type.pointer.child_type);
+                            const target_type = param.type.pointer.child_type;
+                            const output_type = try self.translateType(target_type, true);
+                            try self.append(&output_types, output_type);
+                            try self.addSubstitution(target_type, output_type);
                         }
                     }
                     // see if the translated function should return an error union
@@ -1254,6 +1252,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     for (f.parameters[0..arg_count], 0..) |param, index| {
                         const new_param = try self.translateParameter(param, inout_index == index);
                         try self.append(&new_params, new_param);
+                        try self.addSubstitution(param.type, new_param.type);
                     }
                     const payload_type = switch (output_types.len) {
                         0 => self.void_type,
@@ -1339,6 +1338,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .name = new_name,
                 .expr = .{ .unknown = number },
             };
+        }
+
+        fn addSubstitution(self: *@This(), old_type: *Type, new_type: *Type) !void {
+            const is_unique_type = switch (new_type.*) {
+                .enumeration, .expression => false,
+                else => true,
+            };
+            if (new_type == old_type or is_unique_type) {
+                try self.new_to_old_param_map.put(new_type, old_type);
+            }
         }
 
         fn isWriteTarget(_: *@This(), t: *const Type) bool {
@@ -2263,7 +2272,10 @@ test "CodeGenerator (alpha)" {
         .error_name_fn = ns.getErrorName,
     }) = try .init(gpa.allocator());
     defer generator.deinit();
-    try generator.analyze();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
     const path = try std.fs.path.resolve(generator.allocator, &.{
         generator.cwd,
         "test/alpha.zig",

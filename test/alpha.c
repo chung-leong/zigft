@@ -1,6 +1,9 @@
 #include <stdio.h>
 
-// single positive status (0), positive = error
+// testing basic features
+//
+// error scheme: 
+// single positive status (0), positive numbers are errors
 
 typedef enum {
     alpha_ok,
@@ -9,9 +12,32 @@ typedef enum {
     alpha_unknown,
 } alpha_status;
 
+typedef enum {
+    alpha_lousy,
+    alpha_lazy,
+    alpha_happy,
+    alpha_bad,
+} alpha_mood;
+
+int value = 0;
+
 alpha_status alpha_accept_int(int arg0) {
-    printf("arg0 = %d\n", arg0);
+    value = arg0;
     return alpha_ok;
+}
+
+int alpha_get_int(void) {
+    return value;
+}
+
+alpha_mood mood = 0;
+
+alpha_status alpha_accept_enum(alpha_mood arg0) {
+    mood = arg0;
+}
+
+alpha_mood alpha_get_enum(void) {
+    return mood;
 }
 
 typedef struct {
