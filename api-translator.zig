@@ -640,7 +640,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         arena: std.heap.ArenaAllocator,
         allocator: std.mem.Allocator,
-        cwd_path: []const u8,
+        cwd: []const u8,
         indent_level: usize,
         indented: bool,
         current_root: *Type,
@@ -666,7 +666,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var self = try arena.allocator().create(@This());
             self.arena = arena;
             self.allocator = self.arena.allocator();
-            self.cwd_path = try std.process.getCwdAlloc(self.allocator);
+            self.cwd = try std.process.getCwdAlloc(self.allocator);
             self.indent_level = 0;
             self.indented = false;
             self.old_root = try self.createType(.{ .container = .{ .kind = "struct" } });
@@ -751,6 +751,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn obtainExpression(self: *@This(), tree: Ast, node: Ast.Node.Index, is_rhs: bool) !Expression {
             var buffer1: [1]Ast.Node.Index = undefined;
             var buffer2: [2]Ast.Node.Index = undefined;
+            if (node == 0) return .{ .unknown = "" };
             return if (tree.fullFnProto(&buffer1, node)) |fn_proto| .{
                 .type = try self.obtainFunctionType(tree, fn_proto),
             } else if (tree.fullContainerDecl(&buffer2, node)) |decl| .{
@@ -1709,6 +1710,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.append(&argv, "zig");
             try self.append(&argv, "translate-c");
             try self.append(&argv, full_path);
+            try self.append(&argv, "-lc");
             for (options.include_paths) |include_path| {
                 const arg = try std.fmt.allocPrint(self.allocator, "-I{s}", .{include_path});
                 try self.append(&argv, arg);
@@ -1728,7 +1730,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn findSourceFile(self: *@This(), path: []const u8) ![]const u8 {
             for (options.include_paths) |include_path| {
                 const full_path = try std.fs.path.resolve(self.allocator, &.{
-                    self.cwd_path,
+                    self.cwd,
                     include_path,
                     path,
                 });
@@ -2220,35 +2222,41 @@ test "Translator.translate" {
     try func1(.{}, 123);
 }
 
-test "CodeGenerator" {
+test "CodeGenerator (alpha)" {
     const ns = struct {
+        const prefix = "alpha_";
+
         fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, "animal_");
+            return std.mem.startsWith(u8, name, prefix);
         }
 
         fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, 7, false);
+            return camelize(allocator, name, prefix.len, false);
         }
 
         fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, 7, true);
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, 0);
         }
 
         fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            const index = if (std.mem.lastIndexOfScalar(u8, name, '_')) |i| i + 1 else 0;
-            return snakify(allocator, name, index);
+            return snakify(allocator, name, prefix.len);
         }
 
         fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, 7, true);
+            return camelize(allocator, name, prefix.len, true);
         }
     };
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test/include"},
-        .header_paths = &.{"animal.h"},
-        .c_error_type = "animal_status",
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"alpha.c"},
+        .c_error_type = "alpha_status",
         .filter_fn = ns.filter,
+        .field_name_fn = ns.getFieldName,
         .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
         .enum_name_fn = ns.getEnumName,
@@ -2256,4 +2264,10 @@ test "CodeGenerator" {
     }) = try .init(gpa.allocator());
     defer generator.deinit();
     try generator.analyze();
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/alpha.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
 }
