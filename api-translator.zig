@@ -490,7 +490,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             return dst;
         }
 
-        fn SwitchType(comptime T: type, comptime dir: enum { old_to_new, new_to_old }) type {
+        fn SwapType(comptime T: type, comptime dir: enum { old_to_new, new_to_old }) type {
             return inline for (options.substitutions) |sub| {
                 if (dir == .old_to_new) {
                     if (T == sub.old) break sub.new;
@@ -517,7 +517,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             return if (getTypeWithAttributes(tuple, arg_index, arg_count)) |type_wa|
                 type_wa.type
             else
-                SwitchType(T, .old_to_new);
+                SwapType(T, .old_to_new);
         }
 
         fn WritableTarget(comptime T: type) ?type {
@@ -1889,6 +1889,105 @@ test "asComptimeInt" {
     try expectEqual(asComptimeInt("hello_world"), asComptimeInt("helloworld"));
 }
 
+test "Translator.SwapType" {
+    const OldStruct = extern struct {
+        number1: i32,
+        number2: i32,
+    };
+    const NewStruct = extern struct {
+        a: i32,
+        b: i32,
+    };
+    const c = struct {};
+    const c_to_zig = Translator(.{
+        .c_import_ns = c,
+        .substitutions = &.{
+            .{ .old = OldStruct, .new = NewStruct },
+            .{ .old = *OldStruct, .new = *NewStruct },
+            .{ .old = [*]OldStruct, .new = [*]NewStruct },
+        },
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, .{
+            .default_success_status = 0,
+            .default_failure_status = 1,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const SwapType = c_to_zig.SwapType;
+    const T1 = SwapType(OldStruct, .old_to_new);
+    try expectEqual(T1, NewStruct);
+    const T2 = SwapType(*OldStruct, .old_to_new);
+    try expectEqual(T2, *NewStruct);
+    const T3 = SwapType([*]OldStruct, .old_to_new);
+    try expectEqual(T3, [*]NewStruct);
+    const T4 = SwapType(NewStruct, .new_to_old);
+    try expectEqual(T4, OldStruct);
+}
+
+test "Translator.Substitute" {
+    const OldStruct = extern struct {
+        number1: i32,
+        number2: i32,
+    };
+    const NewStruct = extern struct {
+        a: i32,
+        b: i32,
+    };
+    const NewEnum = enum(c_uint) { a, b, c };
+    const c = struct {};
+    const c_to_zig = Translator(.{
+        .c_import_ns = c,
+        .substitutions = &.{
+            .{ .old = OldStruct, .new = NewStruct },
+            .{ .old = *OldStruct, .new = *NewStruct },
+            .{ .old = [*]OldStruct, .new = [*]NewStruct },
+        },
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, .{
+            .default_success_status = 0,
+            .default_failure_status = 1,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const Substitute = c_to_zig.Substitute;
+    const T1 = Substitute(OldStruct, .{}, 0, 1);
+    try expectEqual(T1, NewStruct);
+    const T2 = Substitute(*OldStruct, .{}, 0, 1);
+    try expectEqual(T2, *NewStruct);
+    const T3 = Substitute([*]OldStruct, .{}, 0, 1);
+    try expectEqual(T3, [*]NewStruct);
+    const T4 = Substitute(c_uint, .{ .@"3" = NewEnum }, 3, 5);
+    try expectEqual(T4, NewEnum);
+    const T5 = Substitute(c_uint, .{ .@"-2" = NewEnum }, 3, 5);
+    try expectEqual(T5, NewEnum);
+    const T6 = Substitute(c_uint, .{ .@"-2" = NewEnum }, 2, 5);
+    try expectEqual(T6, c_uint);
+}
+
+test "Translator.WritableTarget" {
+    const c = struct {};
+    const c_to_zig = Translator(.{
+        .c_import_ns = c,
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, .{
+            .default_success_status = 0,
+            .default_failure_status = 1,
+            .default_error = error.Unexpected,
+        }),
+    });
+    const WritableTarget = c_to_zig.WritableTarget;
+    const Null = @TypeOf(null);
+    const T1 = WritableTarget(*usize) orelse Null;
+    try expectEqual(T1, usize);
+    const T2 = WritableTarget(*const usize) orelse Null;
+    try expectEqual(T2, Null);
+    const T3 = WritableTarget(*void) orelse Null;
+    try expectEqual(T3, Null);
+    const T4 = WritableTarget(*anyopaque) orelse Null;
+    try expectEqual(T4, Null);
+    const T5 = WritableTarget(*opaque {}) orelse Null;
+    try expectEqual(T5, Null);
+    const T6 = WritableTarget(*type) orelse Null;
+    try expectEqual(T6, Null);
+}
+
 test "Translator.convert (basic)" {
     const c = struct {};
     const c_to_zig = Translator(.{
@@ -2071,7 +2170,7 @@ test "Translator.Translated" {
     try expectEqual(Fn9, fn (i32, *bool, *const NewStruct) anyerror!void);
 }
 
-test "translate" {
+test "Translator.translate" {
     const OldStruct = extern struct {
         number1: i32,
         number2: i32,
@@ -2120,78 +2219,6 @@ test "translate" {
     try expectEqual(@TypeOf(func1), fn (NewStruct, i32) ErrorSet!void);
     try func1(.{}, 123);
 }
-
-// test "Translator" {
-//     const c = @cImport(@cInclude("./test/include/animal.h"));
-//     const Self = struct {
-//         pub const Struct = struct {
-//             number1: i32,
-//             nunmer2: i32,
-//         };
-//         pub const Enum = enum(c_uint) { dog, cat, fox };
-//         pub const ErrorSet = error{ Sick, Dead, Crazy, Unknown };
-//         pub const Status = enum {
-//             ok,
-//             sick,
-//             dead,
-//             crazy,
-//             unknown,
-//         };
-//         pub const Cow = struct {
-//             number1: i32,
-//             number2: i32,
-//         };
-//         pub const Hen = struct {
-//             number1: i32,
-//         };
-//         pub const Pig = struct {
-//             number1: i32,
-//             number2: i32,
-//             number3: i32,
-//         };
-//     };
-// }
-
-// test "Substitute" {
-//     const OldStruct = options.substitutions[0].old;
-//     const NewStruct = options.substitutions[0].new;
-//     const OldEnum = options.substitutions[1].old;
-//     const NewEnum = options.substitutions[1].new;
-//     const T1 = Substitute(OldStruct, .{}, 0, 1);
-//     try expectEqual(T1, NewStruct);
-//     const T2 = Substitute(OldEnum, .{ .@"0" = NewEnum }, 0, 1);
-//     try expectEqual(T2, NewEnum);
-//     const T3 = Substitute(OldEnum, .{ .@"-1" = NewEnum }, 0, 1);
-//     try expectEqual(T3, NewEnum);
-//     const T4 = Substitute([]OldStruct, .{}, 0, 1);
-//     try expectEqual(T4, []NewStruct);
-//     const T5 = Substitute([]const OldStruct, .{}, 0, 1);
-//     try expectEqual(T5, []const NewStruct);
-//     const T6 = Substitute([4]OldStruct, .{}, 0, 1);
-//     try expectEqual(T6, [4]NewStruct);
-//     const T7 = Substitute(?OldStruct, .{}, 0, 1);
-//     try expectEqual(T7, ?NewStruct);
-//     const T8 = Substitute(anyerror!OldStruct, .{}, 0, 1);
-//     try expectEqual(T8, anyerror!NewStruct);
-//     const T9 = Substitute(OldEnum, .{ .retval = NewEnum }, null, 1);
-//     try expectEqual(T9, NewEnum);
-// }
-
-// test "WritableTarget" {
-//     const Null = @TypeOf(null);
-//     const T1 = WritableTarget(*usize) orelse Null;
-//     try expectEqual(T1, usize);
-//     const T2 = WritableTarget(*const usize) orelse Null;
-//     try expectEqual(T2, Null);
-//     const T3 = WritableTarget(*void) orelse Null;
-//     try expectEqual(T3, Null);
-//     const T4 = WritableTarget(*anyopaque) orelse Null;
-//     try expectEqual(T4, Null);
-//     const T5 = WritableTarget(*opaque {}) orelse Null;
-//     try expectEqual(T5, Null);
-//     const T6 = WritableTarget(*type) orelse Null;
-//     try expectEqual(T6, Null);
-// }
 
 test "CodeGenerator" {
     const ns = struct {
