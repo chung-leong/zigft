@@ -2423,3 +2423,62 @@ test "CodeGenerator (beta)" {
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());
 }
+
+test "CodeGenerator (beta, return status)" {
+    const ns = struct {
+        const prefix = "beta_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn isError(_: []const u8, value: i128) bool {
+            return value < 0;
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, 0);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, prefix.len);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"beta.c"},
+        .c_error_type = "beta_status",
+        .ignore_non_default_success_status = false,
+        .filter_fn = ns.filter,
+        .enum_is_error_fn = ns.isError,
+        .field_name_fn = ns.getFieldName,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/beta-with-status.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
