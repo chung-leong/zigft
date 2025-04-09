@@ -17,11 +17,10 @@ test "acceptEnum" {
 }
 
 test "acceptStruct" {
-    const input: alpha.Struct = .{
+    const result = alpha.acceptStruct(&.{
         .big_number = 12345,
         .small_number = 3,
-    };
-    const result = alpha.acceptStruct(&input);
+    });
     try expectEqual(alpha.Struct{ .big_number = 12346, .small_number = 4 }, result);
 }
 

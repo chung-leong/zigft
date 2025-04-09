@@ -149,6 +149,9 @@ pub const CodeGeneratorOptions = struct {
     // callback determining which declarations to include
     filter_fn: fn (name: []const u8) bool,
 
+    // callback determining to const pointer to struct should become by-value
+    type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
+
     // callback determining which enum items represent errors
     enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
     // callback determining if an enum type should be a bitflags packed struct
@@ -181,6 +184,10 @@ pub const CodeGeneratorOptions = struct {
 
     pub fn nonZeroValue(_: []const u8, value: i128) bool {
         return value != 0;
+    }
+
+    pub fn neverByValue(_: []const u8) bool {
+        return false;
     }
 
     pub fn neverPackedStruct(_: []const u8) bool {
@@ -427,7 +434,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
         inline fn convert(comptime T: type, arg: anytype) T {
             const AT = @TypeOf(arg);
-            const a = @typeInfo(AT);
             return switch (@typeInfo(T)) {
                 .int => switch (@typeInfo(AT)) {
                     .@"enum" => @intFromEnum(arg),
@@ -436,16 +442,19 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 },
                 .pointer => |pt| switch (@typeInfo(pt.child)) {
                     .@"fn" => translateCallback(pt.child, arg),
-                    inline .@"struct", .@"union" => switch (@typeInfo(a.pointer.child)) {
-                        inline .@"struct", .@"union" => |st| switch (st.layout) {
-                            .@"extern" => @ptrCast(arg),
-                            else => &copyContainer(pt.child, arg.*),
+                    else => switch (@typeInfo(AT)) {
+                        .pointer => |a_pt| switch (@typeInfo(a_pt.child)) {
+                            inline .@"struct", .@"union" => |st| switch (st.layout) {
+                                .@"extern" => @ptrCast(arg),
+                                else => &copyContainer(pt.child, arg.*),
+                            },
+                            else => @ptrCast(arg),
                         },
-                        else => @ptrCast(arg),
+                        // converting "pass-by-value" to "pass-by-pointer"
+                        else => convert(T, &arg),
                     },
-                    else => @ptrCast(arg),
                 },
-                inline .@"struct", .@"union" => switch (a) {
+                inline .@"struct", .@"union" => switch (@typeInfo(AT)) {
                     inline .@"struct", .@"union" => |st| switch (st.layout) {
                         .@"extern" => @bitCast(arg),
                         else => copyContainer(T, arg),
@@ -655,7 +664,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         old_root: *Type,
         old_namespace: Namespace,
         old_to_new_type_map: std.AutoHashMap(*Type, *Type),
-        new_to_old_param_map: std.AutoHashMap(*Type, *Type),
+        old_to_new_param_map: std.AutoHashMap(*Type, *Type),
+        new_param_is_global: std.AutoHashMap(*Type, bool),
         new_root: *Type,
         new_namespace: Namespace,
         new_error_set: *Type,
@@ -680,7 +690,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.old_root = try self.createType(.{ .container = .{ .kind = "struct" } });
             self.old_namespace = .init(self.allocator);
             self.old_to_new_type_map = .init(self.allocator);
-            self.new_to_old_param_map = .init(self.allocator);
+            self.old_to_new_param_map = .init(self.allocator);
+            self.new_param_is_global = .init(self.allocator);
             self.new_root = try self.createType(.{ .container = .{ .kind = "struct" } });
             self.new_namespace = .init(self.allocator);
             self.new_error_set = try self.createType(.{ .error_set = &.{} });
@@ -696,7 +707,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.new_namespace.addType("void", self.void_type);
             try self.new_namespace.addType("anyerror", self.full_error_set);
             // add entry in map so we know we local substitution isn't needed
-            try self.new_to_old_param_map.put(self.void_type, self.void_type);
+            try self.new_param_is_global.put(self.void_type, true);
             return self;
         }
 
@@ -1071,7 +1082,25 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateParameter(self: *@This(), param: Parameter, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
-            const new_type = try self.translateType(param.type, false);
+            const param_type = swap: {
+                switch (param.type.*) {
+                    .pointer => |p| if (p.is_const and !isOpaque(p.child_type)) {
+                        // const pointer to struct and union become by-value argument
+                        switch (p.child_type.*) {
+                            .container => {
+                                const type_name = try self.obtainTypeName(p.child_type);
+                                if (options.type_is_by_value_fn(type_name)) {
+                                    break :swap p.child_type;
+                                }
+                            },
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
+                break :swap param.type;
+            };
+            const new_type = try self.translateType(param_type, false);
             return .{
                 .name = new_name,
                 .type = new_type,
@@ -1271,13 +1300,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     break index + 1;
                 }
             } else 0;
-            for (f.parameters, 0..) |param, index| {
-                if (index >= output_start) {
-                    const target_type = param.type.pointer.child_type;
-                    const output_type = try self.translateType(target_type, true);
-                    try self.append(&output_types, output_type);
-                    try self.addSubstitution(target_type, output_type);
-                }
+            for (f.parameters[output_start..]) |param| {
+                const target_type = param.type.pointer.child_type;
+                const output_type = try self.translateType(target_type, true);
+                try self.append(&output_types, output_type);
+                try self.addSubstitution(target_type, output_type);
             }
             // see if the translated function should return an error union
             const return_error_union = is_pointer_target or self.shouldReturnErrorUnion(t);
@@ -1375,7 +1402,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 else => true,
             };
             if (new_type == old_type or is_unique_type) {
-                try self.new_to_old_param_map.put(new_type, old_type);
+                try self.new_param_is_global.put(new_type, true);
+                if (new_type != old_type) {
+                    try self.old_to_new_param_map.put(old_type, new_type);
+                }
             }
         }
 
@@ -1469,7 +1499,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (new_t.function.parameters, 0..) |param, index| {
                 // we need to do local substitution when the original type isn't unique enough
                 // for global replacement and when a non-const pointer is use for input
-                if (self.new_to_old_param_map.get(param.type) == null or param.is_inout) {
+                if (self.new_param_is_global.get(param.type) == null or param.is_inout) {
                     self.current_root = self.new_root;
                     const name = try self.obtainTypeName(param.type);
                     self.current_root = self.old_root;
@@ -1490,7 +1520,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
             if (!return_error_union) {
                 const return_type = new_t.function.return_type;
-                if (self.new_to_old_param_map.get(return_type) == null) {
+                if (self.new_param_is_global.get(return_type) == null) {
                     self.current_root = self.new_root;
                     const name = try self.obtainTypeName(return_type);
                     self.current_root = self.old_root;
@@ -1716,20 +1746,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printTypeSubstitutions(self: *@This()) !void {
-            var iterator = self.new_to_old_param_map.iterator();
-            var added: std.StringHashMap(bool) = .init(self.allocator);
             const Sub = struct { old_name: []const u8, new_name: []const u8 };
             var subs: []Sub = &.{};
+            var added: std.StringHashMap(bool) = .init(self.allocator);
+            var iterator = self.old_to_new_param_map.iterator();
             while (iterator.next()) |entry| {
-                const new_t = entry.key_ptr.*;
-                const old_t = entry.value_ptr.*;
-                if (old_t != new_t) {
-                    const old_name = try self.obtainTypeName(old_t);
-                    if (added.get(old_name) == null) {
-                        const new_name = try self.obtainTypeName(new_t);
-                        try self.append(&subs, .{ .old_name = old_name, .new_name = new_name });
-                        try added.put(old_name, true);
-                    }
+                const old_t = entry.key_ptr.*;
+                const new_t = entry.value_ptr.*;
+                const old_name = try self.obtainTypeName(old_t);
+                if (added.get(old_name) == null) {
+                    const new_name = try self.obtainTypeName(new_t);
+                    try self.append(&subs, .{ .old_name = old_name, .new_name = new_name });
+                    try added.put(old_name, true);
                 }
             }
             std.mem.sort(Sub, subs, {}, struct {
@@ -2384,6 +2412,64 @@ test "CodeGenerator (alpha)" {
     const path = try std.fs.path.resolve(generator.allocator, &.{
         generator.cwd,
         "test/alpha.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (alpha, by-value)" {
+    const ns = struct {
+        const prefix = "alpha_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn isByValue(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, "alpha_struct");
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, 0);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, prefix.len);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"alpha.c"},
+        .c_error_type = "alpha_status",
+        .filter_fn = ns.filter,
+        .type_is_by_value_fn = ns.isByValue,
+        .field_name_fn = ns.getFieldName,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/alpha-by-value.zig",
     });
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());

@@ -13,8 +13,7 @@ test "acceptString" {
 }
 
 test "acceptUnion" {
-    const input: beta.Union = .{ .integer = 12345 };
-    const result = try beta.acceptUnion(&input);
+    const result = try beta.acceptUnion(&.{ .integer = 12345 });
     try expectEqual(12346, result.integer);
 }
 
