@@ -12,8 +12,7 @@ pub const acceptInt: fn (
     arg0: c_int,
 ) Error!void = c_to_zig.translate("delta_accept_int", true, false, .{});
 
-pub const fail: fn (
-) Error!void = c_to_zig.translate("delta_fail", true, false, .{});
+pub const fail: fn () Error!void = c_to_zig.translate("delta_fail", true, false, .{});
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,

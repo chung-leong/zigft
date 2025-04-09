@@ -1645,13 +1645,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.printTypeRef(e.payload_type);
                 },
                 .function => |f| {
-                    try self.printTxt("fn (\n");
-                    for (f.parameters) |param| {
-                        if (param.name) |n| try self.printFmt("{s}: ", .{n});
-                        try self.printTypeRef(param.type);
-                        try self.printTxt(",\n");
+                    if (f.parameters.len > 0) {
+                        try self.printTxt("fn (\n");
+                        for (f.parameters) |param| {
+                            if (param.name) |n| try self.printFmt("{s}: ", .{n});
+                            try self.printTypeRef(param.type);
+                            try self.printTxt(",\n");
+                        }
+                        try self.printTxt(") ");
+                    } else {
+                        try self.printTxt("fn () ");
                     }
-                    try self.printTxt(") ");
                     if (f.alignment) |a| try self.printFmt("align({s}) ", .{a});
                     try self.printTypeRef(f.return_type);
                 },

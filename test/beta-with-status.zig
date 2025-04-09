@@ -41,8 +41,7 @@ pub const Point = extern struct {
     y: c_int,
 };
 
-pub const getMood: fn (
-) Error!Status = c_to_zig.translate("beta_get_mood", true, false, .{});
+pub const getMood: fn () Error!Status = c_to_zig.translate("beta_get_mood", true, false, .{});
 
 pub const rejectArg: fn (
     arg0: c_int,

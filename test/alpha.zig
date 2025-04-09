@@ -29,15 +29,13 @@ pub const acceptInt: fn (
     arg0: c_int,
 ) Error!void = c_to_zig.translate("alpha_accept_int", true, false, .{});
 
-pub const getInt: fn (
-) c_int = c_to_zig.translate("alpha_get_int", false, false, .{});
+pub const getInt: fn () c_int = c_to_zig.translate("alpha_get_int", false, false, .{});
 
 pub const acceptEnum: fn (
     arg0: Mood,
 ) Error!void = c_to_zig.translate("alpha_accept_enum", true, false, .{ .@"0" = Mood });
 
-pub const getEnum: fn (
-) Mood = c_to_zig.translate("alpha_get_enum", false, false, .{ .retval = Mood });
+pub const getEnum: fn () Mood = c_to_zig.translate("alpha_get_enum", false, false, .{ .retval = Mood });
 
 pub const Struct = extern struct {
     big_number: c_int,
@@ -48,11 +46,9 @@ pub const acceptStruct: fn (
     arg0: *const Struct,
 ) Error!Struct = c_to_zig.translate("alpha_accept_struct", true, false, .{});
 
-pub const fail: fn (
-) Error!std.meta.Tuple(&.{ c_int, c_int }) = c_to_zig.translate("alpha_fail", true, false, .{});
+pub const fail: fn () Error!std.meta.Tuple(&.{ c_int, c_int }) = c_to_zig.translate("alpha_fail", true, false, .{});
 
-pub const failUnknown: fn (
-) Error!std.meta.Tuple(&.{ c_int, c_int }) = c_to_zig.translate("alpha_fail_unknown", true, false, .{});
+pub const failUnknown: fn () Error!std.meta.Tuple(&.{ c_int, c_int }) = c_to_zig.translate("alpha_fail_unknown", true, false, .{});
 
 pub const positiveOnly: fn (
     arg0: c_int,
