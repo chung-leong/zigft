@@ -88,10 +88,6 @@ pub fn BasicErrorScheme(
             non_error_status_buffer[0] = true;
             non_error_status_count += 1;
         },
-        .void => {
-            non_error_status_buffer[0] = {};
-            non_error_status_count += 1;
-        },
         else => unreachable,
     }
     const non_error_statuses = init: {
@@ -131,12 +127,17 @@ pub fn BasicErrorScheme(
         }
     };
 }
+pub const NullErrorScheme = struct {
+    pub const Status = @TypeOf(undefined);
+    pub const ErrorSet = @TypeOf(undefined);
+    pub const PositiveStatus = void;
+};
 pub const CodeGeneratorOptions = struct {
     include_paths: []const []const u8,
     header_paths: []const []const u8,
     translater: []const u8 = "c_to_zig",
     error_set: []const u8 = "Error",
-    c_error_type: []const u8,
+    c_error_type: ?[]const u8 = null,
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
 
@@ -694,6 +695,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.need_inout_import = false;
             try self.new_namespace.addType("void", self.void_type);
             try self.new_namespace.addType("anyerror", self.full_error_set);
+            // add entry in map so we know we local substitution isn't needed
+            try self.new_to_old_param_map.put(self.void_type, self.void_type);
             return self;
         }
 
@@ -949,10 +952,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateDeclarations(self: *@This()) !void {
             // add error set
             try self.deriveErrorSet();
-            try self.append(&self.new_root.container.decls, .{
-                .name = options.error_set,
-                .expr = .{ .type = self.new_error_set },
-            });
+            if (getErrorType() != null) {
+                try self.append(&self.new_root.container.decls, .{
+                    .name = options.error_set,
+                    .expr = .{ .type = self.new_error_set },
+                });
+            }
             // add remaining
             for (self.old_root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
@@ -1408,9 +1413,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
+        fn getErrorType() ?[]const u8 {
+            const name = options.c_error_type orelse return null;
+            return if (std.mem.eql(u8, name, "int"))
+                "c_int"
+            else if (std.mem.eql(u8, name, "unsigned int"))
+                "c_uint"
+            else
+                name;
+        }
+
         fn isReturningStatus(self: *@This(), t: *Type) bool {
+            const err_type = getErrorType() orelse return false;
             const name = self.obtainTypeName(t.function.return_type) catch return false;
-            return std.mem.eql(u8, options.c_error_type, name);
+            return std.mem.eql(u8, err_type, name);
         }
 
         fn shouldReturnErrorUnion(self: *@This(), t: *Type) bool {
@@ -1421,7 +1437,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var names: [][]const u8 = &.{};
             var errors: [][]const u8 = &.{};
             var non_errors: [][]const u8 = &.{};
-            if (self.old_namespace.getType(options.c_error_type)) |t| {
+            const error_type = getErrorType() orelse return;
+            if (self.old_namespace.getType(error_type)) |t| {
                 if (t.* == .enumeration) {
                     for (t.enumeration.items) |item| {
                         if (options.enum_is_error_fn(item.name, item.value)) {
@@ -1695,7 +1712,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printTypeSubstitutions(self: *@This()) !void {
-            try self.printTxt(".substitutions = &.{{\n");
             var iterator = self.new_to_old_param_map.iterator();
             var added: std.StringHashMap(bool) = .init(self.allocator);
             const Sub = struct { old_name: []const u8, new_name: []const u8 };
@@ -1724,6 +1740,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     };
                 }
             }.compare);
+            if (subs.len == 0) return;
+            try self.printTxt(".substitutions = &.{{\n");
             for (subs) |sub| {
                 try self.printFmt(".{{ .old = {s}, .new = {s} }},\n", .{ sub.old_name, sub.new_name });
             }
@@ -1731,8 +1749,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printErrorScheme(self: *@This()) !void {
-            const old_enum_t = self.old_namespace.getType(options.c_error_type) orelse {
-                std.debug.print("Unable to find enum type '{s}'\n", .{options.c_error_type});
+            const error_type = getErrorType() orelse {
+                try self.printTxt(".error_scheme = api_translator.NullErrorScheme,\n");
+                return;
+            };
+            const old_enum_t = self.old_namespace.getType(error_type) orelse {
+                std.debug.print("Unable to find enum type '{s}'\n", .{error_type});
                 return error.Unexpected;
             };
             const new_enum_t = try self.translateType(old_enum_t, false);
@@ -1744,9 +1766,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             } else if (std.mem.eql(u8, enum_name, "bool")) .{
                 "true",
                 "false",
-            } else if (std.mem.eql(u8, enum_name, "void")) .{
-                "{}",
-                "{}",
             } else .{
                 "0",
                 "1",
@@ -1893,7 +1912,7 @@ pub fn camelize(allocator: std.mem.Allocator, name: []const u8, start_index: usi
     var j: usize = 0;
     while (i < name.len) : (i += 1) {
         if (name[i] == '_') {
-            need_upper = true;
+            if (j > 0) need_upper = true;
         } else {
             if (need_upper) {
                 buffer[j] = std.ascii.toUpper(name[i]);
@@ -2478,6 +2497,107 @@ test "CodeGenerator (beta, return status)" {
     const path = try std.fs.path.resolve(generator.allocator, &.{
         generator.cwd,
         "test/beta-with-status.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (gamma)" {
+    const ns = struct {
+        const prefix = "gamma_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"gamma.c"},
+        .c_error_type = "bool",
+        .ignore_non_default_success_status = false,
+        .filter_fn = ns.filter,
+        .fn_name_fn = ns.getFnName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/gamma.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (delta)" {
+    const ns = struct {
+        const prefix = "delta_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"delta.c"},
+        .c_error_type = "int",
+        .ignore_non_default_success_status = false,
+        .filter_fn = ns.filter,
+        .fn_name_fn = ns.getFnName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/delta.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (epsilon)" {
+    const ns = struct {
+        const prefix = "epsilon_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"epsilon.c"},
+        .ignore_non_default_success_status = false,
+        .filter_fn = ns.filter,
+        .fn_name_fn = ns.getFnName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/epsilon.zig",
     });
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());

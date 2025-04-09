@@ -1,6 +1,6 @@
 #include <stddef.h>
 
-// testing alternated error scheme
+// testing alternate error scheme
 //
 // error scheme: 
 // positive status with 0 as default, negative numbers are errors
