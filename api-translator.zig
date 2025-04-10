@@ -952,7 +952,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateParameter(self: *@This(), param: Parameter, is_inout: bool) !Parameter {
+        fn translateParameter(self: *@This(), param: Parameter, is_pointer_target: bool, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
             const param_type = swap: {
                 switch (param.type.*) {
@@ -961,7 +961,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         switch (p.child_type.*) {
                             .container => {
                                 const type_name = try self.obtainTypeName(p.child_type);
-                                if (options.type_is_by_value_fn(type_name)) {
+                                if (!is_pointer_target and options.type_is_by_value_fn(type_name)) {
                                     break :swap p.child_type;
                                 }
                             },
@@ -1168,11 +1168,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     break index + 1;
                 }
             } else 0;
-            for (f.parameters[output_start..]) |param| {
-                const target_type = param.type.pointer.child_type;
-                const output_type = try self.translateType(target_type, true);
-                try self.append(&output_types, output_type);
-                try self.addSubstitution(target_type, output_type);
+            if (!is_pointer_target) {
+                for (f.parameters[output_start..]) |param| {
+                    const target_type = param.type.pointer.child_type;
+                    const output_type = try self.translateType(target_type, true);
+                    try self.append(&output_types, output_type);
+                    try self.addSubstitution(target_type, output_type);
+                }
             }
             // see if the translated function should return an error union
             const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(t);
@@ -1190,7 +1192,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (extra == 1) try self.append(&output_types, status_type);
             const arg_count = f.parameters.len + extra - output_types.len;
             for (f.parameters[0..arg_count], 0..) |param, index| {
-                const new_param = try self.translateParameter(param, inout_index == index);
+                const new_param = try self.translateParameter(param, is_pointer_target, inout_index == index);
                 try self.append(&new_params, new_param);
                 try self.addSubstitution(param.type, new_param.type);
             }
@@ -2545,6 +2547,64 @@ test "CodeGenerator (zeta)" {
     const path = try std.fs.path.resolve(generator.allocator, &.{
         generator.cwd,
         "test/zeta.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (eta)" {
+    const ns = struct {
+        const prefix = "eta_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn isByValue(_: []const u8) bool {
+            return true;
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, 0);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, prefix.len);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"eta.c"},
+        .c_error_type = "eta_status",
+        .filter_fn = ns.filter,
+        .type_is_by_value_fn = ns.isByValue,
+        .field_name_fn = ns.getFieldName,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/eta.zig",
     });
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());
