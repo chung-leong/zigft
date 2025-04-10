@@ -932,26 +932,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
-            const t = get: {
-                if (width > 0) {
-                    const type_name = try std.fmt.allocPrint(self.allocator, "u{d}", .{width});
-                    break :get self.new_namespace.getType(type_name) orelse add: {
-                        const new_t = try self.createType(.{ .expression = .{ .identifier = type_name } });
-                        try self.new_namespace.addType(type_name, new_t);
-                        break :add new_t;
-                    };
-                } else {
-                    const expr = try std.fmt.allocPrint(self.allocator, "std.meta.Int(.unsigned, @bitSizeOf(c_uint) - {d})", .{-width});
-                    break :get try self.createType(.{ .expression = .{ .unknown = expr } });
-                }
-            };
-            return .{
-                .name = name,
-                .type = t,
-            };
-        }
-
         fn translateParameter(self: *@This(), param: Parameter, is_pointer_target: bool, is_inout: bool) !Parameter {
             const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
             const param_type = swap: {
@@ -1231,6 +1211,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .name = new_name,
                 .type = t,
                 .default_value = "false",
+            };
+        }
+
+        fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
+            const t = get: {
+                if (width > 0) {
+                    const type_name = try std.fmt.allocPrint(self.allocator, "u{d}", .{width});
+                    break :get self.new_namespace.getType(type_name) orelse add: {
+                        const new_t = try self.createType(.{ .expression = .{ .identifier = type_name } });
+                        try self.new_namespace.addType(type_name, new_t);
+                        break :add new_t;
+                    };
+                } else {
+                    const expr = try std.fmt.allocPrint(self.allocator, "std.meta.Int(.unsigned, @bitSizeOf(c_uint) - {d})", .{-width});
+                    break :get try self.createType(.{ .expression = .{ .unknown = expr } });
+                }
+            };
+            return .{
+                .name = name,
+                .type = t,
+                .default_value = "0",
             };
         }
 
@@ -2605,6 +2606,64 @@ test "CodeGenerator (eta)" {
     const path = try std.fs.path.resolve(generator.allocator, &.{
         generator.cwd,
         "test/eta.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (theta)" {
+    const ns = struct {
+        const prefix = "theta_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn isPackedStruct(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, "theta_flags");
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, 0);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, prefix.len);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"./test"},
+        .header_paths = &.{"theta.c"},
+        .c_error_type = "theta_status",
+        .filter_fn = ns.filter,
+        .enum_is_packed_struct_fn = ns.isPackedStruct,
+        .field_name_fn = ns.getFieldName,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    generator.analyze() catch |err| {
+        // skip the code generation when we're not in the right directory
+        return if (err == error.FileNotFound) {} else err;
+    };
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "test/theta.zig",
     });
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());
