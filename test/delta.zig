@@ -16,11 +16,7 @@ pub const fail: fn () Error!void = c_to_zig.translate("delta_fail", true, false,
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
-    .error_scheme = api_translator.BasicErrorScheme(c_int, Error, .{
-        .default_success_status = 0,
-        .default_failure_status = 1,
-        .default_error = Error.Unexpected,
-    }),
+    .error_scheme = api_translator.BasicErrorScheme(c_int, Error, Error.Unexpected),
 });
 
 test {
