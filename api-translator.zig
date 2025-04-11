@@ -189,7 +189,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     const i = old_fn.params.len - j - 1;
                     const Target = WritableTarget(old_fn.params[i].type.?) orelse break i + 1;
                     // see if the pointer is attributed as in/out
-                    if (getTypeWithAttributes(local_subs, null, 0)) |type_wa| {
+                    if (getTypeWithAttributes(local_subs, i, old_fn.params.len)) |type_wa| {
                         if (type_wa.is_inout) break i + 1;
                     }
                     types[i] = Substitute(Target, local_subs, i, old_fn.params.len);
