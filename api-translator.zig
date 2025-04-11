@@ -27,9 +27,9 @@ pub const CodeGeneratorOptions = struct {
     enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
 
     // callbacks setting pointer attributes
-    ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
-    ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
-    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = anyopaqueOnly,
+    ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
+    ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
+    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetAnyopaque,
 
     // callback distinguishing in/out pointers from output pointers
     param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
@@ -42,45 +42,6 @@ pub const CodeGeneratorOptions = struct {
     field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
     enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
     error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-
-    pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
-        return arg;
-    }
-
-    pub fn removeArgPrefix(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
-        return if (std.mem.startsWith(u8, arg, "arg_")) arg[4..] else arg;
-    }
-
-    pub fn nonZeroValue(_: []const u8, value: i128) bool {
-        return value != 0;
-    }
-
-    pub fn neverByValue(_: []const u8) bool {
-        return false;
-    }
-
-    pub fn neverPackedStruct(_: []const u8) bool {
-        return false;
-    }
-
-    pub fn anyopaqueOnly(_: []const u8, child_type: []const u8) bool {
-        return std.mem.eql(u8, "anyopaque", child_type);
-    }
-
-    pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-        return true;
-    }
-
-    pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-        return false;
-    }
-
-    pub fn ifCharType(_: []const u8, target_type: []const u8) bool {
-        const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
-        return for (char_types) |char_type| {
-            if (std.mem.eql(u8, target_type, char_type)) break true;
-        } else false;
-    }
 };
 
 pub const inout = TypeWithAttributes.inout;
@@ -486,6 +447,7 @@ pub const Expression = union(enum) {
     identifier: []const u8,
     unknown: []const u8,
 };
+pub const NamespaceType = enum { old, new };
 pub const Namespace = struct {
     to_type: std.StringHashMap(*Type),
     to_name: std.AutoHashMap(*Type, []const u8),
@@ -534,7 +496,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         cwd: []const u8,
         indent_level: usize,
         indented: bool,
-        current_root: *Type,
         old_root: *Type,
         old_namespace: Namespace,
         old_to_new_type_map: std.AutoHashMap(*Type, *Type),
@@ -574,7 +535,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.type_lookup = null;
             self.write_to_byte_array = false;
             self.byte_array = .init(self.allocator);
-            self.current_root = self.old_root;
             self.need_inout_import = false;
             try self.new_namespace.addType("void", self.void_type);
             // add entry in map so we know we local substitution isn't needed
@@ -594,9 +554,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         pub fn print(self: *@This(), writer: anytype) anyerror!void {
             self.output_writer = writer.any();
-            self.current_root = self.new_root;
             try self.printImports();
-            try self.printTypeDef(self.new_root);
+            try self.printTypeDef(self.new_root, .new);
             try self.printTrainslatorSetup();
             if (options.add_simple_test) try self.printSimpleTest();
         }
@@ -941,7 +900,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         // const pointer to struct and union become by-value argument
                         switch (p.child_type.*) {
                             .container => {
-                                const type_name = try self.obtainTypeName(p.child_type);
+                                const type_name = try self.obtainTypeName(p.child_type, .old);
                                 if (!is_pointer_target and options.type_is_by_value_fn(type_name)) {
                                     break :swap p.child_type;
                                 }
@@ -995,6 +954,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateContainer(self: *@This(), t: *Type) !*Type {
             const c = t.container;
+            if (std.mem.eql(u8, c.kind, "opaque")) return t;
             var new_fields: []Field = &.{};
             for (c.fields) |field| {
                 const new_field = try self.translateField(field);
@@ -1017,8 +977,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translatePointer(self: *@This(), t: *Type) !*Type {
             const p = t.pointer;
             const child_t = try self.translateType(p.child_type, true);
-            const ptr_name = try self.obtainTypeName(t);
-            const target_name = try self.obtainTypeName(p.child_type);
+            const ptr_name = try self.obtainTypeName(t, .old);
+            const target_name = try self.obtainTypeName(p.child_type, .old);
             const is_null_terminated = options.ptr_is_null_terminated_fn(ptr_name, target_name);
             const is_many = options.ptr_is_many_fn(ptr_name, target_name);
             const is_optional = options.ptr_is_optional_fn(ptr_name, target_name);
@@ -1038,7 +998,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateEnumeration(self: *@This(), t: *Type) !*Type {
             const e = t.enumeration;
-            const enum_name = try self.obtainTypeName(t);
+            const enum_name = try self.obtainTypeName(t, .old);
             if (options.enum_is_packed_struct_fn(enum_name)) {
                 var pow2_items: []EnumItem = &.{};
                 for (e.items) |item| {
@@ -1141,8 +1101,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             if (decl.expr.type == t) break decl.name;
                         }
                     }
-                } else try self.obtainTypeName(t);
-                const type_name = try self.obtainTypeName(param.type.pointer.child_type);
+                } else try self.obtainTypeName(t, .old);
+                const type_name = try self.obtainTypeName(param.type.pointer.child_type, .old);
                 if (options.param_is_input_fn(fn_name, param.name, index, type_name)) {
                     inout_index = index;
                     self.need_inout_import = true;
@@ -1330,7 +1290,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn isReturningStatus(self: *@This(), t: *Type) bool {
             const err_type = getErrorType() orelse return false;
-            const name = self.obtainTypeName(t.function.return_type) catch return false;
+            const name = self.obtainTypeName(t.function.return_type, .old) catch return false;
             return std.mem.eql(u8, err_type, name);
         }
 
@@ -1375,9 +1335,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 // we need to do local substitution when the original type isn't unique enough
                 // for global replacement and when a non-const pointer is use for input
                 if (self.new_param_is_global.get(param.type) == null or param.is_inout) {
-                    self.current_root = self.new_root;
-                    const name = try self.obtainTypeName(param.type);
-                    self.current_root = self.old_root;
+                    const name = try self.obtainTypeName(param.type, .new);
                     const pair = switch (param.is_inout) {
                         true => try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = inout({s})", .{ index, name }),
                         false => try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ index, name }),
@@ -1400,21 +1358,21 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 if (payload_type.* == .type_tuple) {
                     for (payload_type.type_tuple, 0..) |t, i| {
                         if (self.new_param_is_global.get(t) == null) {
-                            const name = try self.obtainNewTypeName(t);
+                            const name = try self.obtainTypeName(t, .new);
                             const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ offset + i, name });
                             try self.append(&non_unique_args, pair);
                         }
                     }
                 } else {
                     if (self.new_param_is_global.get(payload_type) == null) {
-                        const name = try self.obtainNewTypeName(payload_type);
+                        const name = try self.obtainTypeName(payload_type, .new);
                         const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ offset, name });
                         try self.append(&non_unique_args, pair);
                     }
                 }
             } else {
                 if (self.new_param_is_global.get(return_type) == null) {
-                    const name = try self.obtainNewTypeName(return_type);
+                    const name = try self.obtainTypeName(return_type, .new);
                     const pair = try std.fmt.allocPrint(self.allocator, ".retval = {s}", .{name});
                     try self.append(&non_unique_args, pair);
                 }
@@ -1433,21 +1391,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return .{ .unknown = code };
         }
 
-        fn obtainTypeName(self: *@This(), t: *Type) ![]const u8 {
+        fn obtainTypeName(self: *@This(), t: *Type, ns: NamespaceType) ![]const u8 {
             const indent_before = self.indent_level;
             defer self.indent_level = indent_before;
             self.indent_level = 0;
             self.write_to_byte_array = true;
             defer self.write_to_byte_array = false;
             self.byte_array.clearRetainingCapacity();
-            self.printTypeRef(t) catch {};
+            self.printTypeRef(t, ns) catch {};
             return try self.allocator.dupe(u8, self.byte_array.items);
-        }
-
-        fn obtainNewTypeName(self: *@This(), t: *Type) ![]const u8 {
-            self.current_root = self.new_root;
-            defer self.current_root = self.old_root;
-            return try self.obtainTypeName(t);
         }
 
         fn printImports(self: *@This()) anyerror!void {
@@ -1465,25 +1417,31 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt("}});\n\n");
         }
 
-        fn printTypeRef(self: *@This(), t: *Type) anyerror!void {
-            if (t == self.current_root) {
-                try self.printTxt("@This()");
-            } else if (t == self.old_root) {
-                try self.printTxt(options.c_import);
-            } else {
-                const namespace = if (self.current_root == self.new_root)
-                    self.new_namespace
-                else
-                    self.old_namespace;
-                if (namespace.getName(t)) |name| {
+        fn printTypeRef(self: *@This(), t: *Type, ns: NamespaceType) anyerror!void {
+            if (ns == .old) {
+                if (t == self.old_root) {
+                    try self.printTxt("@This()");
+                } else if (self.old_namespace.getName(t)) |name| {
+                    try self.printFmt("{s}", .{name});
+                } else {
+                    try self.printTypeDef(t, ns);
+                }
+            } else if (ns == .new) {
+                if (t == self.new_root) {
+                    try self.printTxt("@This()");
+                } else if (t == self.old_root) {
+                    try self.printTxt(options.c_import);
+                } else if (self.new_namespace.getName(t)) |name| {
                     try self.printFmt("{s}", .{name});
                 } else if (self.old_namespace.getName(t)) |name| {
                     try self.printFmt("{s}.{s}", .{ options.c_import, name });
-                } else try self.printTypeDef(t);
+                } else {
+                    try self.printTypeDef(t, ns);
+                }
             }
         }
 
-        fn printTypeDef(self: *@This(), t: *Type) anyerror!void {
+        fn printTypeDef(self: *@This(), t: *Type, ns: NamespaceType) anyerror!void {
             switch (t.*) {
                 .container => |c| {
                     if (t != self.new_root) {
@@ -1496,7 +1454,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             try self.printTxt(" {{\n");
                         }
                     }
-                    for (c.fields) |field| try self.printField(field);
+                    for (c.fields) |field| try self.printField(field, ns);
                     if (c.fields.len > 0 and c.decls.len > 0) try self.printTxt("\n");
                     for (c.decls, 0..) |decl, i| {
                         if (i > 0) {
@@ -1504,7 +1462,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                                 try self.printTxt("\n");
                             }
                         }
-                        try self.printDeclaration(decl);
+                        try self.printDeclaration(decl, ns);
                     }
                     if (t != self.new_root and c.fields.len != 0) {
                         try self.printTxt("}}");
@@ -1524,7 +1482,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     if (p.is_const) try self.printTxt("const ");
                     if (p.alignment) |a| try self.printFmt("align({s}) ", .{a});
                     if (p.is_volatile) try self.printTxt("volatile ");
-                    try self.printTypeRef(p.child_type);
+                    try self.printTypeRef(p.child_type, ns);
                 },
                 .enumeration => |e| {
                     try self.printFmt("enum({s}) {{\n", .{if (e.is_signed) "c_int" else "c_uint"});
@@ -1569,16 +1527,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.printTxt("}}");
                 },
                 .error_union => |e| {
-                    try self.printTypeRef(e.error_set);
+                    try self.printTypeRef(e.error_set, ns);
                     try self.printTxt("!");
-                    try self.printTypeRef(e.payload_type);
+                    try self.printTypeRef(e.payload_type, ns);
                 },
                 .function => |f| {
                     if (f.parameters.len > 0) {
                         try self.printTxt("fn (\n");
                         for (f.parameters) |param| {
                             if (param.name) |n| try self.printFmt("{s}: ", .{n});
-                            try self.printTypeRef(param.type);
+                            try self.printTypeRef(param.type, ns);
                             try self.printTxt(",\n");
                         }
                         try self.printTxt(") ");
@@ -1587,47 +1545,47 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                     if (f.alignment) |a| try self.printFmt("align({s}) ", .{a});
                     if (f.call_convention) |c| try self.printFmt("callconv({s}) ", .{c});
-                    try self.printTypeRef(f.return_type);
+                    try self.printTypeRef(f.return_type, ns);
                 },
                 .optional => |ot| {
                     try self.printTxt("?");
-                    try self.printTypeRef(ot);
+                    try self.printTypeRef(ot, ns);
                 },
                 .type_tuple => |types| {
                     try self.printTxt("std.meta.Tuple(&.{{ ");
                     for (types, 0..) |tt, i| {
-                        try self.printTypeRef(tt);
+                        try self.printTypeRef(tt, ns);
                         if (i != types.len - 1) try self.printTxt(", ");
                     }
                     try self.printTxt(" }})");
                 },
                 .expression => |e| {
                     switch (e) {
-                        .type => |et| try self.printTypeRef(et),
+                        .type => |et| try self.printTypeRef(et, ns),
                         .identifier, .unknown => |s| try self.printFmt("{s}", .{s}),
                     }
                 },
             }
         }
 
-        fn printField(self: *@This(), field: Field) anyerror!void {
+        fn printField(self: *@This(), field: Field, ns: NamespaceType) anyerror!void {
             try self.printFmt("{s}: ", .{field.name});
-            try self.printTypeRef(field.type);
+            try self.printTypeRef(field.type, ns);
             if (field.alignment) |a| try self.printFmt(" align({s})", .{a});
             if (field.default_value) |v| try self.printFmt(" = {s}", .{v});
             try self.printTxt(",\n");
         }
 
-        fn printDeclaration(self: *@This(), decl: Declaration) anyerror!void {
+        fn printDeclaration(self: *@This(), decl: Declaration, ns: NamespaceType) anyerror!void {
             const mut = if (decl.mutable) "var" else "const";
             try self.printFmt("pub {s} {s}", .{ mut, decl.name });
             if (decl.type) |t| {
                 try self.printTxt(": ");
-                try self.printTypeRef(t);
+                try self.printTypeRef(t, ns);
             }
             try self.printTxt(" = ");
             switch (decl.expr) {
-                .type => |t| try self.printTypeDef(t),
+                .type => |t| try self.printTypeDef(t, ns),
                 .identifier, .unknown => |s| try self.printFmt("{s}", .{s}),
             }
             try self.printTxt(";\n");
@@ -1650,9 +1608,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             while (iterator.next()) |entry| {
                 const old_t = entry.key_ptr.*;
                 const new_t = entry.value_ptr.*;
-                const old_name = try self.obtainTypeName(old_t);
+                const old_name = try self.obtainTypeName(old_t, .new);
                 if (added.get(old_name) == null) {
-                    const new_name = try self.obtainTypeName(new_t);
+                    const new_name = try self.obtainTypeName(new_t, .new);
                     if (!std.mem.eql(u8, old_name, new_name)) {
                         try self.append(&subs, .{ .old_name = old_name, .new_name = new_name });
                         try added.put(old_name, true);
@@ -1689,7 +1647,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 return error.Unexpected;
             };
             const new_enum_t = try self.translateType(old_enum_t, false);
-            const enum_name = try self.obtainTypeName(new_enum_t);
+            const enum_name = try self.obtainTypeName(new_enum_t, .new);
             try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, {s}.Unexpected),\n", .{
                 enum_name,
                 options.error_set,
@@ -1904,6 +1862,45 @@ test "snakify" {
     try expectEqualSlices(u8, "animal_green_dragon", name1);
     const name2 = try snakify(allocator, "AnimalGreenDragon", 6);
     try expectEqualSlices(u8, "green_dragon", name2);
+}
+
+pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+    return arg;
+}
+
+pub fn removeArgPrefix(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+    return if (std.mem.startsWith(u8, arg, "arg_")) arg[4..] else arg;
+}
+
+pub fn nonZeroValue(_: []const u8, value: i128) bool {
+    return value != 0;
+}
+
+pub fn neverByValue(_: []const u8) bool {
+    return false;
+}
+
+pub fn neverPackedStruct(_: []const u8) bool {
+    return false;
+}
+
+pub fn isTargetAnyopaque(_: []const u8, child_type: []const u8) bool {
+    return std.mem.eql(u8, "anyopaque", child_type);
+}
+
+pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+    return true;
+}
+
+pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+    return false;
+}
+
+pub fn isTargetChar(_: []const u8, target_type: []const u8) bool {
+    const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
+    return for (char_types) |char_type| {
+        if (std.mem.eql(u8, target_type, char_type)) break true;
+    } else false;
 }
 
 fn asComptimeInt(comptime s: []const u8) comptime_int {
