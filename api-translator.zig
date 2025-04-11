@@ -1,9 +1,86 @@
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
 
-const expect = std.testing.expect;
-const expectEqual = std.testing.expectEqual;
-const expectEqualSlices = std.testing.expectEqualSlices;
+pub const CodeGeneratorOptions = struct {
+    include_paths: []const []const u8,
+    header_paths: []const []const u8,
+    translater: []const u8 = "c_to_zig",
+    error_set: []const u8 = "Error",
+    c_error_type: ?[]const u8 = null,
+    c_import: []const u8 = "c",
+    c_root_struct: ?[]const u8 = null,
+
+    always_return_error_union: bool = false,
+    ignore_success_status: bool = true,
+    add_simple_test: bool = true,
+
+    // callback determining which declarations to include
+    filter_fn: fn (name: []const u8) bool,
+
+    // callback determining to const pointer to struct should become by-value
+    type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
+
+    // callback determining which enum items represent errors
+    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
+    // callback determining if an enum type should be a bitflags packed struct
+    enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
+
+    // callbacks setting pointer attributes
+    ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
+    ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
+    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = anyopaqueOnly,
+
+    // callback distinguishing in/out pointers from output pointers
+    param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
+
+    // callbacks adjusting naming convention
+    fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    type_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    const_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    param_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = removeArgPrefix,
+    field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+
+    pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+        return arg;
+    }
+
+    pub fn removeArgPrefix(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+        return if (std.mem.startsWith(u8, arg, "arg_")) arg[4..] else arg;
+    }
+
+    pub fn nonZeroValue(_: []const u8, value: i128) bool {
+        return value != 0;
+    }
+
+    pub fn neverByValue(_: []const u8) bool {
+        return false;
+    }
+
+    pub fn neverPackedStruct(_: []const u8) bool {
+        return false;
+    }
+
+    pub fn anyopaqueOnly(_: []const u8, child_type: []const u8) bool {
+        return std.mem.eql(u8, "anyopaque", child_type);
+    }
+
+    pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+        return true;
+    }
+
+    pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+        return false;
+    }
+
+    pub fn ifCharType(_: []const u8, target_type: []const u8) bool {
+        const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
+        return for (char_types) |char_type| {
+            if (std.mem.eql(u8, target_type, char_type)) break true;
+        } else false;
+    }
+};
 
 pub const inout = TypeWithAttributes.inout;
 
@@ -114,86 +191,6 @@ pub const NullErrorScheme = struct {
     pub const Status = @TypeOf(undefined);
     pub const ErrorSet = @TypeOf(undefined);
     pub const PositiveStatus = void;
-};
-pub const CodeGeneratorOptions = struct {
-    include_paths: []const []const u8,
-    header_paths: []const []const u8,
-    translater: []const u8 = "c_to_zig",
-    error_set: []const u8 = "Error",
-    c_error_type: ?[]const u8 = null,
-    c_import: []const u8 = "c",
-    c_root_struct: ?[]const u8 = null,
-
-    always_return_error_union: bool = false,
-    ignore_success_status: bool = true,
-    add_simple_test: bool = true,
-
-    // callback determining which declarations to include
-    filter_fn: fn (name: []const u8) bool,
-
-    // callback determining to const pointer to struct should become by-value
-    type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
-
-    // callback determining which enum items represent errors
-    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
-    // callback determining if an enum type should be a bitflags packed struct
-    enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
-
-    // callbacks setting pointer attributes
-    ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
-    ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = ifCharType,
-    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = neverOptional,
-
-    // callback distinguishing in/out pointers from output pointers
-    param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
-
-    // callbacks adjusting naming convention
-    fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    type_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    const_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    param_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = removeArgPrefix,
-    field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-
-    pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
-        return arg;
-    }
-
-    pub fn removeArgPrefix(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
-        return if (std.mem.startsWith(u8, arg, "arg_")) arg[4..] else arg;
-    }
-
-    pub fn nonZeroValue(_: []const u8, value: i128) bool {
-        return value != 0;
-    }
-
-    pub fn neverByValue(_: []const u8) bool {
-        return false;
-    }
-
-    pub fn neverPackedStruct(_: []const u8) bool {
-        return false;
-    }
-
-    pub fn neverOptional(_: []const u8, _: []const u8) bool {
-        return false;
-    }
-
-    pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-        return true;
-    }
-
-    pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-        return false;
-    }
-
-    pub fn ifCharType(_: []const u8, target_type: []const u8) bool {
-        const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
-        return for (char_types) |char_type| {
-            if (std.mem.eql(u8, target_type, char_type)) break true;
-        } else false;
-    }
 };
 
 pub fn Translator(comptime options: TranslatorOptions) type {
@@ -1169,7 +1166,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     },
                 },
             };
-            if (extra == 1) try self.append(&output_types, status_type);
+            if (extra == 1) {
+                try self.append(&output_types, status_type);
+                try self.addSubstitution(f.return_type, status_type);
+            }
             const arg_count = f.parameters.len + extra - output_types.len;
             for (f.parameters[0..arg_count], 0..) |param, index| {
                 const new_param = try self.translateParameter(param, is_pointer_target, inout_index == index);
@@ -1816,6 +1816,10 @@ pub fn camelize(allocator: std.mem.Allocator, name: []const u8, start_index: usi
     }
     return buffer;
 }
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualSlices = std.testing.expectEqualSlices;
 
 test "camelize" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
