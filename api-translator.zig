@@ -4,6 +4,7 @@ const fn_transform = @import("./fn-transform.zig");
 pub const CodeGeneratorOptions = struct {
     include_paths: []const []const u8,
     header_paths: []const []const u8,
+    zigft_path: []const u8 = "",
     translater: []const u8 = "c_to_zig",
     error_set: []const u8 = "Error",
     c_error_type: ?[]const u8 = null,
@@ -22,7 +23,7 @@ pub const CodeGeneratorOptions = struct {
 
     // callback determining which enum items represent errors
     enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
-    // callback determining if an enum type should be a bitflags packed struct
+    // callback determining if an enum type is a packed struct
     enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
 
     // callbacks setting pointer attributes
@@ -115,6 +116,7 @@ pub fn BasicErrorScheme(
     new_error_set: type,
     default_error: new_error_set,
 ) type {
+    @setEvalBranchQuota(2000000);
     const es_info = @typeInfo(new_error_set);
     if (es_info != .error_set) @compileError("Error set expected, found '" ++ @typeName(new_error_set) ++ "'");
     const en_info = @typeInfo(old_enum_type);
@@ -201,6 +203,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             comptime ignore_non_error_return_value: bool,
             comptime local_subs: anytype,
         ) type {
+            @setEvalBranchQuota(2000000);
             const old_fn = @typeInfo(OldFn).@"fn";
             const OldRT = old_fn.return_type.?;
             const extra = switch (ignore_non_error_return_value) {
@@ -273,6 +276,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             ignore_non_error_return_value,
             local_subs,
         ) {
+            @setEvalBranchQuota(2000000);
             const OldFn = @TypeOf(@field(options.c_import_ns, fn_name));
             const NewFn = Translated(
                 OldFn,
@@ -1389,12 +1393,28 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     false => false,
                 },
             };
-            if (!return_error_union) {
-                const return_type = new_t.function.return_type;
+            const return_type = new_t.function.return_type;
+            if (return_error_union) {
+                const payload_type = return_type.error_union.payload_type;
+                const offset = new_t.function.parameters.len;
+                if (payload_type.* == .type_tuple) {
+                    for (payload_type.type_tuple, 0..) |t, i| {
+                        if (self.new_param_is_global.get(t) == null) {
+                            const name = try self.obtainNewTypeName(t);
+                            const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ offset + i, name });
+                            try self.append(&non_unique_args, pair);
+                        }
+                    }
+                } else {
+                    if (self.new_param_is_global.get(payload_type) == null) {
+                        const name = try self.obtainNewTypeName(payload_type);
+                        const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ offset, name });
+                        try self.append(&non_unique_args, pair);
+                    }
+                }
+            } else {
                 if (self.new_param_is_global.get(return_type) == null) {
-                    self.current_root = self.new_root;
-                    const name = try self.obtainTypeName(return_type);
-                    self.current_root = self.old_root;
+                    const name = try self.obtainNewTypeName(return_type);
                     const pair = try std.fmt.allocPrint(self.allocator, ".retval = {s}", .{name});
                     try self.append(&non_unique_args, pair);
                 }
@@ -1424,9 +1444,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return try self.allocator.dupe(u8, self.byte_array.items);
         }
 
+        fn obtainNewTypeName(self: *@This(), t: *Type) ![]const u8 {
+            self.current_root = self.new_root;
+            defer self.current_root = self.old_root;
+            return try self.obtainTypeName(t);
+        }
+
         fn printImports(self: *@This()) anyerror!void {
             try self.printTxt("const std = @import(\"std\");\n");
-            try self.printTxt("const api_translator = @import(\"api-translator.zig\");\n");
+            try self.printFmt("const api_translator = @import(\"{s}api-translator.zig\");\n", .{
+                options.zigft_path,
+            });
             if (self.need_inout_import) {
                 try self.printTxt("const inout = api_translator.inout;\n");
             }
@@ -1625,8 +1653,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const old_name = try self.obtainTypeName(old_t);
                 if (added.get(old_name) == null) {
                     const new_name = try self.obtainTypeName(new_t);
-                    try self.append(&subs, .{ .old_name = old_name, .new_name = new_name });
-                    try added.put(old_name, true);
+                    if (!std.mem.eql(u8, old_name, new_name)) {
+                        try self.append(&subs, .{ .old_name = old_name, .new_name = new_name });
+                        try added.put(old_name, true);
+                    }
                 }
             }
             std.mem.sort(Sub, subs, {}, struct {
