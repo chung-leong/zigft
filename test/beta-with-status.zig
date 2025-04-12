@@ -21,11 +21,11 @@ pub const Status = enum(c_int) {
 
 pub const acceptString: fn (
     s: [*:0]const u8,
-) Error!Status = c_to_zig.translate("beta_accept_string", true, false, .{});
+) Error!Status = c_to_zig.translate("beta_accept_string", true, false, .{ .@"1" = Status });
 
 pub const getChar: fn (
     index: usize,
-) Error!std.meta.Tuple(&.{ u8, Status }) = c_to_zig.translate("beta_get_char", true, false, .{});
+) Error!std.meta.Tuple(&.{ u8, Status }) = c_to_zig.translate("beta_get_char", true, false, .{ .@"2" = Status });
 
 pub const Union = extern union {
     integer: c_int,
@@ -34,18 +34,18 @@ pub const Union = extern union {
 
 pub const acceptUnion: fn (
     arg0: *const Union,
-) Error!std.meta.Tuple(&.{ Union, Status }) = c_to_zig.translate("beta_accept_union", true, false, .{});
+) Error!std.meta.Tuple(&.{ Union, Status }) = c_to_zig.translate("beta_accept_union", true, false, .{ .@"2" = Status });
 
 pub const Point = extern struct {
     x: c_int,
     y: c_int,
 };
 
-pub const getMood: fn () Error!Status = c_to_zig.translate("beta_get_mood", true, false, .{});
+pub const getMood: fn () Error!Status = c_to_zig.translate("beta_get_mood", true, false, .{ .@"0" = Status });
 
 pub const rejectArg: fn (
     arg0: c_int,
-) Error!Status = c_to_zig.translate("beta_reject_arg", true, false, .{});
+) Error!Status = c_to_zig.translate("beta_reject_arg", true, false, .{ .@"1" = Status });
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,

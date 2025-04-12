@@ -26,13 +26,15 @@ pub const CodeGeneratorOptions = struct {
     // callback determining if an enum type is a packed struct
     enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
 
-    // callbacks setting pointer attributes
+    // callbacks determining particular pointer attributes
     ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
     ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
     ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetAnyopaque,
 
     // callback distinguishing in/out pointers from output pointers
     param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
+    // callback returning the index of the corresponding pointer argument if it should be treated as the length of a slice pointer
+    param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = alwaysNull,
 
     // callbacks adjusting naming convention
     fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
@@ -155,11 +157,15 @@ pub const NullErrorScheme = struct {
     pub const ErrorSet = @TypeOf(undefined);
     pub const PositiveStatus = void;
 };
+const SplitSlice = struct {
+    len_index: usize,
+    ptr_index: usize,
+};
 
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
         pub fn Translated(
-            comptime OldFn: anytype,
+            comptime OldFn: type,
             comptime return_error_union: bool,
             comptime ignore_non_error_return_value: bool,
             comptime local_subs: anytype,
@@ -230,7 +236,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             comptime fn_name: []const u8,
             comptime return_error_union: bool,
             comptime ignore_non_error_return_value: bool,
-            local_subs: anytype,
+            comptime local_subs: anytype,
         ) Translated(
             @TypeOf(@field(options.c_import_ns, fn_name)),
             return_error_union,
@@ -315,6 +321,128 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             return fn_transform.spreadArgs(ns.call, .auto);
         }
 
+        pub fn SliceType(comptime T: type) type {
+            return switch (@typeInfo(T)) {
+                .pointer => |pt| define: {
+                    var new_pt = pt;
+                    new_pt.size = .slice;
+                    new_pt.sentinel_ptr = null;
+                    if (@typeInfo(new_pt.child) == .@"opaque") new_pt.child = u8;
+                    break :define @Type(.{ .pointer = new_pt });
+                },
+                .optional => |op| ?SliceType(op.child),
+                else => @compileError("Argument is not a pointer"),
+            };
+        }
+
+        pub fn SliceMerged(
+            comptime OldFn: type,
+            comptime pairs: []const SplitSlice,
+        ) type {
+            @setEvalBranchQuota(2000000);
+            const old_fn = switch (@typeInfo(OldFn)) {
+                .@"fn" => |f| f,
+                else => @compileError("Function type expected, received '" ++ @typeName(OldFn) ++ "'"),
+            };
+            const param_count = old_fn.params.len - pairs.len;
+            var new_params: [param_count]std.builtin.Type.Fn.Param = undefined;
+            var j: usize = 0;
+            inline for (old_fn.params, 0..) |param, i| {
+                const PT = param.type orelse @compileError("Cannot merge generic argument");
+                const is_index = inline for (pairs) |pair| {
+                    if (pair.len_index == i) break true;
+                } else false;
+                if (!is_index) {
+                    new_params[j] = param;
+                    const is_ptr = inline for (pairs) |pair| {
+                        if (pair.ptr_index == i) break true;
+                    } else false;
+                    if (is_ptr) new_params[j].type = SliceType(PT);
+                    j += 1;
+                } else {
+                    switch (@typeInfo(PT)) {
+                        .int => {},
+                        else => @compileError("Argument is not an integer"),
+                    }
+                }
+            }
+            var new_fn = old_fn;
+            new_fn.params = &new_params;
+            return @Type(.{ .@"fn" = new_fn });
+        }
+
+        pub fn mergeSlice(
+            comptime func: anytype,
+            comptime pairs: []const SplitSlice,
+        ) SliceMerged(@TypeOf(func), pairs) {
+            @setEvalBranchQuota(2000000);
+            const OldFn = @TypeOf(func);
+            const NewFn = SliceMerged(OldFn, pairs);
+            const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
+            const cc = @typeInfo(NewFn).@"fn".calling_convention;
+            const ns = struct {
+                fn call(new_args: std.meta.ArgsTuple(NewFn)) NewRT {
+                    var old_args: std.meta.ArgsTuple(OldFn) = undefined;
+                    // copy arguments
+                    comptime var j: usize = 0;
+                    inline for (0..old_args.len) |i| {
+                        const is_index = inline for (pairs) |pair| {
+                            if (pair.len_index == i) break true;
+                        } else false;
+                        if (!is_index) {
+                            // see if it's a slice pointer
+                            const len_index: ?usize = inline for (pairs) |pair| {
+                                if (pair.ptr_index == i) break pair.len_index;
+                            } else null;
+                            if (len_index) |k| {
+                                // copy len and pointer
+                                const new_arg = new_args[j];
+                                const AT = @TypeOf(new_arg);
+                                switch (@typeInfo(AT)) {
+                                    .pointer => {
+                                        old_args[i] = @ptrCast(new_arg.ptr);
+                                        old_args[k] = @intCast(new_arg.len);
+                                    },
+                                    .optional => {
+                                        if (new_arg) |s| {
+                                            old_args[i] = @ptrCast(s.ptr);
+                                            old_args[k] = @intCast(s.len);
+                                        } else {
+                                            old_args[i] = null;
+                                            old_args[k] = 0;
+                                        }
+                                    },
+                                    else => unreachable,
+                                }
+                            } else {
+                                old_args[i] = new_args[j];
+                            }
+                            j += 1;
+                        }
+                    }
+                    // call original function
+                    return @call(.always_inline, func, old_args);
+                }
+            };
+            return fn_transform.spreadArgs(ns.call, cc);
+        }
+
+        pub fn translateMerge(
+            comptime fn_name: []const u8,
+            comptime return_error_union: bool,
+            comptime ignore_non_error_return_value: bool,
+            comptime local_subs: anytype,
+            comptime pairs: []const SplitSlice,
+        ) SliceMerged(Translated(
+            @TypeOf(@field(options.c_import_ns, fn_name)),
+            return_error_union,
+            ignore_non_error_return_value,
+            local_subs,
+        ), pairs) {
+            const f = translate(fn_name, return_error_union, ignore_non_error_return_value, local_subs);
+            return mergeSlice(f, pairs);
+        }
+
         inline fn convert(comptime T: type, arg: anytype) T {
             const AT = @TypeOf(arg);
             return switch (@typeInfo(T)) {
@@ -333,7 +461,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     else => @bitCast(arg),
                 },
                 .optional => |op| switch (@typeInfo(AT)) {
-                    .optional => if (arg) convert(op.child, arg) else null,
+                    .optional => if (arg) |a| convert(op.child, a) else null,
                     else => convert(op.child, arg),
                 },
                 .@"enum" => @enumFromInt(arg),
@@ -812,10 +940,22 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .unknown => try options.const_name_fn(self.allocator, decl.name),
                     };
                     const new_decl_t = if (decl.type) |t| try self.translateType(t, false) else null;
-                    const expr = if (isFunctionDecl(decl))
-                        try self.obtainTranslateCall(decl, new_decl_t.?)
-                    else
-                        try self.translateExpression(decl.expr);
+                    const expr = if (isFunctionDecl(decl)) get: {
+                        const split_slices = try self.findSplitSlices(decl.type.?, new_decl_t.?);
+                        // get translate() or translateMerge() call
+                        const expr = try self.obtainTranslateCall(decl, new_decl_t.?, split_slices);
+                        if (split_slices) |pairs| {
+                            // change the declaration, removing slice len and changing pointer type
+                            const new_func = &new_decl_t.?.function;
+                            for (0..pairs.len) |i| {
+                                const pair = pairs[pairs.len - i - 1];
+                                const ptr_param = &new_func.parameters[pair.ptr_index];
+                                ptr_param.type = try self.translateSlicePointer(ptr_param.type);
+                                self.remove(&new_func.parameters, pair.len_index);
+                            }
+                        }
+                        break :get expr;
+                    } else try self.translateExpression(decl.expr);
                     if (expr == .type) {
                         // don't add declarations for opaques
                         if (expr.type.* == .container and std.mem.eql(u8, expr.type.container.kind, "opaque")) {
@@ -1088,20 +1228,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const param = f.parameters[index];
                 if (is_pointer_target) break index + 1;
                 if (!self.isWriteTarget(param.type)) break index + 1;
-                // maybe it's a in/out pointer--need to ask the callback function;
-                // first, we need a name
-                const fn_name = for (self.old_root.container.decls) |decl| {
-                    // function prototype
-                    if (decl.type == t) break decl.name;
-                    if (decl.expr == .type) {
-                        // function definition
-                        if (decl.expr.type == t) break decl.name;
-                        if (decl.expr.type.* == .pointer) {
-                            // function pointer
-                            if (decl.expr.type == t) break decl.name;
-                        }
-                    }
-                } else try self.obtainTypeName(t, .old);
+                // maybe it's a in/out pointer--need to ask the callback function
+                const fn_name = try self.obtainFunctionName(t);
                 const type_name = try self.obtainTypeName(param.type.pointer.child_type, .old);
                 if (options.param_is_input_fn(fn_name, param.name, index, type_name)) {
                     inout_index = index;
@@ -1164,6 +1292,28 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
+        fn findSplitSlices(self: *@This(), t: *Type, new_t: *Type) !?[]SplitSlice {
+            const has_pointers = for (new_t.function.parameters) |p| {
+                if (p.type.* == .pointer) break true;
+            } else false;
+            if (!has_pointers) return null;
+            const fn_name = try self.obtainFunctionName(t);
+            var pairs: []SplitSlice = &.{};
+            for (0..new_t.function.parameters.len) |i| {
+                const is_ptr = for (pairs) |pair| {
+                    if (pair.ptr_index == i) break true;
+                } else false;
+                if (!is_ptr) {
+                    const param = t.function.parameters[i];
+                    const type_name = try self.obtainTypeName(param.type, .old);
+                    if (options.param_is_slice_len_fn(fn_name, param.name, i, type_name)) |ptr_index| {
+                        try self.append(&pairs, .{ .ptr_index = ptr_index, .len_index = i });
+                    }
+                }
+            }
+            return if (pairs.len > 0) pairs else null;
+        }
+
         fn translateBitField(self: *@This(), item: EnumItem) !Field {
             const new_name = try options.enum_name_fn(self.allocator, item.name);
             const t = self.new_namespace.getType("bool") orelse add: {
@@ -1176,6 +1326,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .type = t,
                 .default_value = "false",
             };
+        }
+
+        fn translateSlicePointer(self: *@This(), t: *Type) !*Type {
+            var new_t = t.*;
+            new_t.pointer.size = .slice;
+            new_t.pointer.sentinel = null;
+            if (isOpaque(new_t.pointer.child_type)) {
+                new_t.pointer.child_type = try self.createType(.{
+                    .expression = .{ .identifier = "u8" },
+                });
+            }
+            return try self.createType(new_t);
         }
 
         fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
@@ -1328,7 +1490,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.non_error_enums = non_errors;
         }
 
-        fn obtainTranslateCall(self: *@This(), decl: Declaration, new_t: *const Type) !Expression {
+        fn obtainTranslateCall(
+            self: *@This(),
+            decl: Declaration,
+            new_t: *const Type,
+            split_slices: ?[]SplitSlice,
+        ) !Expression {
             const return_error_union = self.shouldReturnErrorUnion(decl.type.?);
             var non_unique_args: [][]const u8 = &.{};
             for (new_t.function.parameters, 0..) |param, index| {
@@ -1381,7 +1548,26 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const local_subs_pairs = try std.mem.join(self.allocator, ", ", non_unique_args);
                 break :get try std.fmt.allocPrint(self.allocator, " {s} ", .{local_subs_pairs});
             } else "";
-            const code = try std.fmt.allocPrint(self.allocator, "{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
+            const code = if (split_slices) |pairs| format: {
+                // print code for translateMerge() to merge slice pointers
+                var pair_lines: [][]const u8 = &.{};
+                for (pairs) |pair| {
+                    const pair_line = try std.fmt.allocPrint(self.allocator, "    .{{ .ptr_index = {d}, .len_index = {d} }},", .{
+                        pair.ptr_index,
+                        pair.len_index,
+                    });
+                    try self.append(&pair_lines, pair_line);
+                }
+                const pair_list = try std.mem.join(self.allocator, "\n", pair_lines);
+                break :format try std.fmt.allocPrint(self.allocator, "{s}.translateMerge(\"{s}\", {}, {}, .{{{s}}}, &.{{\n{s}\n}})", .{
+                    options.translater,
+                    decl.name,
+                    return_error_union,
+                    ignore_non_error_return_value,
+                    local_subs,
+                    pair_list,
+                });
+            } else try std.fmt.allocPrint(self.allocator, "{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
                 options.translater,
                 decl.name,
                 return_error_union,
@@ -1400,6 +1586,21 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.byte_array.clearRetainingCapacity();
             self.printTypeRef(t, ns) catch {};
             return try self.allocator.dupe(u8, self.byte_array.items);
+        }
+
+        fn obtainFunctionName(self: *@This(), t: *Type) ![]const u8 {
+            return for (self.old_root.container.decls) |decl| {
+                // function prototype
+                if (decl.type == t) break decl.name;
+                if (decl.expr == .type) {
+                    // function definition
+                    if (decl.expr.type == t) break decl.name;
+                    if (decl.expr.type.* == .pointer) {
+                        // function pointer
+                        if (decl.expr.type == t) break decl.name;
+                    }
+                }
+            } else try self.obtainTypeName(t, .old);
         }
 
         fn printImports(self: *@This()) anyerror!void {
@@ -1896,6 +2097,10 @@ pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool
     return false;
 }
 
+pub fn alwaysNull(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?usize {
+    return null;
+}
+
 pub fn isTargetChar(_: []const u8, target_type: []const u8) bool {
     const char_types: []const []const u8 = &.{ "u8", "wchar_t", "char16_t" };
     return for (char_types) |char_type| {
@@ -2202,500 +2407,62 @@ test "Translator.translate" {
     try func1(.{}, 123);
 }
 
-test "CodeGenerator (alpha)" {
-    const ns = struct {
-        const prefix = "alpha_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"alpha.c"},
-        .c_error_type = "alpha_status",
-        .filter_fn = ns.filter,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/alpha.zig",
+test "Translator.SliceMerged" {
+    const c = struct {};
+    const c_to_zig = Translator(.{
+        .c_import_ns = c,
+        .error_scheme = NullErrorScheme,
     });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
+    const SliceMerged = c_to_zig.SliceMerged;
+    const Fn1 = SliceMerged(fn (usize, *const u8) usize, &.{
+        .{ .len_index = 0, .ptr_index = 1 },
+    });
+    try expectEqual(fn ([]const u8) usize, Fn1);
+    const Fn2 = SliceMerged(fn (*anyopaque, *const u8, usize, *const u8, usize) void, &.{
+        .{ .len_index = 2, .ptr_index = 1 },
+        .{ .len_index = 4, .ptr_index = 3 },
+    });
+    try expectEqual(fn (*anyopaque, []const u8, []const u8) void, Fn2);
 }
 
-test "CodeGenerator (alpha, by-value)" {
-    const ns = struct {
-        const prefix = "alpha_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn isByValue(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, "alpha_struct");
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"alpha.c"},
-        .c_error_type = "alpha_status",
-        .filter_fn = ns.filter,
-        .type_is_by_value_fn = ns.isByValue,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/alpha-by-value.zig",
+test "Translator.mergeSlice" {
+    const c = struct {};
+    const c_to_zig = Translator(.{
+        .c_import_ns = c,
+        .error_scheme = NullErrorScheme,
     });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (beta)" {
+    const mergeSlice = c_to_zig.mergeSlice;
     const ns = struct {
-        const prefix = "beta_";
+        var ptr_received: ?[*]const u8 = null;
+        var len_received: ?u32 = null;
 
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
+        fn call1(len: u32, ptr: [*]const u8) void {
+            len_received = len;
+            ptr_received = ptr;
         }
 
-        fn isError(_: []const u8, value: i128) bool {
-            return value < 0;
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
+        fn call2(len: u32, ptr_maybe: ?*const anyopaque) void {
+            if (ptr_maybe) |ptr| {
+                len_received = len;
+                ptr_received = @ptrCast(ptr);
+            } else {
+                len_received = 0;
+                ptr_received = null;
+            }
         }
     };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"beta.c"},
-        .c_error_type = "beta_status",
-        .filter_fn = ns.filter,
-        .enum_is_error_fn = ns.isError,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/beta.zig",
+    const f1 = mergeSlice(ns.call1, &.{
+        .{ .len_index = 0, .ptr_index = 1 },
     });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (beta, return status)" {
-    const ns = struct {
-        const prefix = "beta_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn isError(_: []const u8, value: i128) bool {
-            return value < 0;
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"beta.c"},
-        .c_error_type = "beta_status",
-        .ignore_success_status = false,
-        .filter_fn = ns.filter,
-        .enum_is_error_fn = ns.isError,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/beta-with-status.zig",
+    f1("Hello world");
+    try expectEqual(11, ns.len_received);
+    try expectEqualSlices(u8, "Hello world", ns.ptr_received.?[0..11]);
+    const f2 = mergeSlice(ns.call2, &.{
+        .{ .len_index = 0, .ptr_index = 1 },
     });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (gamma)" {
-    const ns = struct {
-        const prefix = "gamma_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"gamma.c"},
-        .c_error_type = "bool",
-        .ignore_success_status = false,
-        .filter_fn = ns.filter,
-        .fn_name_fn = ns.getFnName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/gamma.zig",
-    });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (delta)" {
-    const ns = struct {
-        const prefix = "delta_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"delta.c"},
-        .c_error_type = "int",
-        .ignore_success_status = false,
-        .filter_fn = ns.filter,
-        .fn_name_fn = ns.getFnName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/delta.zig",
-    });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (epsilon)" {
-    const ns = struct {
-        const prefix = "epsilon_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"epsilon.c"},
-        .ignore_success_status = false,
-        .filter_fn = ns.filter,
-        .fn_name_fn = ns.getFnName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/epsilon.zig",
-    });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (zeta)" {
-    const ns = struct {
-        const prefix = "zeta_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"zeta.c"},
-        .c_error_type = "zeta_status",
-        .filter_fn = ns.filter,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/zeta.zig",
-    });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (eta)" {
-    const ns = struct {
-        const prefix = "eta_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn isByValue(_: []const u8) bool {
-            return true;
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"eta.c"},
-        .c_error_type = "eta_status",
-        .filter_fn = ns.filter,
-        .type_is_by_value_fn = ns.isByValue,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/eta.zig",
-    });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
-}
-
-test "CodeGenerator (theta)" {
-    const ns = struct {
-        const prefix = "theta_";
-
-        fn filter(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, prefix);
-        }
-
-        fn isPackedStruct(name: []const u8) bool {
-            return std.mem.startsWith(u8, name, "theta_flags");
-        }
-
-        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, false);
-        }
-
-        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-
-        fn getFieldName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, 0);
-        }
-
-        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return snakify(allocator, name, prefix.len);
-        }
-
-        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-            return camelize(allocator, name, prefix.len, true);
-        }
-    };
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    var generator: *CodeGenerator(.{
-        .include_paths = &.{"./test"},
-        .header_paths = &.{"theta.c"},
-        .c_error_type = "theta_status",
-        .filter_fn = ns.filter,
-        .enum_is_packed_struct_fn = ns.isPackedStruct,
-        .field_name_fn = ns.getFieldName,
-        .type_name_fn = ns.getTypeName,
-        .fn_name_fn = ns.getFnName,
-        .enum_name_fn = ns.getEnumName,
-        .error_name_fn = ns.getErrorName,
-    }) = try .init(gpa.allocator());
-    defer generator.deinit();
-    generator.analyze() catch |err| {
-        // skip the code generation when we're not in the right directory
-        return if (err == error.FileNotFound) {} else err;
-    };
-    const path = try std.fs.path.resolve(generator.allocator, &.{
-        generator.cwd,
-        "test/theta.zig",
-    });
-    const file = try std.fs.createFileAbsolute(path, .{});
-    try generator.print(file.writer());
+    f2(null);
+    try expectEqual(0, ns.len_received);
+    f2("Hello world");
+    try expectEqual(11, ns.len_received);
+    try expectEqualSlices(u8, "Hello world", ns.ptr_received.?[0..11]);
 }
