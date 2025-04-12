@@ -618,6 +618,15 @@ pub const Namespace = struct {
 pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
     return struct {
         const Ast = std.zig.Ast;
+        const NameContext = enum {
+            @"fn",
+            type,
+            @"const",
+            param,
+            field,
+            @"enum",
+            @"error",
+        };
 
         arena: std.heap.ArenaAllocator,
         allocator: std.mem.Allocator,
@@ -920,6 +929,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return tree.source[span.start..span.end];
         }
 
+        fn transformName(self: *@This(), name: []const u8, context: NameContext) ![]const u8 {
+            switch (context) {
+                inline else => |tag| {
+                    const f = @field(options, @tagName(tag) ++ "_name_fn");
+                    const new_name = try f(self.allocator, name);
+                    const is_valid = std.zig.isValidId(new_name) and switch (context) {
+                        .@"const", .@"fn", .param, .type => !std.zig.primitives.isPrimitive(new_name),
+                        else => true,
+                    };
+                    return if (is_valid) new_name else try self.allocPrint("@\"{s}\"", .{new_name});
+                },
+            }
+        }
+
         fn translateDeclarations(self: *@This()) !void {
             // add error set
             try self.deriveErrorSet();
@@ -933,12 +956,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (self.old_root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
                     // get name in target namespace
-                    const new_name = if (isFunctionDecl(decl))
-                        try options.fn_name_fn(self.allocator, decl.name)
+                    const transform: NameContext = if (isFunctionDecl(decl))
+                        .@"fn"
                     else switch (decl.expr) {
-                        .type, .identifier => try options.type_name_fn(self.allocator, decl.name),
-                        .unknown => try options.const_name_fn(self.allocator, decl.name),
+                        .type, .identifier => .type,
+                        .unknown => .@"const",
                     };
+                    const new_name = try self.transformName(decl.name, transform);
                     const new_decl_t = if (decl.type) |t| try self.translateType(t, false) else null;
                     const expr = if (isFunctionDecl(decl)) get: {
                         const split_slices = try self.findSplitSlices(decl.type.?, new_decl_t.?);
@@ -1024,7 +1048,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateField(self: *@This(), field: Field) !Field {
-            const new_name = try options.field_name_fn(self.allocator, field.name);
+            const new_name = try self.transformName(field.name, .field);
             return .{
                 .name = new_name,
                 .type = try self.translateType(field.type, false),
@@ -1033,7 +1057,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateParameter(self: *@This(), param: Parameter, is_pointer_target: bool, is_inout: bool) !Parameter {
-            const new_name = if (param.name) |n| try options.param_name_fn(self.allocator, n) else null;
+            const new_name = if (param.name) |n| try self.transformName(n, .param) else null;
             const param_type = swap: {
                 switch (param.type.*) {
                     .pointer => |p| if (p.is_const and !isOpaque(p.child_type)) {
@@ -1061,7 +1085,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateEnumItem(self: *@This(), item: EnumItem) !EnumItem {
-            const new_name = try options.enum_name_fn(self.allocator, item.name);
+            const new_name = try self.transformName(item.name, .@"enum");
             return .{
                 .name = new_name,
                 .value = item.value,
@@ -1161,7 +1185,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         // insert filler
                         const blank_field = try self.createBlankField(blank_field_name, pos - bits_used);
                         try self.append(&new_fields, blank_field);
-                        blank_field_name = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ blank_field_name, "_" });
+                        blank_field_name = try self.allocPrint("{s}{s}", .{ blank_field_name, "_" });
                         bits_used = pos;
                     }
                     const new_field = try self.translateBitField(item);
@@ -1315,7 +1339,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateBitField(self: *@This(), item: EnumItem) !Field {
-            const new_name = try options.enum_name_fn(self.allocator, item.name);
+            const new_name = try self.transformName(item.name, .@"enum");
             const t = self.new_namespace.getType("bool") orelse add: {
                 const new_t = try self.createType(.{ .expression = .{ .identifier = "bool" } });
                 try self.new_namespace.addType("bool", new_t);
@@ -1343,14 +1367,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
             const t = get: {
                 if (width > 0) {
-                    const type_name = try std.fmt.allocPrint(self.allocator, "u{d}", .{width});
+                    const type_name = try self.allocPrint("u{d}", .{width});
                     break :get self.new_namespace.getType(type_name) orelse add: {
                         const new_t = try self.createType(.{ .expression = .{ .identifier = type_name } });
                         try self.new_namespace.addType(type_name, new_t);
                         break :add new_t;
                     };
                 } else {
-                    const expr = try std.fmt.allocPrint(self.allocator, "std.meta.Int(.unsigned, @bitSizeOf(c_uint) - {d})", .{-width});
+                    const expr = try self.allocPrint("std.meta.Int(.unsigned, @bitSizeOf(c_uint) - {d})", .{-width});
                     break :get try self.createType(.{ .expression = .{ .unknown = expr } });
                 }
             };
@@ -1362,15 +1386,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn createBitFieldDeclaration(self: *@This(), name: []const u8, fields: []Field) !Declaration {
-            const new_name = try options.enum_name_fn(self.allocator, name);
+            const new_name = try self.transformName(name, .@"enum");
             var pairs: [][]const u8 = &.{};
             for (fields) |field| {
-                const assign = try std.fmt.allocPrint(self.allocator, ".{s} = true", .{field.name});
+                const assign = try self.allocPrint(".{s} = true", .{field.name});
                 try self.append(&pairs, assign);
             }
             const set = switch (pairs.len) {
                 0 => ".{}",
-                else => try std.fmt.allocPrint(self.allocator, ".{s}", .{pairs}),
+                else => try self.allocPrint(".{s}", .{pairs}),
             };
             const t = self.new_namespace.getType("@This()") orelse add: {
                 const new_t = try self.createType(.{ .expression = .{ .identifier = "@This()" } });
@@ -1385,8 +1409,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn createIntDeclaration(self: *@This(), name: []const u8, value: i128) !Declaration {
-            const new_name = try options.enum_name_fn(self.allocator, name);
-            const number = try std.fmt.allocPrint(self.allocator, "{d}", .{value});
+            const new_name = try self.transformName(name, .@"enum");
+            const number = try self.allocPrint("{d}", .{value});
             return .{
                 .name = new_name,
                 .expr = .{ .unknown = number },
@@ -1469,12 +1493,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 if (t.* == .enumeration) {
                     for (t.enumeration.items) |item| {
                         if (options.enum_is_error_fn(item.name, item.value)) {
-                            const err_name = try options.error_name_fn(self.allocator, item.name);
+                            const err_name = try self.transformName(item.name, .@"error");
                             try self.append(&names, err_name);
-                            const en_name = try options.enum_name_fn(self.allocator, item.name);
+                            const en_name = try self.transformName(item.name, .@"enum");
                             try self.append(&errors, en_name);
                         } else {
-                            const en_name = try options.enum_name_fn(self.allocator, item.name);
+                            const en_name = try self.transformName(item.name, .@"enum");
                             try self.append(&non_errors, en_name);
                         }
                     }
@@ -1504,8 +1528,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 if (self.new_param_is_global.get(param.type) == null or param.is_inout) {
                     const name = try self.obtainTypeName(param.type, .new);
                     const pair = switch (param.is_inout) {
-                        true => try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = inout({s})", .{ index, name }),
-                        false => try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ index, name }),
+                        true => try self.allocPrint(".@\"{d}\" = inout({s})", .{ index, name }),
+                        false => try self.allocPrint(".@\"{d}\" = {s}", .{ index, name }),
                     };
                     try self.append(&non_unique_args, pair);
                 }
@@ -1526,40 +1550,40 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     for (payload_type.type_tuple, 0..) |t, i| {
                         if (self.new_param_is_global.get(t) == null) {
                             const name = try self.obtainTypeName(t, .new);
-                            const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ offset + i, name });
+                            const pair = try self.allocPrint(".@\"{d}\" = {s}", .{ offset + i, name });
                             try self.append(&non_unique_args, pair);
                         }
                     }
                 } else {
                     if (self.new_param_is_global.get(payload_type) == null) {
                         const name = try self.obtainTypeName(payload_type, .new);
-                        const pair = try std.fmt.allocPrint(self.allocator, ".@\"{d}\" = {s}", .{ offset, name });
+                        const pair = try self.allocPrint(".@\"{d}\" = {s}", .{ offset, name });
                         try self.append(&non_unique_args, pair);
                     }
                 }
             } else {
                 if (self.new_param_is_global.get(return_type) == null) {
                     const name = try self.obtainTypeName(return_type, .new);
-                    const pair = try std.fmt.allocPrint(self.allocator, ".retval = {s}", .{name});
+                    const pair = try self.allocPrint(".retval = {s}", .{name});
                     try self.append(&non_unique_args, pair);
                 }
             }
             const local_subs = if (non_unique_args.len > 0) get: {
                 const local_subs_pairs = try std.mem.join(self.allocator, ", ", non_unique_args);
-                break :get try std.fmt.allocPrint(self.allocator, " {s} ", .{local_subs_pairs});
+                break :get try self.allocPrint(" {s} ", .{local_subs_pairs});
             } else "";
             const code = if (split_slices) |pairs| format: {
                 // print code for translateMerge() to merge slice pointers
                 var pair_lines: [][]const u8 = &.{};
                 for (pairs) |pair| {
-                    const pair_line = try std.fmt.allocPrint(self.allocator, "    .{{ .ptr_index = {d}, .len_index = {d} }},", .{
+                    const pair_line = try self.allocPrint("    .{{ .ptr_index = {d}, .len_index = {d} }},", .{
                         pair.ptr_index,
                         pair.len_index,
                     });
                     try self.append(&pair_lines, pair_line);
                 }
                 const pair_list = try std.mem.join(self.allocator, "\n", pair_lines);
-                break :format try std.fmt.allocPrint(self.allocator, "{s}.translateMerge(\"{s}\", {}, {}, .{{{s}}}, &.{{\n{s}\n}})", .{
+                break :format try self.allocPrint("{s}.translateMerge(\"{s}\", {}, {}, .{{{s}}}, &.{{\n{s}\n}})", .{
                     options.translater,
                     decl.name,
                     return_error_union,
@@ -1567,7 +1591,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     local_subs,
                     pair_list,
                 });
-            } else try std.fmt.allocPrint(self.allocator, "{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
+            } else try self.allocPrint("{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
                 options.translater,
                 decl.name,
                 return_error_union,
@@ -1902,7 +1926,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.append(&argv, full_path);
             try self.append(&argv, "-lc");
             for (options.include_paths) |include_path| {
-                const arg = try std.fmt.allocPrint(self.allocator, "-I{s}", .{include_path});
+                const arg = try self.allocPrint("-I{s}", .{include_path});
                 try self.append(&argv, arg);
             }
             const result = try std.process.Child.run(.{
@@ -1929,6 +1953,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 } else |_| self.allocator.free(full_path);
             }
             return error.FileNotFound;
+        }
+
+        fn allocPrint(self: *@This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
+            return std.fmt.allocPrint(self.allocator, fmt, args);
         }
 
         fn append(self: *@This(), slice_ptr: anytype, value: GrandchildOf(@TypeOf(slice_ptr))) !void {
