@@ -190,15 +190,19 @@ test "CodeGenerator (beta, return status)" {
         fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
             return camelize(allocator, name, prefix.len, true);
         }
+
+        fn isStatusRequire(_: []const u8) bool {
+            return true;
+        }
     };
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     var generator: *CodeGenerator(.{
         .include_paths = &.{"."},
         .header_paths = &.{"beta.c"},
         .c_error_type = "beta_status",
-        .ignore_success_status = false,
         .filter_fn = ns.filter,
         .enum_is_error_fn = ns.isError,
+        .status_is_required_fn = ns.isStatusRequire,
         .field_name_fn = ns.getFieldName,
         .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
@@ -229,7 +233,6 @@ test "CodeGenerator (gamma)" {
         .include_paths = &.{"."},
         .header_paths = &.{"gamma.c"},
         .c_error_type = "bool",
-        .ignore_success_status = false,
         .filter_fn = ns.filter,
         .fn_name_fn = ns.getFnName,
     }) = try .init(gpa.allocator());
@@ -257,7 +260,6 @@ test "CodeGenerator (delta)" {
         .include_paths = &.{"."},
         .header_paths = &.{"delta.c"},
         .c_error_type = "int",
-        .ignore_success_status = false,
         .filter_fn = ns.filter,
         .fn_name_fn = ns.getFnName,
     }) = try .init(gpa.allocator());
@@ -284,7 +286,6 @@ test "CodeGenerator (epsilon)" {
     var generator: *CodeGenerator(.{
         .include_paths = &.{"."},
         .header_paths = &.{"epsilon.c"},
-        .ignore_success_status = false,
         .filter_fn = ns.filter,
         .fn_name_fn = ns.getFnName,
     }) = try .init(gpa.allocator());

@@ -33,11 +33,11 @@ pub const Callback = *const fn (
 
 pub const isSleepy: fn (
     flags: Flags,
-) Error!void = c_to_zig.translate("theta_is_sleepy", true, false, .{});
+) Error!void = c_to_zig.translate("theta_is_sleepy", true, false, .{ .@"0" = Flags });
 
 pub const setDwarves: fn (
     flags: Flags,
-) Error!void = c_to_zig.translate("theta_set_dwarves", true, false, .{});
+) Error!void = c_to_zig.translate("theta_set_dwarves", true, false, .{ .@"0" = Flags });
 
 pub const invoke: fn (
     cb: Callback,
@@ -47,7 +47,6 @@ const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
         .{ .old = c.theta_callback, .new = Callback },
-        .{ .old = c.theta_flags, .new = Flags },
     },
     .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
 });

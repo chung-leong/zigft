@@ -10,9 +10,6 @@ pub const CodeGeneratorOptions = struct {
     c_error_type: ?[]const u8 = null,
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
-
-    always_return_error_union: bool = false,
-    ignore_success_status: bool = true,
     add_simple_test: bool = true,
 
     // callback determining which declarations to include
@@ -22,28 +19,38 @@ pub const CodeGeneratorOptions = struct {
     type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
 
     // callback determining which enum items represent errors
-    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = nonZeroValue,
+    enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = isNonZero,
     // callback determining if an enum type is a packed struct
     enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
 
     // callbacks determining particular pointer attributes
     ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
     ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
-    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetAnyopaque,
+    ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = neverOptional,
 
+    // callback determining whether ptr param is optional
+    param_is_optional_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?bool = notFunctionSpecific,
     // callback distinguishing in/out pointers from output pointers
-    param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = alwaysOutput,
+    param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = neverInput,
     // callback returning the index of the corresponding pointer argument if it should be treated as the length of a slice pointer
-    param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = alwaysNull,
+    param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = neverSliceLength,
+
+    // calling determining whether positive status is needed
+    status_is_required_fn: fn (fn_name: []const u8) bool = neverRequired,
+    // calling determining whether a fucntion should return error union is needed
+    error_union_is_required_fn: fn (fn_name: []const u8) bool = neverRequired,
 
     // callbacks adjusting naming convention
-    fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    type_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    const_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
+    type_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
+    const_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
     param_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = removeArgPrefix,
-    field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
-    error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = noChange,
+    field_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
+    enum_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
+    error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
+
+    // callback returning doc comment
+    doc_comment_fn: fn (std.mem.Allocator, old_name: []const u8, new_name: []const u8) ?[]const u8 = provideNoComment,
 };
 
 pub const inout = TypeWithAttributes.inout;
@@ -156,10 +163,6 @@ pub const NullErrorScheme = struct {
     pub const Status = @TypeOf(undefined);
     pub const ErrorSet = @TypeOf(undefined);
     pub const PositiveStatus = void;
-};
-const SplitSlice = struct {
-    len_index: usize,
-    ptr_index: usize,
 };
 
 pub fn Translator(comptime options: TranslatorOptions) type {
@@ -614,6 +617,14 @@ pub const Namespace = struct {
         }
     }
 };
+const SplitSlice = struct {
+    len_index: usize,
+    ptr_index: usize,
+};
+const LocalSubstitution = struct {
+    index: ?usize,
+    type_name: []const u8,
+};
 
 pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
     return struct {
@@ -637,7 +648,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         old_namespace: Namespace,
         old_to_new_type_map: std.AutoHashMap(*Type, *Type),
         old_to_new_param_map: std.AutoHashMap(*Type, *Type),
-        new_param_is_global: std.AutoHashMap(*Type, bool),
         new_root: *Type,
         new_namespace: Namespace,
         new_error_set: *Type,
@@ -662,7 +672,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.old_namespace = .init(self.allocator);
             self.old_to_new_type_map = .init(self.allocator);
             self.old_to_new_param_map = .init(self.allocator);
-            self.new_param_is_global = .init(self.allocator);
             self.new_root = try self.createType(.{ .container = .{ .kind = "struct" } });
             self.new_namespace = .init(self.allocator);
             self.new_error_set = try self.createType(.{ .error_set = &.{} });
@@ -673,9 +682,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.write_to_byte_array = false;
             self.byte_array = .init(self.allocator);
             self.need_inout_import = false;
-            try self.new_namespace.addType("void", self.void_type);
-            // add entry in map so we know we local substitution isn't needed
-            try self.new_param_is_global.put(self.void_type, true);
             return self;
         }
 
@@ -934,6 +940,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 inline else => |tag| {
                     const f = @field(options, @tagName(tag) ++ "_name_fn");
                     const new_name = try f(self.allocator, name);
+                    if (new_name.len > 0 and new_name[0] == '@') return new_name;
                     const is_valid = std.zig.isValidId(new_name) and switch (context) {
                         .@"const", .@"fn", .param, .type => !std.zig.primitives.isPrimitive(new_name),
                         else => true,
@@ -944,7 +951,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateDeclarations(self: *@This()) !void {
-            // add error set
+            // add error set first
             try self.deriveErrorSet();
             if (getErrorType() != null) {
                 try self.append(&self.new_root.container.decls, .{
@@ -952,7 +959,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .expr = .{ .type = self.new_error_set },
                 });
             }
-            // add remaining
+            // translate all declarations
             for (self.old_root.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
                     // get name in target namespace
@@ -964,27 +971,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     };
                     const new_name = try self.transformName(decl.name, transform);
                     const new_decl_t = if (decl.type) |t| try self.translateType(t, false) else null;
-                    const expr = if (isFunctionDecl(decl)) get: {
-                        const split_slices = try self.findSplitSlices(decl.type.?, new_decl_t.?);
-                        // get translate() or translateMerge() call
-                        const expr = try self.obtainTranslateCall(decl, new_decl_t.?, split_slices);
-                        if (split_slices) |pairs| {
-                            // change the declaration, removing slice len and changing pointer type
-                            const new_func = &new_decl_t.?.function;
-                            for (0..pairs.len) |i| {
-                                const pair = pairs[pairs.len - i - 1];
-                                const ptr_param = &new_func.parameters[pair.ptr_index];
-                                ptr_param.type = try self.translateSlicePointer(ptr_param.type);
-                                self.remove(&new_func.parameters, pair.len_index);
-                            }
-                        }
-                        break :get expr;
-                    } else try self.translateExpression(decl.expr);
+                    const expr = try self.translateExpression(decl.expr);
                     if (expr == .type) {
                         // don't add declarations for opaques
-                        if (expr.type.* == .container and std.mem.eql(u8, expr.type.container.kind, "opaque")) {
+                        if (expr.type.* == .container and std.mem.eql(u8, expr.type.container.kind, "opaque"))
                             continue;
-                        }
                         try self.new_namespace.addType(new_name, expr.type);
                     }
                     try self.append(&self.new_root.container.decls, .{
@@ -1025,6 +1016,40 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                     // can't be optional
                     new_t.pointer.is_optional = false;
+                }
+            }
+            // add translate calls to function declarations
+            for (self.new_root.container.decls) |*new_decl| {
+                if (isFunctionDecl(new_decl.*)) {
+                    const new_t = new_decl.type.?;
+                    const t, const fn_name = for (self.old_root.container.decls) |decl| {
+                        if (isFunctionDecl(decl)) {
+                            if (self.old_to_new_type_map.get(decl.type.?) == new_t) {
+                                break .{ decl.type.?, decl.name };
+                            }
+                        }
+                    } else unreachable;
+                    const return_error_union = self.shouldReturnErrorUnion(fn_name, t);
+                    const ignore_non_error_return_value = self.shouldIgnoreNonErrorRetval(fn_name, t);
+                    const local_subs = try self.findLocalSubstitutions(t, new_t);
+                    const split_slices = try self.findSplitSlices(t, new_t);
+                    // get translate() or translateMerge() call
+                    new_decl.expr = try self.obtainTranslateCall(
+                        fn_name,
+                        return_error_union,
+                        ignore_non_error_return_value,
+                        local_subs,
+                        split_slices,
+                    );
+                    if (split_slices.len > 0) {
+                        // change the declaration, removing slice len and changing pointer type
+                        for (0..split_slices.len) |i| {
+                            const pair = split_slices[split_slices.len - i - 1];
+                            const ptr_param = &new_t.function.parameters[pair.ptr_index];
+                            ptr_param.type = try self.translateSlicePointer(ptr_param.type);
+                            self.remove(&new_t.function.parameters, pair.len_index);
+                        }
+                    }
                 }
             }
         }
@@ -1247,13 +1272,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             // look for writable pointer
             var output_types: []*Type = &.{};
             var inout_index: ?usize = null;
+            const fn_name = try self.obtainFunctionName(t);
             const output_start = for (0..f.parameters.len) |offset| {
                 const index = f.parameters.len - offset - 1;
                 const param = f.parameters[index];
                 if (is_pointer_target) break index + 1;
                 if (!self.isWriteTarget(param.type)) break index + 1;
                 // maybe it's a in/out pointer--need to ask the callback function
-                const fn_name = try self.obtainFunctionName(t);
                 const type_name = try self.obtainTypeName(param.type.pointer.child_type, .old);
                 if (options.param_is_input_fn(fn_name, param.name, index, type_name)) {
                     inout_index = index;
@@ -1266,31 +1291,25 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const target_type = param.type.pointer.child_type;
                     const output_type = try self.translateType(target_type, true);
                     try self.append(&output_types, output_type);
-                    try self.addSubstitution(target_type, output_type);
                 }
             }
             // see if the translated function should return an error union
-            const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(t);
+            const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(fn_name, t);
             const status_type = try self.translateType(f.return_type, false);
             const extra: usize = switch (!is_pointer_target and self.isReturningStatus(t)) {
-                false => if (isVoid(f.return_type)) 0 else 1,
-                true => switch (self.non_error_enums.len) {
-                    0, 1 => 0,
-                    else => switch (options.ignore_success_status) {
-                        true => 0,
-                        false => 1,
-                    },
+                true => switch (self.non_error_enums.len > 1) {
+                    true => if (self.shouldIgnoreNonErrorRetval(fn_name, t)) 0 else 1,
+                    false => 0,
                 },
+                false => if (isVoid(f.return_type)) 0 else 1,
             };
             if (extra == 1) {
                 try self.append(&output_types, status_type);
-                try self.addSubstitution(f.return_type, status_type);
             }
             const arg_count = f.parameters.len + extra - output_types.len;
             for (f.parameters[0..arg_count], 0..) |param, index| {
                 const new_param = try self.translateParameter(param, is_pointer_target, inout_index == index);
                 try self.append(&new_params, new_param);
-                try self.addSubstitution(param.type, new_param.type);
             }
             const payload_type = switch (output_types.len) {
                 0 => self.void_type,
@@ -1316,26 +1335,75 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
-        fn findSplitSlices(self: *@This(), t: *Type, new_t: *Type) !?[]SplitSlice {
+        fn findLocalSubstitutions(self: *@This(), t: *Type, new_t: *Type) ![]LocalSubstitution {
+            var local_subs: []LocalSubstitution = &.{};
+            for (new_t.function.parameters, 0..) |new_param, index| {
+                // we need to do local substitution when the new type cannot be derived through
+                // the global substitution table
+                const param = t.function.parameters[index];
+                if (!try self.addGlobalSubstitute(param.type, new_param.type)) {
+                    var type_name = try self.obtainTypeName(new_param.type, .new);
+                    if (param.is_inout) {
+                        type_name = try self.allocPrint("inout({s})", .{type_name});
+                    }
+                    try self.append(&local_subs, .{
+                        .index = index,
+                        .type_name = type_name,
+                    });
+                }
+            }
+            // add substitutes of return types
+            const return_type = new_t.function.return_type;
+            const output_types: []const *Type = switch (return_type.*) {
+                .error_union => |e| switch (e.payload_type.*) {
+                    .type_tuple => |tt| tt,
+                    else => &.{e.payload_type},
+                },
+                else => &.{return_type},
+            };
+            const offset = new_t.function.parameters.len;
+            for (output_types, 0..) |new_ot, i| {
+                const ot, const index = switch (offset + i < t.function.parameters.len) {
+                    true => .{ t.function.parameters[offset + i].type.pointer.child_type, offset + i },
+                    false => switch (return_type.*) {
+                        // if an error union is return, then the extra return is the status
+                        // which doesn't require substitution
+                        .error_union => continue,
+                        else => .{ t.function.return_type, null },
+                    },
+                };
+                if (!try self.addGlobalSubstitute(ot, new_ot)) {
+                    const type_name = try self.obtainTypeName(new_ot, .new);
+                    try self.append(&local_subs, .{
+                        .index = index,
+                        .type_name = type_name,
+                    });
+                }
+            }
+            return local_subs;
+        }
+
+        fn findSplitSlices(self: *@This(), t: *Type, new_t: *Type) ![]SplitSlice {
+            var pairs: []SplitSlice = &.{};
             const has_pointers = for (new_t.function.parameters) |p| {
                 if (p.type.* == .pointer) break true;
             } else false;
-            if (!has_pointers) return null;
-            const fn_name = try self.obtainFunctionName(t);
-            var pairs: []SplitSlice = &.{};
-            for (0..new_t.function.parameters.len) |i| {
-                const is_ptr = for (pairs) |pair| {
-                    if (pair.ptr_index == i) break true;
-                } else false;
-                if (!is_ptr) {
-                    const param = t.function.parameters[i];
-                    const type_name = try self.obtainTypeName(param.type, .old);
-                    if (options.param_is_slice_len_fn(fn_name, param.name, i, type_name)) |ptr_index| {
-                        try self.append(&pairs, .{ .ptr_index = ptr_index, .len_index = i });
+            if (has_pointers) {
+                const fn_name = try self.obtainFunctionName(t);
+                for (0..new_t.function.parameters.len) |i| {
+                    const is_ptr = for (pairs) |pair| {
+                        if (pair.ptr_index == i) break true;
+                    } else false;
+                    if (!is_ptr) {
+                        const param = t.function.parameters[i];
+                        const type_name = try self.obtainTypeName(param.type, .old);
+                        if (options.param_is_slice_len_fn(fn_name, param.name, i, type_name)) |ptr_index| {
+                            try self.append(&pairs, .{ .ptr_index = ptr_index, .len_index = i });
+                        }
                     }
                 }
             }
-            return if (pairs.len > 0) pairs else null;
+            return pairs;
         }
 
         fn translateBitField(self: *@This(), item: EnumItem) !Field {
@@ -1417,17 +1485,23 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn addSubstitution(self: *@This(), old_type: *Type, new_type: *Type) !void {
-            const is_unique_type = switch (new_type.*) {
+        fn addGlobalSubstitute(self: *@This(), old_type: *Type, new_type: *Type) !bool {
+            if (new_type == old_type) return true;
+            if (new_type.* == .expression and new_type.expression == .identifier) {
+                if (std.zig.isPrimitive(new_type.expression.identifier)) return true;
+            }
+            const is_unique_type = switch (old_type.*) {
                 .enumeration, .expression => false,
                 else => true,
             };
-            if (new_type == old_type or is_unique_type) {
-                try self.new_param_is_global.put(new_type, true);
-                if (new_type != old_type) {
-                    try self.old_to_new_param_map.put(old_type, new_type);
+            if (is_unique_type) {
+                const result = try self.old_to_new_param_map.getOrPut(old_type);
+                if (!result.found_existing) {
+                    result.value_ptr.* = new_type;
+                    return true;
                 }
             }
+            return false;
         }
 
         fn isFunctionDecl(decl: Declaration) bool {
@@ -1480,8 +1554,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return std.mem.eql(u8, err_type, name);
         }
 
-        fn shouldReturnErrorUnion(self: *@This(), t: *Type) bool {
-            return options.always_return_error_union or self.isReturningStatus(t);
+        fn shouldReturnErrorUnion(self: *@This(), fn_name: []const u8, t: *Type) bool {
+            return self.isReturningStatus(t) or options.error_union_is_required_fn(fn_name);
+        }
+
+        fn shouldIgnoreNonErrorRetval(self: *@This(), fn_name: []const u8, t: *Type) bool {
+            return if (self.non_error_enums.len > 1 and self.isReturningStatus(t))
+                !options.status_is_required_fn(fn_name)
+            else
+                false;
         }
 
         fn deriveErrorSet(self: *@This()) !void {
@@ -1516,88 +1597,53 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn obtainTranslateCall(
             self: *@This(),
-            decl: Declaration,
-            new_t: *const Type,
-            split_slices: ?[]SplitSlice,
+            old_fn_name: []const u8,
+            return_error_union: bool,
+            ignore_non_error_return_value: bool,
+            local_subs: []LocalSubstitution,
+            split_slices: []SplitSlice,
         ) !Expression {
-            const return_error_union = self.shouldReturnErrorUnion(decl.type.?);
-            var non_unique_args: [][]const u8 = &.{};
-            for (new_t.function.parameters, 0..) |param, index| {
-                // we need to do local substitution when the original type isn't unique enough
-                // for global replacement and when a non-const pointer is use for input
-                if (self.new_param_is_global.get(param.type) == null or param.is_inout) {
-                    const name = try self.obtainTypeName(param.type, .new);
-                    const pair = switch (param.is_inout) {
-                        true => try self.allocPrint(".@\"{d}\" = inout({s})", .{ index, name }),
-                        false => try self.allocPrint(".@\"{d}\" = {s}", .{ index, name }),
-                    };
-                    try self.append(&non_unique_args, pair);
+            const local_sub_list = if (local_subs.len > 0) format: {
+                var sub_items: [][]const u8 = &.{};
+                for (local_subs) |sub| {
+                    const sub_item = if (sub.index) |i|
+                        try self.allocPrint(".@\"{d}\" = {s}", .{ i, sub.type_name })
+                    else
+                        try self.allocPrint(".retval = {s}", .{sub.type_name});
+                    try self.append(&sub_items, sub_item);
                 }
-            }
-            const ignore_non_error_return_value = switch (self.non_error_enums.len) {
-                0, 1 => false,
-                else => switch (options.ignore_success_status) {
-                    // ignore the return value if it's a positive status code
-                    true => self.isReturningStatus(decl.type.?),
-                    false => false,
-                },
-            };
-            const return_type = new_t.function.return_type;
-            if (return_error_union) {
-                const payload_type = return_type.error_union.payload_type;
-                const offset = new_t.function.parameters.len;
-                if (payload_type.* == .type_tuple) {
-                    for (payload_type.type_tuple, 0..) |t, i| {
-                        if (self.new_param_is_global.get(t) == null) {
-                            const name = try self.obtainTypeName(t, .new);
-                            const pair = try self.allocPrint(".@\"{d}\" = {s}", .{ offset + i, name });
-                            try self.append(&non_unique_args, pair);
-                        }
-                    }
-                } else {
-                    if (self.new_param_is_global.get(payload_type) == null) {
-                        const name = try self.obtainTypeName(payload_type, .new);
-                        const pair = try self.allocPrint(".@\"{d}\" = {s}", .{ offset, name });
-                        try self.append(&non_unique_args, pair);
-                    }
-                }
-            } else {
-                if (self.new_param_is_global.get(return_type) == null) {
-                    const name = try self.obtainTypeName(return_type, .new);
-                    const pair = try self.allocPrint(".retval = {s}", .{name});
-                    try self.append(&non_unique_args, pair);
-                }
-            }
-            const local_subs = if (non_unique_args.len > 0) get: {
-                const local_subs_pairs = try std.mem.join(self.allocator, ", ", non_unique_args);
-                break :get try self.allocPrint(" {s} ", .{local_subs_pairs});
+                const sub_items_joined = try std.mem.join(self.allocator, ", ", sub_items);
+                break :format try self.allocPrint(" {s} ", .{sub_items_joined});
             } else "";
-            const code = if (split_slices) |pairs| format: {
-                // print code for translateMerge() to merge slice pointers
-                var pair_lines: [][]const u8 = &.{};
-                for (pairs) |pair| {
-                    const pair_line = try self.allocPrint("    .{{ .ptr_index = {d}, .len_index = {d} }},", .{
+            // print code for translateMerge() to merge slice pointers
+            const slice_list = if (split_slices.len > 0) format: {
+                var slice_lines: [][]const u8 = &.{};
+                for (split_slices) |pair| {
+                    const slice_line = try self.allocPrint("    .{{ .ptr_index = {d}, .len_index = {d} }},", .{
                         pair.ptr_index,
                         pair.len_index,
                     });
-                    try self.append(&pair_lines, pair_line);
+                    try self.append(&slice_lines, slice_line);
                 }
-                const pair_list = try std.mem.join(self.allocator, "\n", pair_lines);
-                break :format try self.allocPrint("{s}.translateMerge(\"{s}\", {}, {}, .{{{s}}}, &.{{\n{s}\n}})", .{
+                break :format try std.mem.join(self.allocator, "\n", slice_lines);
+            } else "";
+            const code = if (slice_list.len > 0)
+                try self.allocPrint("{s}.translateMerge(\"{s}\", {}, {}, .{{{s}}}, &.{{\n{s}\n}})", .{
                     options.translater,
-                    decl.name,
+                    old_fn_name,
                     return_error_union,
                     ignore_non_error_return_value,
-                    local_subs,
-                    pair_list,
+                    local_sub_list,
+                    slice_list,
+                })
+            else
+                try self.allocPrint("{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
+                    options.translater,
+                    old_fn_name,
+                    return_error_union,
+                    ignore_non_error_return_value,
+                    local_sub_list,
                 });
-            } else try self.allocPrint("{s}.translate(\"{s}\", {}, {}, .{{{s}}})", .{
-                options.translater,
-                decl.name,
-                return_error_union,
-                ignore_non_error_return_value,
-                local_subs,
-            });
             return .{ .unknown = code };
         }
 
@@ -2093,15 +2139,19 @@ test "snakify" {
     try expectEqualSlices(u8, "green_dragon", name2);
 }
 
-pub fn noChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
+pub fn makeNoChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
     return arg;
+}
+
+pub fn provideNoComment(_: std.mem.Allocator, _: []const u8, _: []const u8) ?[]const u8 {
+    return null;
 }
 
 pub fn removeArgPrefix(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
     return if (std.mem.startsWith(u8, arg, "arg_")) arg[4..] else arg;
 }
 
-pub fn nonZeroValue(_: []const u8, value: i128) bool {
+pub fn isNonZero(_: []const u8, value: i128) bool {
     return value != 0;
 }
 
@@ -2113,20 +2163,28 @@ pub fn neverPackedStruct(_: []const u8) bool {
     return false;
 }
 
-pub fn isTargetAnyopaque(_: []const u8, child_type: []const u8) bool {
-    return std.mem.eql(u8, "anyopaque", child_type);
-}
-
-pub fn alwaysInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
-    return true;
-}
-
-pub fn alwaysOutput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+pub fn neverOptional(_: []const u8, _: []const u8) bool {
     return false;
 }
 
-pub fn alwaysNull(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?usize {
+pub fn alwaysTrue(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+    return true;
+}
+
+pub fn notFunctionSpecific(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?bool {
     return null;
+}
+
+pub fn neverInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
+    return false;
+}
+
+pub fn neverSliceLength(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?usize {
+    return null;
+}
+
+pub fn neverRequired(_: []const u8) bool {
+    return false;
 }
 
 pub fn isTargetChar(_: []const u8, target_type: []const u8) bool {
