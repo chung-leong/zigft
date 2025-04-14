@@ -207,7 +207,7 @@ test "CodeGenerator (beta, return status)" {
         .c_error_type = "beta_status",
         .filter_fn = ns.filter,
         .enum_is_error_fn = ns.isError,
-        .status_is_required_fn = ns.isStatusRequire,
+        .status_is_returned_fn = ns.isStatusRequire,
         .field_name_fn = ns.getFieldName,
         .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
@@ -480,6 +480,56 @@ test "CodeGenerator (iota)" {
     defer generator.deinit();
     try generator.analyze();
     const path = try std.fs.path.resolve(generator.allocator, &.{ generator.cwd, "iota.zig" });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (kappa)" {
+    const ns = struct {
+        const prefix = "kappa_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, prefix.len);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn isReturningErrorUnion(fn_name: []const u8) bool {
+            return !std.mem.eql(u8, fn_name, "kappa_get_last_status");
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"."},
+        .header_paths = &.{"kappa.c"},
+        .c_error_type = "kappa_status",
+        .filter_fn = ns.filter,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+        .error_union_is_returned_fn = ns.isReturningErrorUnion,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    try generator.analyze();
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "kappa.zig",
+    });
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());
 }

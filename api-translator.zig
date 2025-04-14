@@ -36,9 +36,9 @@ pub const CodeGeneratorOptions = struct {
     param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = neverSliceLength,
 
     // calling determining whether positive status is needed
-    status_is_required_fn: fn (fn_name: []const u8) bool = neverRequired,
+    status_is_returned_fn: fn (fn_name: []const u8) bool = neverReturned,
     // calling determining whether a fucntion should return error union is needed
-    error_union_is_required_fn: fn (fn_name: []const u8) bool = neverRequired,
+    error_union_is_returned_fn: fn (fn_name: []const u8) bool = alwaysReturned,
 
     // callbacks adjusting naming convention
     fn_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
@@ -142,28 +142,32 @@ pub fn BasicErrorScheme(
     return struct {
         pub const Status = old_enum_type;
         pub const ErrorSet = new_error_set;
-        pub const PositiveStatus = if (non_error_statuses.len > 1) Status else void;
-        pub const Result = union(enum) {
-            status: PositiveStatus,
-            err: anyerror,
-        };
 
-        pub fn fromEnum(arg: Status) Result {
-            return if (std.mem.indexOfScalar(Status, &non_error_statuses, arg)) |_| .{
-                .status = if (PositiveStatus == void) {} else arg,
-            } else for (error_enum_table) |entry| {
-                if (entry.status == arg) break .{ .err = entry.err };
-            } else .{
-                .err = default_error,
+        pub fn RetvalSubstitute(comptime T: type) type {
+            return switch (@typeInfo(Status)) {
+                .@"enum" => |en| if (en.tag_type == T) Status else T,
+                else => T,
+            };
+        }
+
+        pub fn OutputType(comptime T: type) type {
+            return if (T == Status and non_error_statuses.len <= 1) void else T;
+        }
+
+        pub fn check(retval: anytype) ErrorSet!OutputType(@TypeOf(retval)) {
+            const T = @TypeOf(retval);
+            return switch (T) {
+                Status => if (std.mem.indexOfScalar(Status, &non_error_statuses, retval)) |_|
+                    if (OutputType(T) == void) {} else retval
+                else for (error_enum_table) |entry| {
+                    if (entry.status == retval) break entry.err;
+                } else default_error,
+                else => retval,
             };
         }
     };
 }
-pub const NullErrorScheme = struct {
-    pub const Status = @TypeOf(undefined);
-    pub const ErrorSet = @TypeOf(undefined);
-    pub const PositiveStatus = void;
-};
+pub const NullErrorScheme = struct {};
 
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
@@ -176,24 +180,20 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             @setEvalBranchQuota(2000000);
             const old_fn = @typeInfo(OldFn).@"fn";
             const OldRT = old_fn.return_type.?;
+            const NewRT = RetvalSubstitute(OldRT, local_subs);
             const extra = switch (ignore_non_error_return_value) {
                 true => 0,
                 false => switch (return_error_union) {
                     // room for an extra type when there're multiple status codes indicating success
-                    true => if (options.error_scheme.PositiveStatus != void) 1 else 0,
+                    true => if (options.error_scheme.OutputType(NewRT) != void) 1 else 0,
                     // room for an extra type when the return value isn't an error code or void
-                    false => if (OldRT != void) 1 else 0,
+                    false => if (NewRT != void) 1 else 0,
                 },
             };
             // look for non-const pointers, scanning backward
             const OutputTypes = init: {
                 var types: [old_fn.params.len + extra]type = undefined;
-                if (extra == 1) {
-                    types[old_fn.params.len] = switch (return_error_union) {
-                        true => options.error_scheme.PositiveStatus,
-                        false => Substitute(OldRT, local_subs, null, old_fn.params.len),
-                    };
-                }
+                if (extra == 1) types[old_fn.params.len] = NewRT;
                 const start_index = inline for (0..old_fn.params.len) |j| {
                     const i = old_fn.params.len - j - 1;
                     const Target = WritableTarget(old_fn.params[i].type.?) orelse break i + 1;
@@ -222,14 +222,15 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 1 => OutputTypes[0],
                 else => std.meta.Tuple(OutputTypes),
             };
-            const Error = options.error_scheme.ErrorSet;
-            const NewRT = if (return_error_union) Error!Payload else Payload;
             return @Type(.{
                 .@"fn" = .{
                     .calling_convention = .auto,
                     .is_generic = false,
                     .is_var_args = false,
-                    .return_type = NewRT,
+                    .return_type = switch (return_error_union) {
+                        true => options.error_scheme.ErrorSet!Payload,
+                        else => Payload,
+                    },
                     .params = &params,
                 },
             });
@@ -254,13 +255,17 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 ignore_non_error_return_value,
                 local_subs,
             );
-            const NewRT = @typeInfo(NewFn).@"fn".return_type.?;
-            const Payload = switch (@typeInfo(NewRT)) {
+            const OldRT = @typeInfo(OldFn).@"fn".return_type.?;
+            // NewRT is OldRT in the new namespace (usually an enum)
+            const NewRT = RetvalSubstitute(OldRT, local_subs);
+            // ReturnType is what the new function actually returns
+            const ReturnType = @typeInfo(NewFn).@"fn".return_type.?;
+            const Payload = switch (@typeInfo(ReturnType)) {
                 .error_union => |eu| eu.payload,
-                else => NewRT,
+                else => ReturnType,
             };
             const ns = struct {
-                inline fn call(new_args: std.meta.ArgsTuple(NewFn)) NewRT {
+                inline fn call(new_args: std.meta.ArgsTuple(NewFn)) ReturnType {
                     var old_args: std.meta.ArgsTuple(OldFn) = undefined;
                     // copy arguments
                     inline for (new_args, 0..) |new_arg, i| {
@@ -276,7 +281,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                         else => 1,
                     };
                     const extra = output_count - pointer_count;
-                    const last = if (output_count > 1) payload.len - 1 else 0;
                     // add pointers to result
                     switch (pointer_count) {
                         1 => old_args[new_args.len] = @ptrCast(&payload),
@@ -285,7 +289,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                             old_args[i] = convert(ArgT, &payload[i - new_args.len]);
                         },
                     }
-                    // get function
+                    // get original function
                     const func = if (options.late_bind_fn) |get| bind: {
                         const bind_ns = struct {
                             var func_ptr: ?*const OldFn = null;
@@ -298,25 +302,20 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                             break :bind ptr;
                         }
                     } else @field(options.c_import_ns, fn_name);
-
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
-                    if (return_error_union) {
-                        // see if the call encountered an error
-                        const status = convert(options.error_scheme.Status, old_rv);
-                        switch (options.error_scheme.fromEnum(status)) {
-                            .err => |e| return @errorCast(e),
-                            .status => |s| if (extra > 0) {
-                                // add positive status to result
-                                if (last > 0) payload[last] = s else payload = s;
-                            },
-                        }
-                    } else if (extra > 0) {
-                        if (last > 0) {
-                            payload[last] = convert(@TypeOf(payload[last]), old_rv);
-                        } else {
-                            payload = convert(@TypeOf(payload), old_rv);
-                        }
+                    const new_rv = convert(NewRT, old_rv);
+                    // check outcome (if returning error union)
+                    const output = switch (return_error_union) {
+                        true => try options.error_scheme.check(new_rv),
+                        false => new_rv,
+                    };
+                    if (extra > 0) {
+                        // add positive status to result
+                        if (output_count > 1)
+                            payload[payload.len - 1] = output
+                        else
+                            payload = output;
                     }
                     return payload;
                 }
@@ -500,6 +499,13 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 type_wa.type
             else
                 SwapType(T, .old_to_new);
+        }
+
+        fn RetvalSubstitute(comptime T: type, tuple: anytype) type {
+            return if (@hasDecl(options.error_scheme, "RetvalSubstitute"))
+                options.error_scheme.RetvalSubstitute(T)
+            else
+                Substitute(T, tuple, null, 0);
         }
 
         fn WritableTarget(comptime T: type) ?type {
@@ -1289,17 +1295,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     break index + 1;
                 }
             } else 0;
-            if (!is_pointer_target) {
-                for (f.parameters[output_start..]) |param| {
-                    const target_type = param.type.pointer.child_type;
-                    const output_type = try self.translateType(target_type, true);
-                    try self.append(&output_types, output_type);
-                }
+            for (f.parameters[output_start..]) |param| {
+                const target_type = param.type.pointer.child_type;
+                const output_type = try self.translateType(target_type, true);
+                try self.append(&output_types, output_type);
             }
             // see if the translated function should return an error union
             const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(fn_name, t);
             const status_type = try self.translateType(f.return_type, false);
-            const extra: usize = switch (!is_pointer_target and self.isReturningStatus(t)) {
+            const extra: usize = switch (return_error_union) {
                 true => switch (self.non_error_enums.len > 1) {
                     true => if (self.shouldIgnoreNonErrorRetval(fn_name, t)) 0 else 1,
                     false => 0,
@@ -1558,12 +1562,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn shouldReturnErrorUnion(self: *@This(), fn_name: []const u8, t: *Type) bool {
-            return self.isReturningStatus(t) or options.error_union_is_required_fn(fn_name);
+            return self.isReturningStatus(t) and options.error_union_is_returned_fn(fn_name);
         }
 
         fn shouldIgnoreNonErrorRetval(self: *@This(), fn_name: []const u8, t: *Type) bool {
             return if (self.non_error_enums.len > 1 and self.isReturningStatus(t))
-                !options.status_is_required_fn(fn_name)
+                !options.status_is_returned_fn(fn_name)
             else
                 false;
         }
@@ -2194,8 +2198,12 @@ pub fn neverSliceLength(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) 
     return null;
 }
 
-pub fn neverRequired(_: []const u8) bool {
+pub fn neverReturned(_: []const u8) bool {
     return false;
+}
+
+pub fn alwaysReturned(_: []const u8) bool {
+    return true;
 }
 
 pub fn isTargetChar(_: []const u8, target_type: []const u8) bool {
