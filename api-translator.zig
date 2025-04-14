@@ -50,7 +50,7 @@ pub const CodeGeneratorOptions = struct {
     error_name_fn: fn (std.mem.Allocator, name: []const u8) std.mem.Allocator.Error![]const u8 = makeNoChange,
 
     // callback returning doc comment
-    doc_comment_fn: fn (std.mem.Allocator, old_name: []const u8, new_name: []const u8) ?[]const u8 = provideNoComment,
+    doc_comment_fn: fn (std.mem.Allocator, old_name: []const u8, new_name: []const u8) std.mem.Allocator.Error!?[]const u8 = provideNoComment,
 };
 
 pub const inout = TypeWithAttributes.inout;
@@ -563,6 +563,7 @@ pub const Declaration = struct {
     alignment: ?[]const u8 = null,
     mutable: bool = false,
     expr: Expression = .{ .unknown = "" },
+    doc_comment: ?[]const u8 = null,
 };
 pub const Parameter = struct {
     type: *Type,
@@ -978,12 +979,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             continue;
                         try self.new_namespace.addType(new_name, expr.type);
                     }
+                    const doc_comment = try options.doc_comment_fn(self.allocator, decl.name, new_name);
                     try self.append(&self.new_root.container.decls, .{
                         .name = new_name,
                         .type = new_decl_t,
                         .alignment = decl.alignment,
                         .mutable = false,
                         .expr = expr,
+                        .doc_comment = doc_comment,
                     });
                 }
             }
@@ -1847,7 +1850,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt(",\n");
         }
 
+        fn printDocComment(self: *@This(), text: []const u8) anyerror!void {
+            var iterator = std.mem.splitScalar(u8, text, '\n');
+            while (iterator.next()) |line| {
+                try self.printFmt("/// {s}\n", .{line});
+            }
+        }
+
         fn printDeclaration(self: *@This(), decl: Declaration, ns: NamespaceType) anyerror!void {
+            if (decl.doc_comment) |c| try self.printDocComment(c);
             const mut = if (decl.mutable) "var" else "const";
             try self.printFmt("pub {s} {s}", .{ mut, decl.name });
             if (decl.type) |t| {
@@ -2143,7 +2154,7 @@ pub fn makeNoChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Err
     return arg;
 }
 
-pub fn provideNoComment(_: std.mem.Allocator, _: []const u8, _: []const u8) ?[]const u8 {
+pub fn provideNoComment(_: std.mem.Allocator, _: []const u8, _: []const u8) std.mem.Allocator.Error!?[]const u8 {
     return null;
 }
 

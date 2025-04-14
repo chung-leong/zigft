@@ -32,6 +32,10 @@ test "CodeGenerator (alpha)" {
         fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
             return camelize(allocator, name, prefix.len, true);
         }
+
+        fn getDocComment(allocator: std.mem.Allocator, old_name: []const u8, new_name: []const u8) !?[]const u8 {
+            return try std.fmt.allocPrint(allocator, "\n{s} -> {s}\n", .{ old_name, new_name });
+        }
     };
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     var generator: *CodeGenerator(.{
@@ -44,6 +48,7 @@ test "CodeGenerator (alpha)" {
         .fn_name_fn = ns.getFnName,
         .enum_name_fn = ns.getEnumName,
         .error_name_fn = ns.getErrorName,
+        .doc_comment_fn = ns.getDocComment,
     }) = try .init(gpa.allocator());
     defer generator.deinit();
     try generator.analyze();
