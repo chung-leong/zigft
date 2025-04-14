@@ -533,3 +533,60 @@ test "CodeGenerator (kappa)" {
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());
 }
+
+test "CodeGenerator (lambda)" {
+    const ns = struct {
+        const prefix = "lambda_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return snakify(allocator, name, prefix.len);
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn isByValue(name: []const u8) bool {
+            return std.mem.eql(u8, name, "lambda_union");
+        }
+
+        fn isParamOptional(fn_name: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?bool {
+            if (std.mem.eql(u8, fn_name, "lambda_accept_union")) return true;
+            if (std.mem.eql(u8, fn_name, "lambda_accept_struct2")) return true;
+            return null;
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"."},
+        .header_paths = &.{"lambda.c"},
+        .c_error_type = "lambda_status",
+        .filter_fn = ns.filter,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+        .type_is_by_value_fn = ns.isByValue,
+        .param_is_optional_fn = ns.isParamOptional,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    try generator.analyze();
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "lambda.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}

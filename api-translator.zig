@@ -2,12 +2,18 @@ const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
 
 pub const CodeGeneratorOptions = struct {
+    pub const ErrorValue = struct {
+        type: []const u8,
+        name: []const u8,
+    };
+
     include_paths: []const []const u8,
     header_paths: []const []const u8,
     zigft_path: []const u8 = "",
     translater: []const u8 = "c_to_zig",
     error_set: []const u8 = "Error",
     c_error_type: ?[]const u8 = null,
+    c_error_values: ?[]ErrorValue = null,
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
     add_simple_test: bool = true,
@@ -163,6 +169,42 @@ pub fn BasicErrorScheme(
                     if (entry.status == retval) break entry.err;
                 } else default_error,
                 else => retval,
+            };
+        }
+    };
+}
+pub fn InvalidReturnValueScheme(
+    invalid_values: anytype,
+    default_error: anyerror,
+) type {
+    return struct {
+        pub const ErrorSet = @TypeOf(default_error);
+
+        pub fn OutputType(comptime T: type) type {
+            return switch (@typeInfo(T)) {
+                .optional => |op| op.child,
+                else => T,
+            };
+        }
+
+        pub fn check(retval: anytype) ErrorSet!OutputType(@TypeOf(retval)) {
+            const T = @TypeOf(retval);
+            return switch (@typeInfo(T)) {
+                .optional => if (retval) |v| v else default_error,
+                else => inline for (invalid_values) |invalid_value| {
+                    const IV = @TypeOf(invalid_value);
+                    switch (@typeInfo(IV)) {
+                        .@"fn" => |f| {
+                            if (f.params.len != 1) @compileError("Function accepting one argument expected");
+                            if (f.return_type != bool) @compileError("Function returning bool expected");
+                            if (f.params[0].type == T)
+                                break if (invalid_value(retval)) default_error else retval;
+                        },
+                        else => if (T == IV) {
+                            break if (retval == invalid_value) default_error else retval;
+                        },
+                    }
+                } else @compileError("Unable to determine validity of '" ++ @typeName(T) ++ "'"),
             };
         }
     };
@@ -455,6 +497,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 },
                 .pointer => switch (@typeInfo(AT)) {
                     .pointer => @ptrCast(arg),
+                    .optional => if (arg) |a| convert(T, a) else null,
                     // converting "pass-by-value" to "pass-by-pointer"
                     else => convert(T, &arg),
                 },
@@ -1090,7 +1133,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateParameter(self: *@This(), param: Parameter, is_pointer_target: bool, is_inout: bool) !Parameter {
+        fn translateParameter(self: *@This(), param: Parameter, is_pointer_target: bool, is_inout: bool, is_optional: ?bool) !Parameter {
             const new_name = if (param.name) |n| try self.transformName(n, .param) else null;
             const param_type = swap: {
                 switch (param.type.*) {
@@ -1110,12 +1153,25 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 }
                 break :swap param.type;
             };
-            const new_type = try self.translateType(param_type, false);
+            const base_type = try self.translateType(param_type, false);
+            const new_type = try self.changeOptionality(base_type, is_optional);
             return .{
                 .name = new_name,
                 .type = new_type,
                 .is_inout = is_inout,
             };
+        }
+
+        fn changeOptionality(self: *@This(), t: *Type, is_optional: ?bool) !*Type {
+            if (is_optional orelse return t) {
+                if (t.* == .pointer and t.pointer.is_optional) return t;
+                return self.createType(.{ .optional = t });
+            } else {
+                if (t.* != .pointer or !t.pointer.is_optional) return t;
+                var new_ptr = t.*;
+                new_ptr.pointer.is_optional = false;
+                return self.createType(new_ptr);
+            }
         }
 
         fn translateEnumItem(self: *@This(), item: EnumItem) !EnumItem {
@@ -1315,7 +1371,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
             const arg_count = f.parameters.len + extra - output_types.len;
             for (f.parameters[0..arg_count], 0..) |param, index| {
-                const new_param = try self.translateParameter(param, is_pointer_target, inout_index == index);
+                // only pointer type can be optional
+                const is_optional: ?bool = switch (param.type.*) {
+                    .pointer => |p| check: {
+                        const type_name = try self.obtainTypeName(p.child_type, .old);
+                        break :check options.param_is_optional_fn(fn_name, param.name, index, type_name);
+                    },
+                    else => false,
+                };
+                const is_inout = inout_index == index;
+                const new_param = try self.translateParameter(param, is_pointer_target, is_inout, is_optional);
                 try self.append(&new_params, new_param);
             }
             const payload_type = switch (output_types.len) {
