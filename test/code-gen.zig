@@ -590,3 +590,40 @@ test "CodeGenerator (lambda)" {
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());
 }
+
+test "CodeGenerator (mu)" {
+    const ns = struct {
+        const prefix = "mu_";
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"."},
+        .header_paths = &.{"mu.c"},
+        .c_error_values = &.{
+            .{ .type = "mu_handle", .name = "INVALID_HANDLE" },
+        },
+        .filter_fn = ns.filter,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    try generator.analyze();
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "mu.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}

@@ -13,7 +13,7 @@ pub const CodeGeneratorOptions = struct {
     translater: []const u8 = "c_to_zig",
     error_set: []const u8 = "Error",
     c_error_type: ?[]const u8 = null,
-    c_error_values: ?[]ErrorValue = null,
+    c_error_values: ?[]const ErrorValue = null,
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
     add_simple_test: bool = true,
@@ -175,10 +175,18 @@ pub fn BasicErrorScheme(
 }
 pub fn InvalidReturnValueScheme(
     invalid_values: anytype,
-    default_error: anyerror,
+    error_set: type,
+    default_error: error_set,
 ) type {
     return struct {
-        pub const ErrorSet = @TypeOf(default_error);
+        pub const ErrorSet = error_set;
+
+        pub fn RetvalSubstitute(comptime T: type) type {
+            return switch (@typeInfo(T)) {
+                .pointer => ?T,
+                else => T,
+            };
+        }
 
         pub fn OutputType(comptime T: type) type {
             return switch (@typeInfo(T)) {
@@ -235,7 +243,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             // look for non-const pointers, scanning backward
             const OutputTypes = init: {
                 var types: [old_fn.params.len + extra]type = undefined;
-                if (extra == 1) types[old_fn.params.len] = NewRT;
+                if (extra == 1) types[old_fn.params.len] = options.error_scheme.OutputType(NewRT);
                 const start_index = inline for (0..old_fn.params.len) |j| {
                     const i = old_fn.params.len - j - 1;
                     const Target = WritableTarget(old_fn.params[i].type.?) orelse break i + 1;
@@ -545,10 +553,11 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         fn RetvalSubstitute(comptime T: type, tuple: anytype) type {
+            const NewRT = Substitute(T, tuple, null, 0);
             return if (@hasDecl(options.error_scheme, "RetvalSubstitute"))
-                options.error_scheme.RetvalSubstitute(T)
+                options.error_scheme.RetvalSubstitute(NewRT)
             else
-                Substitute(T, tuple, null, 0);
+                NewRT;
         }
 
         fn WritableTarget(comptime T: type) ?type {
@@ -701,8 +710,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         new_root: *Type,
         new_namespace: Namespace,
         new_error_set: *Type,
-        error_enums: []const []const u8,
-        non_error_enums: []const []const u8,
+        non_error_enum_count: usize,
         void_type: *Type,
         type_lookup: ?*Type,
         write_to_byte_array: bool,
@@ -725,8 +733,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.new_root = try self.createType(.{ .container = .{ .kind = "struct" } });
             self.new_namespace = .init(self.allocator);
             self.new_error_set = try self.createType(.{ .error_set = &.{} });
-            self.error_enums = &.{};
-            self.non_error_enums = &.{};
+            self.non_error_enum_count = 0;
             self.void_type = try self.createType(.{ .expression = .{ .identifier = "void" } });
             self.type_lookup = null;
             self.write_to_byte_array = false;
@@ -1001,9 +1008,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateDeclarations(self: *@This()) !void {
-            // add error set first
-            try self.deriveErrorSet();
-            if (getErrorType() != null) {
+            if (options.c_error_type != null or options.c_error_values != null) {
+                // add error set first
+                try self.deriveErrorSet();
                 try self.append(&self.new_root.container.decls, .{
                     .name = options.error_set,
                     .expr = .{ .type = self.new_error_set },
@@ -1360,9 +1367,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(fn_name, t);
             const status_type = try self.translateType(f.return_type, false);
             const extra: usize = switch (return_error_union) {
-                true => switch (self.non_error_enums.len > 1) {
-                    true => if (self.shouldIgnoreNonErrorRetval(fn_name, t)) 0 else 1,
-                    false => 0,
+                true => switch (self.shouldIgnoreNonErrorRetval(fn_name, t)) {
+                    true => 0,
+                    false => switch (self.isReturningStatus(t)) {
+                        true => if (self.non_error_enum_count > 1) 1 else 0,
+                        false => 1,
+                    },
                 },
                 false => if (isVoid(f.return_type)) 0 else 1,
             };
@@ -1437,12 +1447,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (output_types, 0..) |new_ot, i| {
                 const ot, const index = switch (offset + i < t.function.parameters.len) {
                     true => .{ t.function.parameters[offset + i].type.pointer.child_type, offset + i },
-                    false => switch (return_type.*) {
-                        // if an error union is return, then the extra return is the status
-                        // which doesn't require substitution
-                        .error_union => continue,
-                        else => .{ t.function.return_type, null },
-                    },
+                    false => if (self.non_error_enum_count > 1 and return_type.* == .error_union)
+                        // if an error union is returned and there're multiple enum positive statuses, then
+                        // the extra output is the status, which doesn't require substitution
+                        continue
+                    else
+                        .{ t.function.return_type, null },
                 };
                 if (!try self.addGlobalSubstitute(ot, new_ot)) {
                     const type_name = try self.obtainTypeName(new_ot, .new);
@@ -1610,7 +1620,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn getErrorType() ?[]const u8 {
+        fn getErrorEnumType() ?[]const u8 {
             const name = options.c_error_type orelse return null;
             return if (std.mem.eql(u8, name, "int"))
                 "c_int"
@@ -1621,17 +1631,31 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn isReturningStatus(self: *@This(), t: *Type) bool {
-            const err_type = getErrorType() orelse return false;
+            const err_type = getErrorEnumType() orelse return false;
             const name = self.obtainTypeName(t.function.return_type, .old) catch return false;
             return std.mem.eql(u8, err_type, name);
         }
 
+        fn isReturningInvalidValue(self: *@This(), t: *Type) bool {
+            const values = options.c_error_values orelse return false;
+            const rt = t.function.return_type;
+            // C pointers can be null, so they are considered potentially invalid values
+            if (rt.* == .pointer) return true;
+            const name = self.obtainTypeName(rt, .old) catch return false;
+            return for (values) |value| {
+                if (std.mem.eql(u8, value.type, name)) break true;
+            } else false;
+        }
+
         fn shouldReturnErrorUnion(self: *@This(), fn_name: []const u8, t: *Type) bool {
-            return self.isReturningStatus(t) and options.error_union_is_returned_fn(fn_name);
+            return if (self.isReturningStatus(t) or self.isReturningInvalidValue(t))
+                options.error_union_is_returned_fn(fn_name)
+            else
+                false;
         }
 
         fn shouldIgnoreNonErrorRetval(self: *@This(), fn_name: []const u8, t: *Type) bool {
-            return if (self.non_error_enums.len > 1 and self.isReturningStatus(t))
+            return if (self.non_error_enum_count > 1 and self.isReturningStatus(t))
                 !options.status_is_returned_fn(fn_name)
             else
                 false;
@@ -1639,20 +1663,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn deriveErrorSet(self: *@This()) !void {
             var names: [][]const u8 = &.{};
-            var errors: [][]const u8 = &.{};
-            var non_errors: [][]const u8 = &.{};
-            const error_type = getErrorType() orelse return;
-            if (self.old_namespace.getType(error_type)) |t| {
-                if (t.* == .enumeration) {
-                    for (t.enumeration.items) |item| {
-                        if (options.enum_is_error_fn(item.name, item.value)) {
-                            const err_name = try self.transformName(item.name, .@"error");
-                            try self.append(&names, err_name);
-                            const en_name = try self.transformName(item.name, .@"enum");
-                            try self.append(&errors, en_name);
-                        } else {
-                            const en_name = try self.transformName(item.name, .@"enum");
-                            try self.append(&non_errors, en_name);
+            if (getErrorEnumType()) |enum_name| {
+                if (self.old_namespace.getType(enum_name)) |t| {
+                    if (t.* == .enumeration) {
+                        for (t.enumeration.items) |item| {
+                            if (options.enum_is_error_fn(item.name, item.value)) {
+                                const err_name = try self.transformName(item.name, .@"error");
+                                try self.append(&names, err_name);
+                            } else self.non_error_enum_count += 1;
                         }
                     }
                 }
@@ -1663,8 +1681,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (!has_unexpected) try self.append(&names, "Unexpected");
             self.new_error_set.error_set = names;
             try self.new_namespace.addType(options.error_set, self.new_error_set);
-            self.error_enums = errors;
-            self.non_error_enums = non_errors;
         }
 
         fn obtainTranslateCall(
@@ -1989,21 +2005,53 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printErrorScheme(self: *@This()) !void {
-            const error_type = getErrorType() orelse {
+            if (getErrorEnumType()) |enum_name| {
+                const old_enum_t = self.old_namespace.getType(enum_name) orelse {
+                    std.debug.print("Unable to find enum type '{s}'\n", .{enum_name});
+                    return error.Unexpected;
+                };
+                const new_enum_t = try self.translateType(old_enum_t, false);
+                const new_enum_name = try self.obtainTypeName(new_enum_t, .new);
+                try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, {s}.Unexpected),\n", .{
+                    new_enum_name,
+                    options.error_set,
+                    options.error_set,
+                });
+            } else if (options.c_error_values) |values| {
+                if (values.len == 0) {
+                    try self.printFmt(".error_scheme = api_translator.InvalidReturnValueScheme(.{{}}, {s}, {s}.Unexpected),\n", .{
+                        options.error_set,
+                        options.error_set,
+                    });
+                } else {
+                    try self.printTxt(".error_scheme = api_translator.InvalidReturnValueScheme(.{{\n");
+                    for (values) |value| {
+                        const old_t = self.old_namespace.getType(value.type) orelse {
+                            std.debug.print("Unable to find type '{s}'\n", .{value.type});
+                            return error.Unexpected;
+                        };
+                        const new_t = try self.translateType(old_t, false);
+                        const new_type_name = try self.obtainTypeName(new_t, .new);
+                        const is_c_name = for (self.old_root.container.decls) |decl| {
+                            if (std.mem.eql(u8, decl.name, value.name)) break true;
+                        } else false;
+                        const value_ref = if (is_c_name)
+                            try self.allocPrint("{s}.{s}", .{ options.c_import, value.name })
+                        else
+                            value.name;
+                        if (std.mem.eql(u8, value.type, new_type_name))
+                            try self.printFmt("@as({s}, {s}),\n", .{ new_type_name, value_ref })
+                        else
+                            try self.printFmt("@as({s}, @bitCast({s})),\n", .{ new_type_name, value_ref });
+                    }
+                    try self.printFmt("}}, {s}, {s}.Unexpected),\n", .{
+                        options.error_set,
+                        options.error_set,
+                    });
+                }
+            } else {
                 try self.printTxt(".error_scheme = api_translator.NullErrorScheme,\n");
-                return;
-            };
-            const old_enum_t = self.old_namespace.getType(error_type) orelse {
-                std.debug.print("Unable to find enum type '{s}'\n", .{error_type});
-                return error.Unexpected;
-            };
-            const new_enum_t = try self.translateType(old_enum_t, false);
-            const enum_name = try self.obtainTypeName(new_enum_t, .new);
-            try self.printFmt(".error_scheme = api_translator.BasicErrorScheme({s}, {s}, {s}.Unexpected),\n", .{
-                enum_name,
-                options.error_set,
-                options.error_set,
-            });
+            }
         }
 
         fn printSimpleTest(self: *@This()) !void {
