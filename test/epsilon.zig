@@ -10,7 +10,6 @@ pub const acceptInt: fn (
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
-    .error_scheme = api_translator.NullErrorScheme,
 });
 
 test {
