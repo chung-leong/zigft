@@ -1691,9 +1691,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn isReturningStatus(self: *@This(), fn_expr: *const Expression) bool {
             const err_type = options.c_error_type orelse return false;
+            const err_type_zig = translateCType(err_type);
             const ret_type = fn_expr.type.function.return_type;
             const name = self.obtainTypeName(ret_type, .old) catch return false;
-            return std.mem.eql(u8, err_type, name);
+            return std.mem.eql(u8, err_type_zig, name);
         }
 
         fn isReturningInvalidValue(self: *@This(), fn_expr: *const Expression) bool {
@@ -1910,12 +1911,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (options.c_error_type) |enum_name| {
                 const fn_ref = try self.createIdentifier("api_translator.BasicErrorScheme", .{});
                 var arguments: []*const Expression = &.{};
-                const zig_value_type = translateCType(enum_name);
-                if (self.old_namespace.getExpression(zig_value_type)) |old_enum| {
+                const enum_type_zig = translateCType(enum_name);
+                if (self.old_namespace.getExpression(enum_type_zig)) |old_enum| {
                     const new_enum = try self.translateExpression(old_enum);
                     try self.append(&arguments, new_enum);
                 } else {
-                    try self.append(&arguments, try self.createIdentifier("{s}", .{zig_value_type}));
+                    try self.append(&arguments, try self.createIdentifier("{s}", .{enum_type_zig}));
                 }
                 const error_set = self.new_namespace.getExpression(options.error_set) orelse
                     return error.Unexpected;
@@ -1933,9 +1934,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 try self.append(&arguments, try self.createIdentifier("{s}.Unexpected", .{options.error_set}));
                 var array_initializers: []*const Expression = &.{};
                 for (values) |value| {
-                    const zig_value_type = translateCType(value.type);
-                    const old_type = self.old_namespace.getExpression(zig_value_type) orelse
-                        try self.createIdentifier("{s}", .{zig_value_type});
+                    const value_type_zig = translateCType(value.type);
+                    const old_type = self.old_namespace.getExpression(value_type_zig) orelse
+                        try self.createIdentifier("{s}", .{value_type_zig});
                     const new_type = try self.translateExpression(old_type);
                     var value_ref = self.old_namespace.getExpression(value.name) orelse
                         try self.createCode("{s}", .{value.name});
