@@ -515,6 +515,10 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 },
                 .optional => |op| switch (@typeInfo(AT)) {
                     .optional => if (arg) |a| convert(op.child, a) else null,
+                    .pointer => |pt| switch (pt.is_allowzero and arg == null) {
+                        false => convert(op.child, arg),
+                        true => null,
+                    },
                     else => convert(op.child, arg),
                 },
                 .@"enum" => @enumFromInt(arg),
@@ -695,6 +699,13 @@ pub const Namespace = struct {
     pub fn addExpression(self: *@This(), name: []const u8, expr: *const Expression) !void {
         try self.to_expr.put(name, expr);
         try self.to_name.put(expr, name);
+    }
+
+    pub fn removeExpression(self: *@This(), expr: *const Expression) void {
+        if (self.to_name.get(expr)) |name| {
+            _ = self.to_expr.remove(name);
+            _ = self.to_name.remove(expr);
+        }
     }
 
     pub fn removeName(self: *@This(), name: []const u8) void {
@@ -1066,33 +1077,36 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
             if (options.c_root_struct) |name| {
                 // use specified type as root (i.e. the namespace of the source file)
-                const t = self.old_namespace.getType(name) orelse {
+                const old_container = self.old_namespace.getExpression(name) orelse {
                     std.debug.print("Unable to find container type '{s}'\n", .{name});
                     return error.Unexpected;
                 };
-                const new_t = self.old_to_new_map.get(t) orelse return error.Unexpected;
-                const new_root = switch (new_t.*) {
-                    .container => new_t,
-                    .pointer => |p| p.child_type,
-                    else => {
-                        std.debug.print("'{s}' is not a container type\n", .{name});
-                        return error.Unexpected;
-                    },
+                const new_container = self.old_to_new_map.get(old_container) orelse return error.Unexpected;
+                const new_root: *Expression = if (self.isTypeOf(new_container, .container))
+                    @constCast(new_container)
+                else if (self.getPointerInfo(new_container)) |p|
+                    @constCast(p.child_type)
+                else {
+                    std.debug.print("'{s}' is not a container type\n", .{name});
+                    return error.Unexpected;
                 };
                 // transfer decls into specified type
-                new_root.container.decls = self.new_root.type.container.decls;
+                new_root.type.container.decls = self.new_root.type.container.decls;
                 self.new_root = new_root;
                 // remove declaration of pointer type, if used to specified the struct
-                if (new_t.* == .pointer) {
-                    for (new_root.container.decls, 0..) |decl, i| {
-                        if (decl.expr == .type and decl.expr.type == new_t) {
-                            self.remove(&new_root.container.decls, i);
-                            self.new_namespace.removeType(new_t);
+                if (self.isPointer(new_container)) {
+                    for (new_root.type.container.decls, 0..) |decl, i| {
+                        if (decl.expr == new_container) {
+                            self.remove(&new_root.type.container.decls, i);
+                            self.new_namespace.removeExpression(new_container);
                             break;
                         }
                     }
                     // can't be optional
-                    new_t.pointer.is_optional = false;
+                    if (self.getTypeInfo(new_container, .optional)) |o| {
+                        const ptr = @constCast(new_container);
+                        ptr.* = o.child_type.*;
+                    }
                 }
             }
             // add translate calls to function declarations
@@ -1231,7 +1245,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateContainer(self: *@This(), expr: *const Expression) !*const Expression {
             const c = expr.type.container;
-            if (std.mem.eql(u8, c.kind, "opaque")) return expr;
             var new_fields: []Field = &.{};
             for (c.fields) |field| {
                 const new_field = try self.translateField(field);
@@ -2264,6 +2277,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt(" = ");
             try self.printExpression(decl.expr, ns);
             try self.printTxt(";\n");
+            if (self.getPointerInfo(decl.expr)) |p| {
+                if (self.new_namespace.getName(p.child_type) == null) {
+                    // target is not in namespace, make it accessible through the parent type
+                    const ref = if (self.isTypeOf(decl.expr, .optional))
+                        try self.allocPrint("@typeInfo(@typeInfo({s}).optional.child).pointer.child", .{decl.name})
+                    else
+                        try self.allocPrint("@typeInfo({s}).pointer.child", .{decl.name});
+                    try self.new_namespace.addExpression(ref, p.child_type);
+                }
+            }
         }
 
         fn printSimpleTest(self: *@This()) !void {
