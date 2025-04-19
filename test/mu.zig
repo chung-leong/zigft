@@ -14,7 +14,7 @@ pub const getVoidPtr: fn (
 
 pub const getIntPtr: fn (
     arg: bool,
-) Error!*Handle = c_to_zig.translate("mu_get_int_ptr", true, false, .{});
+) Error!*c_int = c_to_zig.translate("mu_get_int_ptr", true, false, .{});
 
 pub const Handle = c_int;
 
@@ -26,11 +26,11 @@ const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
         .{ .old = ?*anyopaque, .new = *anyopaque },
-        .{ .old = [*c]Handle, .new = *Handle },
+        .{ .old = [*c]c_int, .new = *c_int },
     },
-    .error_scheme = api_translator.InvalidReturnValueScheme(.{
-        @as(Handle, @bitCast(c.INVALID_HANDLE)),
-    }, Error, Error.Unexpected),
+    .error_scheme = api_translator.InvalidReturnValueScheme(Error, Error.Unexpected, .{
+        @as(Handle, c.INVALID_HANDLE),
+    }),
 });
 
 test {

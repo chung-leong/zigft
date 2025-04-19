@@ -731,6 +731,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         cwd: []const u8,
         indent_level: usize,
         indented: bool,
+        close_bracket_stack: std.ArrayList([]const u8),
         old_root: *Expression,
         old_namespace: Namespace,
         old_to_new_map: std.AutoHashMap(*const Expression, *const Expression),
@@ -752,6 +753,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.cwd = try std.process.getCwdAlloc(self.allocator);
             self.indent_level = 0;
             self.indented = false;
+            self.close_bracket_stack = .init(self.allocator);
             self.old_root = try self.createType(.{
                 .container = .{ .kind = "struct" },
             });
@@ -1701,7 +1703,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const values = options.c_error_values orelse return false;
             const ret_type = fn_expr.type.function.return_type;
             // C pointers can be null, so they are considered potentially invalid values
-            if (self.isTypeOf(ret_type, .pointer)) return true;
+            if (self.isPointer(ret_type)) return true;
             const name = self.obtainTypeName(ret_type, .old) catch return false;
             return for (values) |value| {
                 if (std.mem.eql(u8, value.type, name)) break true;
@@ -2273,9 +2275,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printFmt(self: *@This(), comptime fmt: []const u8, args: anytype) anyerror!void {
-            if (std.mem.startsWith(u8, fmt, "}") or std.mem.startsWith(u8, fmt, ")")) {
-                if (self.indent_level > 0)
+            if (self.close_bracket_stack.getLastOrNull()) |close_bracket| {
+                if (std.mem.startsWith(u8, fmt, close_bracket)) {
                     self.indent_level -= 1;
+                    _ = self.close_bracket_stack.pop();
+                }
             }
             if (self.indent_level > 0 and !self.indented) {
                 for (0..self.indent_level) |_| {
@@ -2284,7 +2288,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 self.indented = true;
             }
             try self.write(fmt, args);
-            if (std.mem.endsWith(u8, fmt, "{\n") or std.mem.endsWith(u8, fmt, "(\n")) {
+            if (std.mem.endsWith(u8, fmt, "{\n")) {
+                try self.close_bracket_stack.append("}");
+                self.indent_level += 1;
+            } else if (std.mem.endsWith(u8, fmt, "(\n")) {
+                try self.close_bracket_stack.append(")");
                 self.indent_level += 1;
             }
             if (std.mem.endsWith(u8, fmt, "\n")) {
