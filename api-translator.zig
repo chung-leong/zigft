@@ -1796,11 +1796,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .value = try self.createCode("{d}", .{pair.len_index}),
                     });
                     try self.append(&slice_initializers, try self.createExpression(.{
-                        .struct_init = .{ .initializers = sub_initializers },
+                        .struct_init = .{ .initializers = slice_inits },
                     }));
                 }
                 try self.append(&arguments, try self.createExpression(.{
-                    .array_init = .{ .initializers = slice_initializers, .is_multiline = true },
+                    .array_init = .{
+                        .initializers = slice_initializers,
+                        .is_multiline = true,
+                        .is_reference = true,
+                    },
                 }));
             }
             return try self.createExpression(.{
@@ -1977,7 +1981,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.write_to_byte_array = true;
             defer self.write_to_byte_array = false;
             self.byte_array.clearRetainingCapacity();
-            self.printExpression(expr, ns) catch {};
+            self.printRef(expr, ns) catch {};
             return try self.allocator.dupe(u8, self.byte_array.items);
         }
 

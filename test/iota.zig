@@ -34,7 +34,6 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = ?*const anyopaque, .new = *const anyopaque },
         .{ .old = [*c]const u8, .new = [*:0]const u8 },
     },
-    .error_scheme = api_translator.NullErrorScheme,
 });
 
 test {
