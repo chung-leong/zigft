@@ -5,16 +5,19 @@ const expectEqual = std.testing.expectEqual;
 
 test "setString" {
     iota.setString("Hello world");
-    const len1 = iota.getStringLen();
-    try expectEqual(11, len1);
-    const c1 = iota.getChar(6);
-    try expectEqual('w', c1);
+    const len = iota.getStringLen();
+    try expectEqual(11, len);
+    const c = iota.getChar(6);
+    try expectEqual('w', c);
+}
+
+test "setBytes" {
     iota.setBytes("Hello world");
-    const len2 = iota.getByteLen();
-    try expectEqual(11, len2);
-    const c2 = iota.getByte(7);
-    try expectEqual('o', c2);
+    const len1 = iota.getByteLen();
+    try expectEqual(11, len1);
+    const c = iota.getByte(7);
+    try expectEqual('o', c);
     iota.setBytes(null);
-    const len3 = iota.getByteLen();
-    try expectEqual(0, len3);
+    const len2 = iota.getByteLen();
+    try expectEqual(0, len2);
 }

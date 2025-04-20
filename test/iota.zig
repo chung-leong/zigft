@@ -31,7 +31,6 @@ pub const getByteLen: fn () usize = c_to_zig.translate("iota_get_byte_len", fals
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
-        .{ .old = ?*const anyopaque, .new = ?[]const u8 },
         .{ .old = [*c]const u8, .new = [*:0]const u8 },
     },
 });

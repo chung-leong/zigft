@@ -247,7 +247,12 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             // look for non-const pointers, scanning backward
             const OutputTypes = init: {
                 var types: [old_fn.params.len + extra]type = undefined;
-                if (extra == 1) types[old_fn.params.len] = options.error_scheme.OutputType(NewRT);
+                if (extra == 1) {
+                    types[old_fn.params.len] = if (return_error_union)
+                        options.error_scheme.OutputType(NewRT)
+                    else
+                        NewRT;
+                }
                 const start_index = inline for (0..old_fn.params.len) |j| {
                     const i = old_fn.params.len - j - 1;
                     const Target = WritableTarget(old_fn.params[i].type.?) orelse break i + 1;
@@ -1567,15 +1572,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateSlicePointer(self: *@This(), expr: *const Expression) !*const Expression {
-            var new_expr = expr.*;
-            if (self.getPointerInfo(&new_expr)) |const_p| {
-                const p = @constCast(const_p);
-                p.size = .slice;
-                p.sentinel = null;
-                if (self.isOpaque(p.child_type))
-                    p.child_type = try self.createIdentifier("u8", .{});
-            }
-            return try self.createExpression(new_expr);
+            if (self.getPointerInfo(expr)) |p| {
+                var new_p = p.*;
+                new_p.size = .slice;
+                new_p.sentinel = null;
+                if (self.isOpaque(new_p.child_type))
+                    new_p.child_type = try self.createIdentifier("u8", .{});
+                var new_type = try self.createType(.{ .pointer = new_p });
+                if (self.isTypeOf(expr, .optional))
+                    new_type = try self.createType(.{ .optional = .{ .child_type = new_type } });
+                return new_type;
+            } else return error.Unexpected;
         }
 
         fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
