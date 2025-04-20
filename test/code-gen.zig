@@ -468,6 +468,10 @@ test "CodeGenerator (iota)" {
             if (std.mem.eql(u8, param_type, "usize")) return param_index - 1;
             return null;
         }
+
+        fn isParamOptional(fn_name: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?bool {
+            return if (std.mem.eql(u8, fn_name, "iota_set_bytes")) true else null;
+        }
     };
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     var generator: *CodeGenerator(.{
@@ -476,6 +480,7 @@ test "CodeGenerator (iota)" {
         .filter_fn = ns.filter,
         .fn_name_fn = ns.getFnName,
         .param_is_slice_len_fn = ns.isParamSliceLen,
+        .param_is_optional_fn = ns.isParamOptional,
     }) = try .init(gpa.allocator());
     defer generator.deinit();
     try generator.analyze();

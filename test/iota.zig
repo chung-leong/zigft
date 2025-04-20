@@ -17,7 +17,7 @@ pub const getChar: fn (
 pub const getStringLen: fn () usize = c_to_zig.translate("iota_get_string_len", false, false, .{});
 
 pub const setBytes: fn (
-    s: []const u8,
+    s: ?[]const u8,
 ) void = c_to_zig.translateMerge("iota_set_bytes", false, false, .{}, &.{
     .{ .ptr_index = 0, .len_index = 1 },
 });
@@ -31,7 +31,7 @@ pub const getByteLen: fn () usize = c_to_zig.translate("iota_get_byte_len", fals
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
-        .{ .old = ?*const anyopaque, .new = *const anyopaque },
+        .{ .old = ?*const anyopaque, .new = ?[]const u8 },
         .{ .old = [*c]const u8, .new = [*:0]const u8 },
     },
 });

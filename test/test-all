@@ -1,0 +1,3 @@
+#!/bin/bash
+zig test code-gen.zig -lc -I.
+find ./*-test.zig -type f -print0 | sort -z | xargs -L1 -r0 zig test -lc -I.

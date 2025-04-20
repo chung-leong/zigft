@@ -217,7 +217,11 @@ pub fn InvalidReturnValueScheme(
         }
     };
 }
-pub const NullErrorScheme = struct {};
+pub const NullErrorScheme = struct {
+    pub fn OutputType(comptime T: type) type {
+        return T;
+    }
+};
 
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
@@ -522,6 +526,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     else => convert(op.child, arg),
                 },
                 .@"enum" => @enumFromInt(arg),
+                .void => arg,
                 else => @bitCast(arg),
             };
         }
@@ -1026,8 +1031,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             switch (context) {
                 inline else => |tag| {
                     const f = @field(options, @tagName(tag) ++ "_name_fn");
-                    const new_name = try f(self.allocator, name);
-                    if (new_name.len > 0 and new_name[0] == '@') return new_name;
+                    const name_adj = if (std.mem.startsWith(u8, name, "@\"")) name[2 .. name.len - 1] else name;
+                    const new_name = try f(self.allocator, name_adj);
+                    if (std.mem.startsWith(u8, new_name, "@\"")) return new_name;
                     const is_valid = std.zig.isValidId(new_name) and switch (context) {
                         .@"const", .@"fn", .param, .type => !std.zig.primitives.isPrimitive(new_name),
                         else => true,
