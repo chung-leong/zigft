@@ -1614,7 +1614,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         if (isTypeEql(g.old_type, old_type)) {
                             break !isTypeEql(g.new_type, new_type);
                         }
-                    } else !isTypeEql(old_type, new_type);
+                    } else if (index != null) !isTypeEql(old_type, new_type) else false;
                     if (need_sub) {
                         try self.append(&local_subs, .{ .index = index, .type = sub.new_type });
                     }
@@ -1773,6 +1773,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 std.mem.eql(u8, c.kind, "opaque")
             else
                 self.isPrimitive(expr, "anyopaque");
+        }
+
+        fn isAnyPrimitive(self: *@This(), expr: ?*const Expression) bool {
+            if (expr) |e| {
+                if (e.* == .identifier) {
+                    if (std.zig.isPrimitive(e.identifier)) return true;
+                    if (self.old_namespace.getExpression(e.identifier)) |ref_expr|
+                        if (self.isAnyPrimitive(ref_expr)) return true;
+                }
+            }
+            return false;
         }
 
         fn isPrimitive(self: *@This(), expr: ?*const Expression, name: []const u8) bool {
@@ -2183,6 +2194,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.printTxt(options.c_import);
                 } else if (self.new_namespace.getName(expr)) |name| {
                     try self.printFmt("{s}", .{name});
+                } else if (self.isAnyPrimitive(expr)) {
+                    try self.printExpression(expr, ns);
                 } else if (self.old_namespace.getName(expr)) |name| {
                     try self.printFmt("{s}.{s}", .{ options.c_import, name });
                 } else {
