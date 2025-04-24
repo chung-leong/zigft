@@ -43,7 +43,7 @@ pub const CodeGeneratorOptions = struct {
 
     // calling determining whether positive status is needed
     status_is_returned_fn: fn (fn_name: []const u8) bool = neverReturned,
-    // calling determining whether a fucntion should return error union is needed
+    // calling determining whether a fucntion returns an error union
     error_union_is_returned_fn: fn (fn_name: []const u8) bool = alwaysReturned,
 
     // callbacks adjusting naming convention
@@ -708,7 +708,8 @@ pub const Namespace = struct {
 
     pub fn addExpression(self: *@This(), name: []const u8, expr: *const Expression) !void {
         try self.to_expr.put(name, expr);
-        try self.to_name.put(expr, name);
+        if (self.to_name.get(expr) == null)
+            try self.to_name.put(expr, name);
     }
 
     pub fn removeExpression(self: *@This(), expr: *const Expression) void {
@@ -746,6 +747,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             @"enum",
             @"error",
         };
+        const Substitution = struct {
+            old_type: *const Expression,
+            new_type: *const Expression,
+            is_inout: bool = false,
+        };
 
         arena: std.heap.ArenaAllocator,
         allocator: std.mem.Allocator,
@@ -756,11 +762,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         old_root: *Expression,
         old_namespace: Namespace,
         old_to_new_map: std.AutoHashMap(*const Expression, *const Expression),
-        old_to_new_param_map: std.AutoHashMap(*const Expression, *const Expression),
         new_root: *Expression,
         new_namespace: Namespace,
         new_error_set: *const Expression,
         non_error_enum_count: usize,
+        anonymous_type_count: usize,
         write_to_byte_array: bool,
         byte_array: std.ArrayList(u8),
         output_writer: std.io.AnyWriter,
@@ -780,12 +786,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
             self.old_namespace = .init(self.allocator);
             self.old_to_new_map = .init(self.allocator);
-            self.old_to_new_param_map = .init(self.allocator);
             self.new_root = try self.createType(.{
                 .container = .{ .kind = "struct" },
             });
             self.new_namespace = .init(self.allocator);
             self.non_error_enum_count = 0;
+            self.anonymous_type_count = 0;
             self.write_to_byte_array = false;
             self.byte_array = .init(self.allocator);
             self.need_inout_import = false;
@@ -1120,6 +1126,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }
                 }
             }
+            // look for global substitutions
+            const global_subs = try self.findGlobalSubstutions();
             // add translate calls to function declarations
             for (self.new_root.type.container.decls) |*new_decl| {
                 if (self.isTypeOf(new_decl.type, .function)) {
@@ -1133,7 +1141,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     } else unreachable;
                     const return_error_union = self.shouldReturnErrorUnion(fn_name, t);
                     const ignore_non_error_return_value = self.shouldIgnoreNonErrorRetval(fn_name, t);
-                    const local_subs = try self.findLocalSubstitutions(t, new_type);
+                    const local_subs = try self.findLocalSubstitutions(t, new_type, global_subs);
                     const split_slices = try self.findSplitSlices(t, new_type);
                     // get translate() or translateMerge() call
                     new_decl.expr = try self.obtainTranslateCall(
@@ -1159,7 +1167,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.append(&self.new_root.type.container.decls, .{
                 .public = false,
                 .name = options.translater,
-                .expr = try self.obtainTranslatorSetup(),
+                .expr = try self.obtainTranslatorSetup(global_subs),
             });
         }
 
@@ -1476,31 +1484,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
-        fn findLocalSubstitutions(
+        fn findSubstitutions(
             self: *@This(),
             old_fn: *const Expression,
             new_fn: *const Expression,
-        ) ![]LocalSubstitution {
-            var local_subs: []LocalSubstitution = &.{};
+        ) ![]const Substitution {
+            var subs: []Substitution = &.{};
             for (new_fn.type.function.parameters, 0..) |new_param, index| {
-                // we need to do local substitution when the new type cannot be derived through
-                // the global substitution table
                 const param = old_fn.type.function.parameters[index];
-                if (param.is_inout) {
-                    var inout_arguments: []*const Expression = &.{};
-                    try self.append(&inout_arguments, new_param.type);
-                    const inout_type = try self.createExpression(.{
-                        .function_call = .{
-                            .fn_ref = try self.createIdentifier("inout", .{}),
-                            .arguments = inout_arguments,
-                        },
-                    });
-                    try self.append(&local_subs, .{ .index = index, .type = inout_type });
-                } else if (!try self.addGlobalSubstitute(param.type, new_param.type)) {
-                    try self.append(&local_subs, .{ .index = index, .type = new_param.type });
-                }
+                try self.append(&subs, .{
+                    .old_type = param.type,
+                    .new_type = new_param.type,
+                    .is_inout = new_param.is_inout,
+                });
             }
-            // add substitutes of return types
             const return_type = new_fn.type.function.return_type;
             const output_types: []const *const Expression = get: {
                 if (self.getTypeInfo(return_type, .error_union)) |eu| {
@@ -1518,19 +1515,110 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const offset = new_fn.type.function.parameters.len;
             for (output_types, 0..) |new_ot, i| {
                 // look for pointer arguments in original function
-                const ot, const index = if (offset + i < old_fn.type.function.parameters.len) .{
-                    self.getPointerTarget(old_fn.type.function.parameters[offset + i].type).?,
-                    offset + i,
-                } else if (self.non_error_enum_count > 1 and self.isTypeOf(return_type, .error_union)) {
+                const ot = if (offset + i < old_fn.type.function.parameters.len)
+                    self.getPointerTarget(old_fn.type.function.parameters[offset + i].type).?
+                else if (self.non_error_enum_count > 1 and self.isTypeOf(return_type, .error_union))
                     // if an error union is returned and there're multiple enum positive statuses, then
                     // the extra output is the status, which doesn't require substitution
-                    continue;
-                } else .{
-                    old_fn.type.function.return_type,
-                    null,
-                };
-                if (!try self.addGlobalSubstitute(ot, new_ot))
-                    try self.append(&local_subs, .{ .index = index, .type = new_ot });
+                    continue
+                else
+                    old_fn.type.function.return_type;
+                try self.append(&subs, .{ .old_type = ot, .new_type = new_ot });
+            }
+            return subs;
+        }
+
+        fn findGlobalSubstutions(self: *@This()) ![]const Substitution {
+            var iterator = self.old_to_new_map.iterator();
+            const SubCount = struct {
+                sub: Substitution,
+                score: usize,
+            };
+            var global_substitution_counts: []SubCount = &.{};
+            while (iterator.next()) |entry| {
+                if (entry.key_ptr.*.* == .type and entry.key_ptr.*.type == .function) {
+                    const old_fn = entry.key_ptr.*;
+                    const new_fn = entry.value_ptr.*;
+                    const subs = try self.findSubstitutions(old_fn, new_fn);
+                    for (subs) |sub| {
+                        if (sub.is_inout) continue;
+                        if (self.isTypeOf(sub.old_type, .enumeration)) continue;
+                        const old_type = self.resolveType(sub.old_type, .old);
+                        const new_type = self.resolveType(sub.new_type, .new);
+                        for (global_substitution_counts) |*e| {
+                            if (isTypeEql(e.sub.old_type, old_type)) {
+                                if (isTypeEql(e.sub.new_type, new_type)) {
+                                    e.score += 1;
+                                    break;
+                                }
+                            }
+                        } else {
+                            if (self.isAnonymousType(new_type)) {
+                                // can't substitute with an anonymous type; need a declared type
+                                try self.declareAnonymousType(new_type);
+                            }
+                            try self.append(&global_substitution_counts, .{
+                                .sub = .{
+                                    .old_type = old_type,
+                                    .new_type = new_type,
+                                },
+                                // favor non-optional types in the global substitution table
+                                .score = if (self.isTypeOf(new_type, .optional)) 0 else 1000,
+                            });
+                        }
+                    }
+                }
+            }
+            std.mem.sort(SubCount, global_substitution_counts, {}, struct {
+                fn compare(_: void, lhs: SubCount, rhs: SubCount) bool {
+                    return lhs.score > rhs.score;
+                }
+            }.compare);
+            var global_subs: []Substitution = &.{};
+            for (global_substitution_counts) |*e| {
+                for (global_subs) |sub| {
+                    if (isTypeEql(sub.old_type, e.sub.old_type)) break;
+                } else {
+                    try self.append(&global_subs, e.sub);
+                }
+            }
+            return global_subs;
+        }
+
+        fn findLocalSubstitutions(
+            self: *@This(),
+            old_fn: *const Expression,
+            new_fn: *const Expression,
+            global_subs: []const Substitution,
+        ) ![]LocalSubstitution {
+            var local_subs: []LocalSubstitution = &.{};
+            const subs = try self.findSubstitutions(old_fn, new_fn);
+            for (subs, 0..) |sub, i| {
+                // we need to do local substitution when the new type cannot be derived through
+                // the global substitution table
+                const index = if (i < old_fn.type.function.parameters.len) i else null;
+                if (sub.is_inout) {
+                    var inout_arguments: []*const Expression = &.{};
+                    try self.append(&inout_arguments, sub.new_type);
+                    const inout_type = try self.createExpression(.{
+                        .function_call = .{
+                            .fn_ref = try self.createIdentifier("inout", .{}),
+                            .arguments = inout_arguments,
+                        },
+                    });
+                    try self.append(&local_subs, .{ .index = index, .type = inout_type });
+                } else {
+                    const old_type = self.resolveType(sub.old_type, .old);
+                    const new_type = self.resolveType(sub.new_type, .new);
+                    const need_sub = for (global_subs) |g| {
+                        if (isTypeEql(g.old_type, old_type)) {
+                            break !isTypeEql(g.new_type, new_type);
+                        }
+                    } else !isTypeEql(old_type, new_type);
+                    if (need_sub) {
+                        try self.append(&local_subs, .{ .index = index, .type = sub.new_type });
+                    }
+                }
             }
             return local_subs;
         }
@@ -1624,25 +1712,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn addGlobalSubstitute(
-            self: *@This(),
-            old_type: *const Expression,
-            new_type: *const Expression,
-        ) !bool {
-            if (new_type == old_type) return true;
-            if (new_type.* == .identifier) {
-                if (std.zig.isPrimitive(new_type.identifier)) return true;
-            }
-            if (!self.isTypeOf(old_type, .enumeration)) {
-                const result = try self.old_to_new_param_map.getOrPut(old_type);
-                if (!result.found_existing) {
-                    result.value_ptr.* = new_type;
-                    return true;
-                }
-            }
-            return false;
-        }
-
         fn TypeInfo(comptime tag: Expression.Type.Tag) type {
             return switch (tag) {
                 inline else => |t| @FieldType(Expression.Type, @tagName(t)),
@@ -1717,6 +1786,36 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return false;
         }
 
+        fn isAnonymousType(self: *@This(), expr: ?*const Expression) bool {
+            if (expr) |e| {
+                if (e == self.new_root) return false;
+                if (self.new_namespace.getName(e) == null) {
+                    return switch (e.*) {
+                        .type => switch (e.type) {
+                            inline .pointer, .optional => |p| self.isAnonymousType(p.child_type),
+                            else => true,
+                        },
+                        .identifier => |i| !std.zig.primitives.isPrimitive(i),
+                        else => true,
+                    };
+                }
+            }
+            return false;
+        }
+
+        fn declareAnonymousType(self: *@This(), expr: *const Expression) !void {
+            var base_type = expr;
+            if (self.getPointerInfo(expr)) |p| base_type = p.child_type;
+            const name = try self.allocPrint("Anonymous{d:04}", .{self.anonymous_type_count});
+            self.anonymous_type_count += 1;
+            try self.append(&self.new_root.type.container.decls, .{
+                .public = false,
+                .name = name,
+                .expr = base_type,
+            });
+            try self.new_namespace.addExpression(name, base_type);
+        }
+
         fn isReturningStatus(self: *@This(), fn_expr: *const Expression) bool {
             const err_type = options.c_error_type orelse return false;
             const err_type_zig = translateCType(err_type);
@@ -1734,6 +1833,48 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return for (values) |value| {
                 if (std.mem.eql(u8, value.type, name)) break true;
             } else false;
+        }
+
+        fn resolveType(self: *@This(), expr: *const Expression, ns: NamespaceType) *const Expression {
+            if (expr.* != .identifier) return expr;
+            const namespace = if (ns == .new) self.new_namespace else self.old_namespace;
+            if (namespace.getExpression(expr.identifier)) |ref_expr| {
+                return self.resolveType(ref_expr, ns);
+            }
+            return expr;
+        }
+
+        fn isTypeEql(expr1: *const Expression, expr2: *const Expression) bool {
+            if (expr1 == expr2) return true;
+            if (expr1.* == .type and expr2.* == .type) {
+                switch (expr1.type) {
+                    .pointer => |p1| switch (expr2.type) {
+                        .pointer => |p2| {
+                            if (!isTypeEql(p1.child_type, p2.child_type)) return false;
+                            if (!std.meta.eql(p1.alignment, p2.alignment)) return false;
+                            if (!std.meta.eql(p1.sentinel, p2.sentinel)) return false;
+                            if (p1.size != p2.size) return false;
+                            if (p1.is_const != p2.is_const) return false;
+                            if (p1.is_volatile != p2.is_volatile) return false;
+                            if (p1.allows_zero != p2.allows_zero) return false;
+                            return true;
+                        },
+                        else => return false,
+                    },
+                    .optional => |o1| switch (expr2.type) {
+                        .optional => |o2| {
+                            if (!isTypeEql(o1.child_type, o2.child_type)) return false;
+                            return true;
+                        },
+                        else => return false,
+                    },
+                    else => return false,
+                }
+            } else if (expr1.* == .identifier and expr2.* == .identifier) {
+                return std.mem.eql(u8, expr1.identifier, expr2.identifier);
+            } else {
+                return false;
+            }
         }
 
         fn shouldReturnErrorUnion(
@@ -1841,7 +1982,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
-        fn obtainTranslatorSetup(self: *@This()) !*const Expression {
+        fn obtainTranslatorSetup(self: *@This(), global_subs: []const Substitution) !*const Expression {
             const translator_fn_ref = try self.createIdentifier("api_translator.Translator", .{});
             var arguments: []*const Expression = &.{};
             var translator_options: []Expression.StructInit.Initializer = &.{};
@@ -1849,7 +1990,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .name = "c_import_ns",
                 .value = try self.createIdentifier(options.c_import, .{}),
             });
-            if (try self.obtainSubstitutions()) |sub_expr| {
+            if (try self.obtainSubstitutions(global_subs)) |sub_expr| {
                 try self.append(&translator_options, .{
                     .name = "substitutions",
                     .value = sub_expr,
@@ -1869,31 +2010,25 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
-        fn obtainSubstitutions(self: *@This()) !?*const Expression {
+        fn obtainSubstitutions(self: *@This(), global_subs: []const Substitution) !?*const Expression {
             const Sub = struct {
                 old_name: []const u8,
-                old_expr: *const Expression,
+                old_type: *const Expression,
                 new_name: []const u8,
-                new_expr: *const Expression,
+                new_type: *const Expression,
             };
+            if (global_subs.len == 0) return null;
             var subs: []Sub = &.{};
-            var added: std.StringHashMap(bool) = .init(self.allocator);
-            var iterator = self.old_to_new_param_map.iterator();
-            while (iterator.next()) |entry| {
-                const old_expr = entry.key_ptr.*;
-                const new_expr = entry.value_ptr.*;
-                const old_name = try self.obtainTypeName(old_expr, .new);
-                if (added.get(old_name) == null) {
-                    const new_name = try self.obtainTypeName(new_expr, .new);
-                    if (!std.mem.eql(u8, old_name, new_name)) {
-                        try self.append(&subs, .{
-                            .old_name = old_name,
-                            .old_expr = old_expr,
-                            .new_name = new_name,
-                            .new_expr = new_expr,
-                        });
-                        try added.put(old_name, true);
-                    }
+            for (global_subs) |sub| {
+                const old_name = try self.obtainTypeName(sub.old_type, .new);
+                const new_name = try self.obtainTypeName(sub.new_type, .new);
+                if (!std.mem.eql(u8, old_name, new_name)) {
+                    try self.append(&subs, .{
+                        .old_name = old_name,
+                        .old_type = sub.old_type,
+                        .new_name = new_name,
+                        .new_type = sub.new_type,
+                    });
                 }
             }
             std.mem.sort(Sub, subs, {}, struct {
@@ -1908,12 +2043,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     };
                 }
             }.compare);
-            if (subs.len == 0) return null;
             var slice_initializers: []*const Expression = &.{};
             for (subs) |sub| {
                 var struct_initializers: []Expression.StructInit.Initializer = &.{};
-                try self.append(&struct_initializers, .{ .name = "old", .value = sub.old_expr });
-                try self.append(&struct_initializers, .{ .name = "new", .value = sub.new_expr });
+                try self.append(&struct_initializers, .{ .name = "old", .value = sub.old_type });
+                try self.append(&struct_initializers, .{ .name = "new", .value = sub.new_type });
                 try self.append(&slice_initializers, try self.createExpression(.{
                     .struct_init = .{ .initializers = struct_initializers },
                 }));
