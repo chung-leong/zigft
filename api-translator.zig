@@ -592,6 +592,7 @@ pub const Expression = union(enum) {
     array_init: ArrayInit,
     struct_init: StructInit,
     function_call: FunctionCall,
+    function_body: []const u8,
 
     pub const Type = union(enum) {
         container: Container,
@@ -841,7 +842,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.append(&self.old_root.type.container.decls, .{
                 .name = fn_name,
                 .type = fn_type,
-                .expr = &.{ .any = "" },
+                .expr = &.{ .function_body = "" },
             });
             try self.old_namespace.addExpression(fn_name, fn_type);
         }
@@ -1078,7 +1079,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     };
                     const new_name = try self.transformName(decl.name, transform);
                     const new_type = if (decl.type) |t| try self.translateExpression(t) else null;
-                    const expr = try self.translateExpression(decl.expr);
+                    const expr = try self.translateDefinition(decl.expr);
                     // don't add declarations for opaques
                     if (self.isOpaque(expr)) continue;
                     try self.new_namespace.addExpression(new_name, expr);
@@ -1171,6 +1172,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             });
         }
 
+        fn translateDefinition(self: *@This(), expr: *const Expression) !*const Expression {
+            if (expr.* == .identifier) {
+                if (options.filter_fn(expr.identifier)) {
+                    // don't dereference the identifier when it's imported into the new namespace
+                    // in a situation where the same type appears under multiple name we want to
+                    // retain the name used in that particular instance
+                    const ref_expr = self.resolveType(expr, .old);
+                    const context: NameContext = switch (ref_expr.*) {
+                        .type => .type,
+                        .function_body => .@"fn",
+                        else => .@"const",
+                    };
+                    const new_name = try self.transformName(expr.identifier, context);
+                    const new_expr = try self.createIdentifier("{s}", .{new_name});
+                    try self.old_to_new_map.put(expr, new_expr);
+                    return new_expr;
+                }
+            }
+            return self.translateExpression(expr);
+        }
+
         fn translateExpression(self: *@This(), expr: *const Expression) std.mem.Allocator.Error!*const Expression {
             return self.translateExpressionEx(expr, false);
         }
@@ -1189,7 +1211,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .function => try self.translateFunction(expr, is_pointer_target),
                         else => expr,
                     },
-                    .identifier => try self.translateIdentifier(expr),
+                    .identifier => try self.translateIdentifier(expr, is_pointer_target),
                     else => expr,
                 };
                 try self.old_to_new_map.put(expr, new_expr);
@@ -1197,9 +1219,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateIdentifier(self: *@This(), expr: *const Expression) !*const Expression {
-            const ref_expr = self.resolveType(expr, .old);
-            return if (ref_expr != expr) try self.translateExpression(ref_expr) else expr;
+        fn translateIdentifier(self: *@This(), expr: *const Expression, is_pointer_target: bool) !*const Expression {
+            return if (self.old_namespace.getExpression(expr.identifier)) |ref_expr|
+                try self.translateExpressionEx(ref_expr, is_pointer_target)
+            else
+                expr;
         }
 
         fn translateField(self: *@This(), field: Field) !Field {
@@ -1804,7 +1828,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             inline .pointer, .optional => |p| self.isAnonymousType(p.child_type),
                             else => true,
                         },
-                        .identifier => |i| !std.zig.primitives.isPrimitive(i),
+                        .identifier => false,
                         else => true,
                     };
                 }
@@ -2211,7 +2235,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn printExpression(self: *@This(), expr: *const Expression, ns: NamespaceType) anyerror!void {
             switch (expr.*) {
-                .any => |i| try self.printFmt("{s}", .{i}),
+                .any, .function_body => |i| try self.printFmt("{s}", .{i}),
                 .identifier => |i| try self.printIdentifier(i, ns),
                 .array_init => |a| try self.printArrayInit(a, ns),
                 .struct_init => |s| try self.printStructInit(s, ns),
