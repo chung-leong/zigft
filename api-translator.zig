@@ -1198,10 +1198,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateIdentifier(self: *@This(), expr: *const Expression) !*const Expression {
-            if (self.old_namespace.getExpression(expr.identifier)) |ref_expr| {
-                return try self.translateExpression(ref_expr);
-            }
-            return expr;
+            const ref_expr = self.resolveType(expr, .old);
+            return if (ref_expr != expr) try self.translateExpression(ref_expr) else expr;
         }
 
         fn translateField(self: *@This(), field: Field) !Field {
@@ -2160,7 +2158,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn obtainFunctionName(self: *@This(), expr: *const Expression) ![]const u8 {
-            return self.old_namespace.getName(expr) orelse try self.obtainTypeName(expr, .old);
+            return self.old_namespace.getName(expr) orelse find: {
+                for (self.old_root.type.container.decls) |decl| {
+                    if (self.getPointerInfo(decl.expr)) |p| {
+                        if (p.child_type == expr)
+                            break :find decl.name;
+                    }
+                } else break :find try self.obtainTypeName(expr, .old);
+            };
         }
 
         fn printImports(self: *@This()) anyerror!void {
