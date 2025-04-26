@@ -713,20 +713,6 @@ pub const Namespace = struct {
         if (self.to_name.get(expr) == null)
             try self.to_name.put(expr, name);
     }
-
-    pub fn removeExpression(self: *@This(), expr: *const Expression) void {
-        if (self.to_name.get(expr)) |name| {
-            _ = self.to_expr.remove(name);
-            _ = self.to_name.remove(expr);
-        }
-    }
-
-    pub fn removeName(self: *@This(), name: []const u8) void {
-        if (self.to_expr.get(name)) |expr| {
-            _ = self.to_expr.remove(name);
-            _ = self.to_name.remove(expr);
-        }
-    }
 };
 const SplitSlice = struct {
     len_index: usize,
@@ -1112,21 +1098,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 // transfer decls into specified type
                 new_root.type.container.decls = self.new_root.type.container.decls;
                 self.new_root = new_root;
-                // remove declaration of pointer type, if used to specified the struct
-                if (self.isPointer(new_container)) {
-                    for (new_root.type.container.decls, 0..) |decl, i| {
-                        if (decl.expr == new_container) {
-                            self.remove(&new_root.type.container.decls, i);
-                            self.new_namespace.removeExpression(new_container);
-                            break;
-                        }
-                    }
-                    // can't be optional
-                    if (self.getTypeInfo(new_container, .optional)) |o| {
-                        const ptr = @constCast(new_container);
-                        ptr.* = o.child_type.*;
-                    }
-                }
             }
             // look for global substitutions
             const global_subs = try self.findGlobalSubstutions();
