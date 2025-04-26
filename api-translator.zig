@@ -1258,23 +1258,29 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 }
                 break :swap param.type;
             };
+
             var new_type = try self.translateExpression(param_type);
             if (optionality) |is_optional| {
-                if (self.getTypeInfo(new_type, .optional)) |o| {
-                    if (!is_optional) new_type = o.child_type;
-                } else {
-                    if (is_optional) {
-                        new_type = try self.createType(.{
-                            .optional = .{ .child_type = new_type },
-                        });
-                    }
-                }
+                new_type = try self.changeOptionality(new_type, is_optional);
             }
             return .{
                 .name = new_name,
                 .type = new_type,
                 .is_inout = is_inout,
             };
+        }
+
+        fn changeOptionality(self: *@This(), expr: *const Expression, is_optional: bool) !*const Expression {
+            if (self.getTypeInfo(expr, .optional)) |o| {
+                if (!is_optional) return o.child_type;
+            } else {
+                if (is_optional) {
+                    return try self.createType(.{
+                        .optional = .{ .child_type = expr },
+                    });
+                }
+            }
+            return expr;
         }
 
         fn translateEnumItem(self: *@This(), item: EnumItem) !EnumItem {
@@ -1437,9 +1443,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     break index + 1;
                 }
             } else 0;
-            for (f.parameters[output_start..]) |param| {
+            for (f.parameters[output_start..], 0..) |param, i| {
                 const target_type = self.getPointerTarget(param.type).?;
-                const output_type = try self.translateExpression(target_type);
+                var output_type = try self.translateExpression(target_type);
+                if (self.isPointer(output_type)) {
+                    const type_name = try self.obtainTypeName(target_type, .old);
+                    if (options.param_is_optional_fn(fn_name, param.name, output_start + i, type_name)) |is_optional| {
+                        output_type = try self.changeOptionality(output_type, is_optional);
+                    }
+                }
                 try self.append(&output_types, output_type);
             }
             // see if the translated function should return an error union
