@@ -713,6 +713,13 @@ pub const Namespace = struct {
         if (self.to_name.get(expr) == null)
             try self.to_name.put(expr, name);
     }
+
+    pub fn removeExpression(self: *@This(), expr: *const Expression) void {
+        if (self.to_name.get(expr)) |name| {
+            _ = self.to_expr.remove(name);
+            _ = self.to_name.remove(expr);
+        }
+    }
 };
 const SplitSlice = struct {
     len_index: usize,
@@ -1098,6 +1105,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 // transfer decls into specified type
                 new_root.type.container.decls = self.new_root.type.container.decls;
                 self.new_root = new_root;
+                // remove pointer type from namespace (but keep the declaration), if used to specified the struct
+                if (self.isPointer(new_container)) {
+                    self.new_namespace.removeExpression(new_container);
+                }
             }
             // look for global substitutions
             const global_subs = try self.findGlobalSubstutions();
