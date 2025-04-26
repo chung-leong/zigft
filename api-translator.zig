@@ -7,6 +7,7 @@ pub const CodeGeneratorOptions = struct {
         name: []const u8,
     };
 
+    defines: []const []const u8 = &.{},
     include_paths: []const []const u8,
     header_paths: []const []const u8,
     zigft_path: []const u8 = "",
@@ -2532,6 +2533,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.append(&argv, "-lc");
             for (options.include_paths) |include_path| {
                 const arg = try self.allocPrint("-I{s}", .{include_path});
+                try self.append(&argv, arg);
+            }
+            for (options.defines) |define| {
+                const arg = try self.allocPrint("-D{s}", .{define});
                 try self.append(&argv, arg);
             }
             const result = try std.process.Child.run(.{
