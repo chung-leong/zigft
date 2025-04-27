@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const api_translator = @import("zigft/api-translator.zig");
 const inout = api_translator.inout;
 const c = @cImport({
@@ -1266,6 +1267,10 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = c.napi_value, .new = Value },
     },
     .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
+    .late_bind_fn = switch (builtin.target.os.tag) {
+        .windows => getProcAddress,
+        else => null,
+    },
 });
 
 test {
@@ -1411,4 +1416,13 @@ fn getErrorMessage(err: anytype) [:0]const u8 {
             return @ptrCast(&message);
         },
     }
+}
+
+fn getProcAddress(name: [:0]const u8) *const anyopaque {
+    const module = std.os.windows.kernel32.GetModuleHandleW(null) orelse unreachable;
+    return std.os.windows.kernel32.GetProcAddress(module, name) orelse {
+        var buffer: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buffer, "Unable to import function: {s}", .{name}) catch &buffer;
+        @panic(msg);
+    };
 }
