@@ -18,6 +18,7 @@ pub const CodeGeneratorOptions = struct {
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
     add_simple_test: bool = true,
+    late_bind_expr: ?[]const u8 = null,
 
     // callback determining which declarations to include
     filter_fn: fn (name: []const u8) bool,
@@ -2030,6 +2031,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .value = scheme_expr,
                 });
             }
+            if (options.late_bind_expr) |code| {
+                try self.append(&translator_options, .{
+                    .name = "late_bind_fn",
+                    .value = try self.createCode("{s}", .{code}),
+                });
+            }
             try self.append(&arguments, try self.createExpression(.{
                 .struct_init = .{ .initializers = translator_options, .is_multiline = true },
             }));
@@ -2189,6 +2196,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn printImports(self: *@This()) anyerror!void {
             try self.printTxt("const std = @import(\"std\");\n");
+            if (options.late_bind_expr != null) {
+                // builtin is probably needed when late binding is used
+                try self.printTxt("const builtin = @import(\"builtin\");\n");
+            }
             try self.printFmt("const api_translator = @import(\"{s}api-translator.zig\");\n", .{
                 options.zigft_path,
             });
