@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const api_translator = @import("zigft/api-translator.zig");
 const inout = api_translator.inout;
 const c = @cImport({
@@ -1266,10 +1267,7 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = c.napi_value, .new = Value },
     },
     .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
-    .late_bind_fn = switch (@import("builtin").target.os.tag) {
-        .windows => getProcAddress,
-        else => null,
-    },
+    .late_bind_fn = late_binder,
 });
 
 test {
@@ -1425,3 +1423,8 @@ fn getProcAddress(name: [:0]const u8) *const anyopaque {
         @panic(msg);
     };
 }
+
+const late_binder = switch (builtin.target.os.tag) {
+    .windows => getProcAddress,
+    else => null,
+};
