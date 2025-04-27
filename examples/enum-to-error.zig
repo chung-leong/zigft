@@ -1,5 +1,5 @@
 const std = @import("std");
-const fn_transform = @import("./fn-transform.zig");
+const fn_transform = @import("zigft/fn-transform.zig");
 
 const OriginalErrorEnum = enum(c_int) {
     OK,

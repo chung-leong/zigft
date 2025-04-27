@@ -1,5 +1,5 @@
 const std = @import("std");
-const fn_binding = @import("./fn-binding.zig");
+const fn_binding = @import("zigft/fn-binding.zig");
 
 pub fn main() !void {
     const ns = struct {

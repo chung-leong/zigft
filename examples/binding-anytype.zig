@@ -1,5 +1,5 @@
 const std = @import("std");
-const fn_binding = @import("./fn-binding.zig");
+const fn_binding = @import("zigft/fn-binding.zig");
 
 pub fn main() !void {
     var funcs: [5]*const fn () void = undefined;

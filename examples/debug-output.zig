@@ -1,5 +1,5 @@
 const std = @import("std");
-const fn_transform = @import("./fn-transform.zig");
+const fn_transform = @import("zigft/fn-transform.zig");
 
 fn attachDebugOutput(comptime func: anytype, comptime name: []const u8) @TypeOf(func) {
     const FT = @TypeOf(func);

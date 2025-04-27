@@ -1,5 +1,5 @@
 const std = @import("std");
-const fn_transform = @import("./fn-transform.zig");
+const fn_transform = @import("zigft/fn-transform.zig");
 
 fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
