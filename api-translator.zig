@@ -85,7 +85,7 @@ pub const TypeSubstitution = struct {
 pub const TranslatorOptions = struct {
     substitutions: []const TypeSubstitution = &.{},
     c_import_ns: type,
-    late_bind_fn: ?fn ([]const u8) *const anyopaque = null,
+    late_bind_fn: ?fn ([:0]const u8) *const anyopaque = null,
     error_scheme: type = NullErrorScheme,
 };
 pub fn BasicErrorScheme(
@@ -297,7 +297,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         pub fn translate(
-            comptime fn_name: []const u8,
+            comptime fn_name: [:0]const u8,
             comptime return_error_union: bool,
             comptime ignore_non_error_return_value: bool,
             comptime local_subs: anytype,
@@ -490,7 +490,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         }
 
         pub fn translateMerge(
-            comptime fn_name: []const u8,
+            comptime fn_name: [:0]const u8,
             comptime return_error_union: bool,
             comptime ignore_non_error_return_value: bool,
             comptime local_subs: anytype,
