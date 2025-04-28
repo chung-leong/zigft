@@ -1306,20 +1306,20 @@ pub fn createCallback(
         else => @compileError("Function expected, found '" + @typeName(FT) + "'"),
     };
     // figure out how many arguments the function has and whether it needs the data pointer
-    comptime var need_env = false;
     comptime var need_data = false;
+    comptime var need_env = false;
     comptime var arg_count: usize = 0;
     comptime {
         for (f.params, 0..) |param, i| {
             const PT = param.type orelse @compileError("Missing parameter type");
-            if (PT == Env) {
-                if (i != 0) @compileError("Env is expected to be the first argument");
+            if (!need_env and PT == Env) {
+                if (!need_data and i != 0) @compileError("Env is expected to be the first argument");
+                if (need_data and i != 1) @compileError("Env is expected to be the second argument");
                 need_env = true;
             } else if (PT == Value) {
                 arg_count += 1;
-            } else if (@typeInfo(PT) == .pointer) {
-                if (!need_env and i != 0) @compileError("Data pointer is expected to be the first argument");
-                if (need_env and i != 1) @compileError("Data pointer is expected to be the second argument");
+            } else if (!need_data and @typeInfo(PT) == .pointer) {
+                if (i != 0) @compileError("Data pointer is expected to be the first argument");
                 need_data = true;
             } else @compileError("Unexpected argument '" + @typeName(PT) + "'");
         }
@@ -1344,12 +1344,12 @@ pub fn createCallback(
             // copy arguments into arg tuple
             var args: std.meta.ArgsTuple(FT) = undefined;
             comptime var offset: usize = 0;
-            if (need_env) {
-                args[offset] = env;
-                offset += 1;
-            }
             if (need_data) {
                 args[offset] = @ptrCast(ptr.?);
+                offset += 1;
+            }
+            if (need_env) {
+                args[offset] = env;
                 offset += 1;
             }
             if (need_this) {
