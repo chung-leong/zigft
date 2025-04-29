@@ -72,7 +72,7 @@ const alway_optional_params = .{
 };
 const optional_params = .{
     .{ .fn_name = "node_api_post_finalizer", .arg_indices = .{ 2, 3 } },
-    .{ .fn_name = "napi_add_finalizer", .arg_indices = .{ 2, 4 } },
+    .{ .fn_name = "napi_add_finalizer", .arg_indices = .{4} },
     .{ .fn_name = "napi_define_class", .arg_indices = .{4} },
     .{ .fn_name = "napi_wrap", .arg_indices = .{ 3, 4 } },
     .{ .fn_name = "napi_property_descriptor", .arg_indices = .{ 0, 1 } },

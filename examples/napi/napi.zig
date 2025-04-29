@@ -1345,7 +1345,7 @@ pub fn createCallback(
             var args: std.meta.ArgsTuple(FT) = undefined;
             comptime var offset: usize = 0;
             if (need_data) {
-                args[offset] = @ptrCast(ptr.?);
+                args[offset] = @ptrCast(@alignCast(ptr.?));
                 offset += 1;
             }
             if (need_env) {
