@@ -35,6 +35,7 @@ pub const CodeGeneratorOptions = struct {
     ptr_is_many_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
     ptr_is_null_terminated_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = isTargetChar,
     ptr_is_optional_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = neverOptional,
+    ptr_is_input_fn: fn (ptr_type: []const u8, child_type: []const u8) bool = neverInputPtr,
 
     // callback determining whether ptr param is optional
     param_is_optional_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?bool = notFunctionSpecific,
@@ -1435,10 +1436,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 // no translation of output pointers for function pointers
                 if (is_pointer_target) break index + 1;
                 if (!self.isWriteTarget(param.type)) break index + 1;
-                // maybe it's a in/out pointer--need to ask the callback function
+                // maybe it's a in/out pointer--need to ask the callback functions
+                const ptr_name = try self.obtainTypeName(param.type, .old);
                 const target_type = self.getPointerTarget(param.type).?;
                 const type_name = try self.obtainTypeName(target_type, .old);
-                if (options.param_is_input_fn(fn_name, param.name, index, type_name)) {
+                const is_input = check: {
+                    if (options.ptr_is_input_fn(ptr_name, type_name)) break :check true;
+                    if (options.param_is_input_fn(fn_name, param.name, index, type_name)) break :check true;
+                    break :check false;
+                };
+                if (is_input) {
                     inout_index = index;
                     self.need_inout_import = true;
                     break index + 1;
@@ -2761,6 +2768,10 @@ pub fn neverPackedStruct(_: []const u8) bool {
 }
 
 pub fn neverOptional(_: []const u8, _: []const u8) bool {
+    return false;
+}
+
+pub fn neverInputPtr(_: []const u8, _: []const u8) bool {
     return false;
 }
 
