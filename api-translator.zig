@@ -763,10 +763,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         new_error_set: *const Expression,
         non_error_enum_count: usize,
         anonymous_type_count: usize,
+        current_root: *const Expression,
         write_to_byte_array: bool,
         byte_array: std.ArrayList(u8),
         output_writer: std.io.AnyWriter,
         need_inout_import: bool,
+        add_child_type: bool,
 
         pub fn init(allocator: std.mem.Allocator) !*@This() {
             var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -785,12 +787,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.new_root = try self.createType(.{
                 .container = .{ .kind = "struct" },
             });
+            self.current_root = self.new_root;
             self.new_namespace = .init(self.allocator);
             self.non_error_enum_count = 0;
             self.anonymous_type_count = 0;
             self.write_to_byte_array = false;
             self.byte_array = .init(self.allocator);
             self.need_inout_import = false;
+            self.add_child_type = false;
             return self;
         }
 
@@ -806,6 +810,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         pub fn print(self: *@This(), writer: anytype) anyerror!void {
             self.output_writer = writer.any();
+            self.add_child_type = true;
             try self.printImports();
             try self.printExpression(self.new_root, .new);
             if (options.add_simple_test) try self.printSimpleTest();
@@ -1095,7 +1100,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     return error.Unexpected;
                 };
                 const new_container = self.old_to_new_map.get(old_container) orelse return error.Unexpected;
-                const new_root: *Expression = if (self.isTypeOf(new_container, .container))
+                var new_root: *Expression = if (self.isTypeOf(new_container, .container))
                     @constCast(new_container)
                 else if (self.getPointerInfo(new_container)) |p|
                     @constCast(p.child_type)
@@ -1186,7 +1191,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             expr: *const Expression,
             is_pointer_target: bool,
         ) std.mem.Allocator.Error!*const Expression {
-            return self.old_to_new_map.get(expr) orelse add: {
+            if (self.old_to_new_map.get(expr)) |new_expr| {
+                return new_expr;
+            } else {
                 switch (expr.*) {
                     .type => |t| {
                         const new_expr = try self.createExpression(.{ .any = "" });
@@ -1199,26 +1206,26 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             else => expr.type,
                         };
                         new_expr.* = .{ .type = new_type };
-                        break :add new_expr;
+                        return new_expr;
                     },
                     .identifier => {
                         const new_expr = try self.translateIdentifier(expr, is_pointer_target);
                         try self.old_to_new_map.put(expr, new_expr);
-                        break :add new_expr;
+                        return new_expr;
                     },
                     else => {
                         try self.old_to_new_map.put(expr, expr);
-                        break :add expr;
+                        return expr;
                     },
                 }
-            };
+            }
         }
 
         fn translateIdentifier(self: *@This(), expr: *const Expression, is_pointer_target: bool) !*const Expression {
-            return if (self.old_namespace.getExpression(expr.identifier)) |ref_expr|
-                try self.translateExpressionEx(ref_expr, is_pointer_target)
-            else
-                expr;
+            if (self.old_namespace.getExpression(expr.identifier)) |ref_expr| {
+                return try self.translateExpressionEx(ref_expr, is_pointer_target);
+            }
+            return expr;
         }
 
         fn translateField(self: *@This(), field: Field) !Field {
@@ -1537,6 +1544,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     } else {
                         break :get &.{eu.payload_type};
                     }
+                } else if (return_type.* == .function_call) {
+                    const arg = return_type.function_call.arguments[0];
+                    break :get arg.array_init.initializers;
                 } else {
                     break :get &.{return_type};
                 }
@@ -2234,7 +2244,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     try self.printExpression(expr, ns);
                 }
             } else if (ns == .new) {
-                if (expr == self.new_root) {
+                if (expr == self.current_root) {
                     try self.printTxt("@This()");
                 } else if (expr == self.old_root) {
                     try self.printTxt(options.c_import);
@@ -2258,7 +2268,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .struct_init => |s| try self.printStructInit(s, ns),
                 .function_call => |f| try self.printFunctionCall(f, ns),
                 .type => |t| switch (t) {
-                    .container => |c| try self.printContainerDef(c, ns, expr == self.new_root),
+                    .container => |c| {
+                        const current_root_before = self.current_root;
+                        defer self.current_root = current_root_before;
+                        self.current_root = expr;
+                        try self.printContainerDef(c, ns, expr == self.new_root);
+                    },
                     .pointer => |p| try self.printPointerDef(p, ns),
                     .optional => |o| try self.printOptionalDef(o, ns),
                     .enumeration => |e| try self.printEnumerationDef(e, ns),
@@ -2483,14 +2498,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printTxt(" = ");
             try self.printExpression(decl.expr, ns);
             try self.printTxt(";\n");
-            if (self.getPointerInfo(decl.expr)) |p| {
-                if (self.new_namespace.getName(p.child_type) == null) {
-                    // target is not in namespace, make it accessible through the parent type
-                    const ref = if (self.isTypeOf(decl.expr, .optional))
-                        try self.allocPrint("@typeInfo(@typeInfo({s}).optional.child).pointer.child", .{decl.name})
-                    else
-                        try self.allocPrint("@typeInfo({s}).pointer.child", .{decl.name});
-                    try self.new_namespace.addExpression(ref, p.child_type);
+            if (self.add_child_type) {
+                if (self.getPointerInfo(decl.expr)) |p| {
+                    if (self.new_namespace.getName(p.child_type) == null) {
+                        // target is not in namespace, make it accessible through the parent type
+                        const ref = if (self.isTypeOf(decl.expr, .optional))
+                            try self.allocPrint("@typeInfo(@typeInfo({s}).optional.child).pointer.child", .{decl.name})
+                        else
+                            try self.allocPrint("@typeInfo({s}).pointer.child", .{decl.name});
+                        try self.new_namespace.addExpression(ref, p.child_type);
+                    }
                 }
             }
         }
