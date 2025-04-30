@@ -1187,19 +1187,30 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             is_pointer_target: bool,
         ) std.mem.Allocator.Error!*const Expression {
             return self.old_to_new_map.get(expr) orelse add: {
-                const new_expr = switch (expr.*) {
-                    .type => |t| switch (t) {
-                        .container => try self.translateContainer(expr),
-                        .pointer, .optional => try self.translatePointer(expr),
-                        .enumeration => try self.translateEnumeration(expr),
-                        .function => try self.translateFunction(expr, is_pointer_target),
-                        else => expr,
+                switch (expr.*) {
+                    .type => |t| {
+                        const new_expr = try self.createExpression(.{ .any = "" });
+                        try self.old_to_new_map.put(expr, new_expr);
+                        const new_type = switch (t) {
+                            .container => try self.translateContainer(expr),
+                            .pointer, .optional => try self.translatePointer(expr),
+                            .enumeration => try self.translateEnumeration(expr),
+                            .function => try self.translateFunction(expr, is_pointer_target),
+                            else => expr.type,
+                        };
+                        new_expr.* = .{ .type = new_type };
+                        break :add new_expr;
                     },
-                    .identifier => try self.translateIdentifier(expr, is_pointer_target),
-                    else => expr,
-                };
-                try self.old_to_new_map.put(expr, new_expr);
-                break :add new_expr;
+                    .identifier => {
+                        const new_expr = try self.translateIdentifier(expr, is_pointer_target);
+                        try self.old_to_new_map.put(expr, new_expr);
+                        break :add new_expr;
+                    },
+                    else => {
+                        try self.old_to_new_map.put(expr, expr);
+                        break :add expr;
+                    },
+                }
             };
         }
 
@@ -1274,24 +1285,24 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateContainer(self: *@This(), expr: *const Expression) !*const Expression {
+        fn translateContainer(self: *@This(), expr: *const Expression) !Expression.Type {
             const c = expr.type.container;
             var new_fields: []Field = &.{};
             for (c.fields) |field| {
                 const new_field = try self.translateField(field);
                 try self.append(&new_fields, new_field);
             }
-            return self.createType(.{
+            return .{
                 .container = .{
                     .layout = c.layout,
                     .kind = c.kind,
                     .backing_type = c.backing_type,
                     .fields = new_fields,
                 },
-            });
+            };
         }
 
-        fn translatePointer(self: *@This(), expr: *const Expression) !*const Expression {
+        fn translatePointer(self: *@This(), expr: *const Expression) !Expression.Type {
             // expr is a pointer or an optional
             const p = self.getPointerInfo(expr).?;
             const child_type = try self.translateExpressionEx(p.child_type, true);
@@ -1300,7 +1311,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const is_null_terminated = options.ptr_is_null_terminated_fn(ptr_name, target_name);
             const is_many = options.ptr_is_many_fn(ptr_name, target_name);
             const is_optional = options.ptr_is_optional_fn(ptr_name, target_name);
-            var new_type = try self.createType(.{
+            var new_type: Expression.Type = .{
                 .pointer = .{
                     .child_type = child_type,
                     .alignment = p.alignment,
@@ -1310,16 +1321,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .is_volatile = p.is_volatile,
                     .allows_zero = p.allows_zero,
                 },
-            });
+            };
             if (is_optional) {
-                new_type = try self.createType(.{
-                    .optional = .{ .child_type = new_type },
-                });
+                new_type = .{
+                    .optional = .{ .child_type = try self.createType(new_type) },
+                };
             }
             return new_type;
         }
 
-        fn translateEnumeration(self: *@This(), expr: *const Expression) !*const Expression {
+        fn translateEnumeration(self: *@This(), expr: *const Expression) !Expression.Type {
             const e = expr.type.enumeration;
             const enum_name = try self.obtainTypeName(expr, .old);
             if (options.enum_is_packed_struct_fn(enum_name)) {
@@ -1376,7 +1387,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         }
                     }
                 }
-                return self.createType(.{
+                return .{
                     .container = .{
                         .layout = "packed",
                         .kind = "struct",
@@ -1384,19 +1395,19 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .fields = new_fields,
                         .decls = new_decls,
                     },
-                });
+                };
             } else {
                 var new_items: []EnumItem = &.{};
                 for (e.items) |item| {
                     const new_field = try self.translateEnumItem(item);
                     try self.append(&new_items, new_field);
                 }
-                return self.createType(.{
+                return .{
                     .enumeration = .{
                         .items = new_items,
                         .is_signed = e.is_signed,
                     },
-                });
+                };
             }
         }
 
@@ -1404,7 +1415,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self: *@This(),
             expr: *const Expression,
             is_pointer_target: bool,
-        ) !*const Expression {
+        ) !Expression.Type {
             const f = expr.type.function;
             var new_params: []Parameter = &.{};
             // look for writable pointer
@@ -1492,14 +1503,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 }),
                 false => payload_type,
             };
-            return try self.createType(.{
+            return .{
                 .function = .{
                     .parameters = new_params,
                     .return_type = return_type,
                     .alignment = f.alignment,
                     .call_convention = if (is_pointer_target) f.call_convention else null,
                 },
-            });
+            };
         }
 
         fn findSubstitutions(
