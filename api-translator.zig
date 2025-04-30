@@ -1069,6 +1069,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 try self.new_namespace.addExpression(options.error_set, error_set);
             }
             // translate all declarations
+            var new_name_map: std.StringHashMap(bool) = .init(self.allocator);
             for (self.old_root.type.container.decls) |decl| {
                 if (options.filter_fn(decl.name)) {
                     // get name in target namespace
@@ -1079,10 +1080,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         else => .@"const",
                     };
                     const new_name = try self.transformName(decl.name, transform);
+                    if (new_name_map.get(new_name)) |_| continue;
+                    try new_name_map.put(new_name, true);
                     const new_type = if (decl.type) |t| try self.translateExpression(t) else null;
                     const expr = try self.translateDefinition(decl.expr);
-                    // don't add declarations for opaques
-                    if (self.isOpaque(expr)) continue;
                     try self.new_namespace.addExpression(new_name, expr);
                     const doc_comment = try options.doc_comment_fn(self.allocator, decl.name, new_name);
                     try self.append(&self.new_root.type.container.decls, .{
@@ -1112,6 +1113,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 // transfer decls into specified type
                 new_root.type.container.decls = self.new_root.type.container.decls;
                 self.new_root = new_root;
+                // remove declaration of root struct
+                for (new_root.type.container.decls, 0..) |decl, i| {
+                    if (decl.expr == new_root) {
+                        self.remove(&new_root.type.container.decls, i);
+                        break;
+                    }
+                }
                 // remove pointer type from namespace (but keep the declaration), if used to specified the struct
                 if (self.isPointer(new_container)) {
                     self.new_namespace.removeExpression(new_container);
@@ -1853,7 +1861,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             else => true,
                         },
                         .identifier => false,
-                        else => true,
+                        else => false,
                     };
                 }
             }
