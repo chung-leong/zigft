@@ -226,6 +226,13 @@ pub const NullErrorScheme = struct {
     }
 };
 
+fn getBindNamespace(comptime fn_name: [:0]const u8, comptime FT: type) type {
+    return struct {
+        const name = fn_name;
+        var func_ptr: ?*const FT = null;
+    };
+}
+
 pub fn Translator(comptime options: TranslatorOptions) type {
     return struct {
         pub fn Translated(
@@ -353,9 +360,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     }
                     // get original function
                     const func = if (options.late_bind_fn) |get| bind: {
-                        const bind_ns = struct {
-                            var func_ptr: ?*const OldFn = null;
-                        };
+                        const bind_ns = getBindNamespace(fn_name, OldFn);
                         if (bind_ns.func_ptr) |ptr| {
                             break :bind ptr;
                         } else {
@@ -1080,6 +1085,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         else => .@"const",
                     };
                     const new_name = try self.transformName(decl.name, transform);
+                    if (std.mem.eql(u8, decl.name, "php_stream")) {
+                        std.debug.print("{s} => {s}\n", .{ decl.name, new_name });
+                    }
                     if (new_name_map.get(new_name)) |_| continue;
                     try new_name_map.put(new_name, true);
                     const new_type = if (decl.type) |t| try self.translateExpression(t) else null;

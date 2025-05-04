@@ -1,3 +1,7 @@
+## May 4, 2025
+
+* Fixed late binding
+
 ## Arpil 30, 2025
 
 * Fixed issues with API translator
