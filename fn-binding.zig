@@ -1,7 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const fn_transform = @import("fn-transform.zig");
+
 const expect = std.testing.expect;
+const expectEqualSlices = std.testing.expectEqualSlices;
+const expectEqual = std.testing.expectEqual;
 
 /// Create a binding using an user-provided allocator instead of the default.
 ///
@@ -1064,7 +1067,7 @@ test "BoundFn" {
         @"2": i32,
     };
     const BFT = BoundFn(FT, CT);
-    try expect(BFT == fn (i8, i16, i64) i64);
+    try expectEqual(fn (i8, i16, i64) i64, BFT);
 }
 
 const Mapping = struct {
@@ -1101,12 +1104,12 @@ test "getArgumentMapping" {
         .@"1" = @as(i32, 123),
     });
     const mapping = comptime getArgumentMapping(FT, CT);
-    try expect(mapping[0].src[0] == '0');
-    try expect(mapping[0].dest[0] == '0');
-    try expect(mapping[1].src[0] == '1');
-    try expect(mapping[1].dest[0] == '2');
-    try expect(mapping[2].src[0] == '2');
-    try expect(mapping[2].dest[0] == '3');
+    try expectEqualSlices(u8, "0", mapping[0].src);
+    try expectEqualSlices(u8, "0", mapping[0].dest);
+    try expectEqualSlices(u8, "1", mapping[1].src);
+    try expectEqualSlices(u8, "2", mapping[1].dest);
+    try expectEqualSlices(u8, "2", mapping[2].src);
+    try expectEqualSlices(u8, "3", mapping[2].dest);
 }
 
 fn getContextMapping(comptime FT: type, comptime CT: type) return_type: {
@@ -1139,10 +1142,10 @@ test "getContextMapping" {
     });
     const FT = fn (i32, i32, i32, i32) i32;
     const mapping = comptime getContextMapping(FT, CT);
-    try expect(mapping[0].src[0] == '1');
-    try expect(mapping[0].dest[0] == '1');
-    try expect(mapping[1].src[0] == '-');
-    try expect(mapping[1].dest[0] == '3');
+    try expectEqualSlices(u8, "1", mapping[0].src);
+    try expectEqualSlices(u8, "1", mapping[0].dest);
+    try expectEqualSlices(u8, "-1", mapping[1].src);
+    try expectEqualSlices(u8, "3", mapping[1].dest);
 }
 
 fn isMapped(mapping: []const Mapping, name: [:0]const u8) bool {
@@ -1160,9 +1163,9 @@ test "isMapped" {
     });
     const FT = fn (i32, i32, i32, i32) i32;
     const mapping = comptime getContextMapping(FT, CT);
-    try expect(isMapped(&mapping, "1") == true);
-    try expect(isMapped(&mapping, "3") == true);
-    try expect(isMapped(&mapping, "2") == false);
+    try expectEqual(true, isMapped(&mapping, "1"));
+    try expectEqual(true, isMapped(&mapping, "3"));
+    try expectEqual(false, isMapped(&mapping, "2"));
 }
 
 fn FnType(comptime T: type) type {
@@ -1182,8 +1185,8 @@ test "FnType" {
             return arg;
         }
     };
-    try expect(FnType(@TypeOf(ns.foo)) == fn (i32) i32);
-    try expect(FnType(@TypeOf(&ns.foo)) == fn (i32) i32);
+    try expectEqual(fn (i32) i32, FnType(@TypeOf(ns.foo)));
+    try expectEqual(fn (i32) i32, FnType(@TypeOf(&ns.foo)));
 }
 
 fn Uninlined(comptime FT: type) type {
@@ -2396,8 +2399,8 @@ const InstructionEncoder = struct {
             a: u32 = 456,
         } = .{};
         encoder.add(s);
-        try expect(@as(*align(1) u32, @ptrCast(&bytes[0])).* == 123);
-        try expect(@as(*align(1) u32, @ptrCast(&bytes[4])).* == 456);
+        try expectEqual(123, @as(*align(1) u32, @ptrCast(&bytes[0])).*);
+        try expectEqual(456, @as(*align(1) u32, @ptrCast(&bytes[4])).*);
     }
 
     fn write(self: *@This(), instr: anytype) void {
@@ -2421,8 +2424,8 @@ const InstructionEncoder = struct {
             a: u32 = 456,
         } = .{};
         encoder.write(s);
-        try expect(@as(*align(1) u32, @ptrCast(&bytes[0])).* == 123);
-        try expect(@as(*align(1) u32, @ptrCast(&bytes[4])).* == 456);
+        try expectEqual(123, @as(*align(1) u32, @ptrCast(&bytes[0])).*);
+        try expectEqual(456, @as(*align(1) u32, @ptrCast(&bytes[4])).*);
     }
 };
 
@@ -2566,7 +2569,7 @@ test "bind (i64 x 3 + *i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     bf(1, 2, 3);
-    try expect(number == 1 + 2 + 3);
+    try expectEqual(1 + 2 + 3, number);
 }
 
 test "bind ([no args] + i64 x 4)" {
@@ -2585,10 +2588,10 @@ test "bind ([no args] + i64 x 4)" {
     _ = &number4;
     const vars = .{ number1, number2, number3, number4 };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn () i64);
+    try expectEqual(*const fn () i64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf();
-    try expect(sum == 1 + 2 + 3 + 4);
+    try expectEqual(1 + 2 + 3 + 4, sum);
 }
 
 test "bind (i64 x 1 + i64 x 1)" {
@@ -2601,10 +2604,10 @@ test "bind (i64 x 1 + i64 x 1)" {
     _ = &number;
     const vars = .{ .@"-1" = number };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (i64) i64);
+    try expectEqual(*const fn (i64) i64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(1);
-    try expect(sum == 1 + 1234);
+    try expectEqual(1 + 1234, sum);
 }
 
 test "bind (i64 x 2 + i64 x 1)" {
@@ -2617,10 +2620,10 @@ test "bind (i64 x 2 + i64 x 1)" {
     _ = &number;
     const vars = .{ .@"-1" = number };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (i64, i64) i64);
+    try expectEqual(*const fn (i64, i64) i64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(1, 2);
-    try expect(sum == 1 + 2 + 1234);
+    try expectEqual(1 + 2 + 1234, sum);
 }
 
 test "bind (i64 x 3 + i64 x 1)" {
@@ -2633,10 +2636,10 @@ test "bind (i64 x 3 + i64 x 1)" {
     _ = &number;
     const vars = .{ .@"-1" = number };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (i64, i64, i64) i64);
+    try expectEqual(*const fn (i64, i64, i64) i64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(1, 2, 3);
-    try expect(sum == 1 + 2 + 3 + 1234);
+    try expectEqual(1 + 2 + 3 + 1234, sum);
 }
 
 test "bind (i64 x 4 + i64 x 1)" {
@@ -2651,7 +2654,7 @@ test "bind (i64 x 4 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4);
-    try expect(sum == 1 + 2 + 3 + 4 + 5);
+    try expectEqual(1 + 2 + 3 + 4 + 5, sum);
 }
 
 test "bind (i64 x 5 + i64 x 1)" {
@@ -2666,7 +2669,7 @@ test "bind (i64 x 5 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6, sum);
 }
 
 test "bind (i64 x 6 + i64 x 1)" {
@@ -2681,7 +2684,7 @@ test "bind (i64 x 6 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7, sum);
 }
 
 test "bind (i64 x 7 + i64 x 1)" {
@@ -2696,7 +2699,7 @@ test "bind (i64 x 7 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8, sum);
 }
 
 test "bind (i64 x 8 + i64 x 1)" {
@@ -2711,7 +2714,7 @@ test "bind (i64 x 8 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9, sum);
 }
 
 test "bind (i64 x 9 + i64 x 1)" {
@@ -2726,7 +2729,7 @@ test "bind (i64 x 9 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10, sum);
 }
 
 test "bind (i64 x 10 + i64 x 1)" {
@@ -2741,7 +2744,7 @@ test "bind (i64 x 10 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11, sum);
 }
 
 test "bind (i64 x 11 + i64 x 1)" {
@@ -2756,7 +2759,7 @@ test "bind (i64 x 11 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12, sum);
 }
 
 test "bind (i64 x 12 + i64 x 1)" {
@@ -2771,7 +2774,7 @@ test "bind (i64 x 12 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13, sum);
 }
 
 test "bind (i64 x 13 + i64 x 1)" {
@@ -2786,7 +2789,7 @@ test "bind (i64 x 13 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14, sum);
 }
 
 test "bind (i64 x 14 + i64 x 1)" {
@@ -2801,7 +2804,7 @@ test "bind (i64 x 14 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15, sum);
 }
 
 test "bind (i64 x 15 + i64 x 1)" {
@@ -2816,7 +2819,7 @@ test "bind (i64 x 15 + i64 x 1)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16, sum);
 }
 
 test "bind ([no args] + i64 x 16)" {
@@ -2848,7 +2851,7 @@ test "bind ([no args] + i64 x 16)" {
     const bf = try bind(ns.add, vars);
     defer unbind(bf);
     const sum = bf();
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16, sum);
 }
 
 test "bind (f64 x 3 + f64 x 1)" {
@@ -2861,10 +2864,10 @@ test "bind (f64 x 3 + f64 x 1)" {
     _ = &number;
     const vars = .{ .@"-1" = number };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (f64, f64, f64) f64);
+    try expectEqual(*const fn (f64, f64, f64) f64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(1, 2, 3);
-    try expect(sum == 1 + 2 + 3 + 1234);
+    try expectEqual(1 + 2 + 3 + 1234, sum);
 }
 
 test "bind ([]const u8 x 1 + []const u8 x 1)" {
@@ -2877,7 +2880,7 @@ test "bind ([]const u8 x 1 + []const u8 x 1)" {
     _ = &string;
     const vars = .{ .@"-1" = string };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (a1: []const u8) [2][]const u8);
+    try expectEqual(*const fn (a1: []const u8) [2][]const u8, @TypeOf(bf));
     defer unbind(bf);
     const array = bf("Agnieszka");
     try expect(std.mem.eql(u8, array[0], "Agnieszka"));
@@ -2894,7 +2897,7 @@ test "bind ([]const u8 x 3 + []const u8 x 1)" {
     _ = &string;
     const vars = .{ .@"-1" = string };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (a1: []const u8, a2: []const u8, a3: []const u8) [4][]const u8);
+    try expectEqual(*const fn (a1: []const u8, a2: []const u8, a3: []const u8) [4][]const u8, @TypeOf(bf));
     defer unbind(bf);
     const array = bf("Agnieszka", "Basia", "Czcibora");
     try expect(std.mem.eql(u8, array[0], "Agnieszka"));
@@ -2919,7 +2922,7 @@ test "bind (@Vector(4, f64) x 3 + @Vector(4, f64) x 1)" {
         .{ 0.1, 0.2, 0.3, 0.4 },
         .{ 1, 2, 3, 4 },
     );
-    try expect(@reduce(.And, sum == @Vector(4, f64){ 1.111e1, 2.222e1, 3.333e1, 4.444e1 }));
+    try expectEqual(@Vector(4, f64){ 1.111e1, 2.222e1, 3.333e1, 4.444e1 }, sum);
 }
 
 test "bind (@Vector(4, f64) x 9 + @Vector(4, f64) x 1)" {
@@ -2944,7 +2947,7 @@ test "bind (@Vector(4, f64) x 9 + @Vector(4, f64) x 1)" {
         .{ 1000, 2000, 3000, 4000 },
         .{ 10000, 2000, 30000, 40000 },
     );
-    try expect(@reduce(.And, sum == @Vector(4, f64){ 1.111111111e5, 2.042222222e5, 3.333333333e5, 4.444444444e5 }));
+    try expectEqual(@Vector(4, f64){ 1.111111111e5, 2.042222222e5, 3.333333333e5, 4.444444444e5 }, sum);
 }
 
 test "bind ([12]f64 x 1 + [3]i32 x 1)" {
@@ -2961,10 +2964,10 @@ test "bind ([12]f64 x 1 + [3]i32 x 1)" {
     _ = &array;
     const vars = .{array};
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn ([12]f64) f64);
+    try expectEqual(*const fn ([12]f64) f64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 });
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 10 + 20 + 30);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 10 + 20 + 30, sum);
 }
 
 test "bind ([3]i32 x 1 + [12]f64 x 1)" {
@@ -2981,10 +2984,10 @@ test "bind ([3]i32 x 1 + [12]f64 x 1)" {
     _ = &array;
     const vars = .{ .@"1" = array };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn ([3]i32) f64);
+    try expectEqual(*const fn ([3]i32) f64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(.{ 10, 20, 30 });
-    try expect(sum == 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 10 + 20 + 30);
+    try expectEqual(1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 10 + 20 + 30, sum);
 }
 
 test "bind (*i8 x 3 + *i8 x 1)" {
@@ -3005,10 +3008,10 @@ test "bind (*i8 x 3 + *i8 x 1)" {
     const bf = try bind(ns.set, vars);
     defer unbind(bf);
     bf(&number1, &number2, &number3);
-    try expect(number1 == 123);
-    try expect(number2 == 123);
-    try expect(number3 == 123);
-    try expect(number4 == 123);
+    try expectEqual(123, number1);
+    try expectEqual(123, number2);
+    try expectEqual(123, number3);
+    try expectEqual(123, number4);
 }
 
 test "bind (*i16 x 3 + *i16 x 1)" {
@@ -3029,10 +3032,10 @@ test "bind (*i16 x 3 + *i16 x 1)" {
     const bf = try bind(ns.set, vars);
     defer unbind(bf);
     bf(&number1, &number2, &number3);
-    try expect(number1 == 123);
-    try expect(number2 == 123);
-    try expect(number3 == 123);
-    try expect(number4 == 123);
+    try expectEqual(123, number1);
+    try expectEqual(123, number2);
+    try expectEqual(123, number3);
+    try expectEqual(123, number4);
 }
 
 test "bind (*i32 x 3 + *i32 x 1)" {
@@ -3053,10 +3056,10 @@ test "bind (*i32 x 3 + *i32 x 1)" {
     const bf = try bind(ns.set, vars);
     defer unbind(bf);
     bf(&number1, &number2, &number3);
-    try expect(number1 == 123);
-    try expect(number2 == 123);
-    try expect(number3 == 123);
-    try expect(number4 == 123);
+    try expectEqual(123, number1);
+    try expectEqual(123, number2);
+    try expectEqual(123, number3);
+    try expectEqual(123, number4);
 }
 
 test "bind (*i64 x 3 + *i64 x 1)" {
@@ -3077,10 +3080,10 @@ test "bind (*i64 x 3 + *i64 x 1)" {
     const bf = try bind(ns.set, vars);
     defer unbind(bf);
     bf(&number1, &number2, &number3);
-    try expect(number1 == 123);
-    try expect(number2 == 123);
-    try expect(number3 == 123);
-    try expect(number4 == 123);
+    try expectEqual(123, number1);
+    try expectEqual(123, number2);
+    try expectEqual(123, number3);
+    try expectEqual(123, number4);
 }
 
 test "bind (i64 x 1 + i64 x 1, comptime)" {
@@ -3092,10 +3095,10 @@ test "bind (i64 x 1 + i64 x 1, comptime)" {
     const number: i64 = 1234;
     const vars = .{ .@"-1" = number };
     const bf = comptime try bind(&ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (i64) i64);
+    try expectEqual(*const fn (i64) i64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(1);
-    try expect(sum == 1 + 1234);
+    try expectEqual(1 + 1234, sum);
 }
 
 test "bind (i64 x 1 + i64 x 1, pointer)" {
@@ -3110,10 +3113,10 @@ test "bind (i64 x 1 + i64 x 1, pointer)" {
     var fn_ptr = &ns.add;
     _ = &fn_ptr;
     const bf = try bind(fn_ptr, vars);
-    try expect(@TypeOf(bf) == *const fn (i64) i64);
+    try expectEqual(*const fn (i64) i64, @TypeOf(bf));
     defer unbind(bf);
     const sum = bf(1);
-    try expect(sum == 1 + 1234);
+    try expectEqual(1 + 1234, sum);
 }
 
 test "bound" {
@@ -3126,14 +3129,14 @@ test "bound" {
     _ = &number;
     const vars = .{ .@"-1" = number };
     const bf = try bind(ns.add, vars);
-    try expect(@TypeOf(bf) == *const fn (i64) i64);
+    try expectEqual(*const fn (i64) i64, @TypeOf(bf));
     defer unbind(bf);
     const sum1 = bf(1);
-    try expect(sum1 == 1 + 1234);
+    try expectEqual(1 + 1234, sum1);
     const ctx_ptr = bound(@TypeOf(vars), bf) orelse return error.NotFound;
     protect(false);
     ctx_ptr.@"-1" = 4567;
     protect(true);
     const sum2 = bf(1);
-    try expect(sum2 == 1 + 4567);
+    try expectEqual(1 + 4567, sum2);
 }
