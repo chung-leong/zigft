@@ -1110,14 +1110,14 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     return error.Unexpected;
                 };
                 const new_container = self.old_to_new_map.get(old_container) orelse return error.Unexpected;
-                var new_root: *Expression = if (self.isTypeOf(new_container, .container))
-                    @constCast(new_container)
-                else if (self.getPointerInfo(new_container)) |p|
-                    @constCast(p.child_type)
-                else {
-                    std.debug.print("'{s}' is not a container type\n", .{name});
-                    return error.Unexpected;
-                };
+                var new_root: *Expression = @constCast(new_container);
+                if (self.getPointerInfo(new_root)) |p| {
+                    new_root = @constCast(p.child_type);
+                }
+                if (!self.isTypeOf(new_root, .container)) {
+                    try self.redefineAsContainer(new_root, name);
+                }
+
                 // transfer decls into specified type
                 new_root.type.container.decls = self.new_root.type.container.decls;
                 self.new_root = new_root;
@@ -1286,6 +1286,36 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .type = new_type,
                 .is_inout = is_inout,
             };
+        }
+
+        fn redefineAsContainer(self: *@This(), expr: *Expression, name: []const u8) !void {
+            if (expr.* != .identifier) {
+                std.debug.print("Cannot convert '{s}' to container type\n", .{name});
+                return error.Unexpected;
+            }
+            if (std.mem.eql(u8, expr.identifier, "anyopaque")) {
+                expr.* = .{
+                    .type = .{
+                        .container = .{ .kind = "opaque" },
+                    },
+                };
+            } else {
+                var fields: []Field = &.{};
+                const base_type = try self.createExpression(expr.*);
+                try self.append(&fields, .{
+                    .name = "_",
+                    .type = base_type,
+                });
+                expr.* = .{
+                    .type = .{
+                        .container = .{
+                            .layout = "packed",
+                            .kind = "struct",
+                            .fields = fields,
+                        },
+                    },
+                };
+            }
         }
 
         fn changeOptionality(self: *@This(), expr: *const Expression, is_optional: bool) !*const Expression {
@@ -2681,6 +2711,9 @@ pub fn camelize(allocator: std.mem.Allocator, name: []const u8, start_index: usi
     const underscore_count = std.mem.count(u8, name[start_index..], "_");
     const len = name.len - start_index - underscore_count;
     const buffer = try allocator.alloc(u8, len);
+    const need_lower = for (name) |c| {
+        if (std.ascii.isLower(c)) break false;
+    } else true;
     var need_upper = capitalize;
     var i: usize = start_index;
     var j: usize = 0;
@@ -2692,7 +2725,10 @@ pub fn camelize(allocator: std.mem.Allocator, name: []const u8, start_index: usi
                 buffer[j] = std.ascii.toUpper(name[i]);
                 need_upper = false;
             } else {
-                buffer[j] = std.ascii.toLower(name[i]);
+                buffer[j] = if (need_lower or (j == 0 and !capitalize))
+                    std.ascii.toLower(name[i])
+                else
+                    name[i];
             }
             j += 1;
         }
@@ -2715,6 +2751,8 @@ test "camelize" {
     try expectEqualSlices(u8, "GreenDragon", name2);
     const name3 = try camelize(allocator, "ANIMAL_GREEN_DRAGON", 0, true);
     try expectEqualSlices(u8, "AnimalGreenDragon", name3);
+    const name4 = try camelize(allocator, "AnimalGreenDragon", 6, false);
+    try expectEqualSlices(u8, "greenDragon", name4);
 }
 
 pub fn snakify(allocator: std.mem.Allocator, name: []const u8, start_index: usize) ![]const u8 {
