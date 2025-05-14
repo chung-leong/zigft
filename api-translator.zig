@@ -1,6 +1,10 @@
 const std = @import("std");
 const fn_transform = @import("./fn-transform.zig");
 
+pub const EnumInfo = struct {
+    name: []const u8,
+    tag_type: []const u8,
+};
 pub const CodeGeneratorOptions = struct {
     pub const ErrorValue = struct {
         type: []const u8,
@@ -13,6 +17,7 @@ pub const CodeGeneratorOptions = struct {
     zigft_path: []const u8 = "",
     translater: []const u8 = "c_to_zig",
     error_set: []const u8 = "Error",
+    error_enum: ?[]const u8 = null,
     c_error_type: ?[]const u8 = null,
     c_error_values: ?[]const ErrorValue = null,
     c_import: []const u8 = "c",
@@ -43,6 +48,9 @@ pub const CodeGeneratorOptions = struct {
     param_is_input_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) bool = neverInput,
     // callback returning the index of the corresponding pointer argument if it should be treated as the length of a slice pointer
     param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = neverSliceLength,
+
+    // callback for converting constants into enum
+    const_is_enum_item_fn: fn (const_name: []const u8) ?EnumInfo = notEnumItem,
 
     // calling determining whether positive status is needed
     status_is_returned_fn: fn (fn_name: []const u8) bool = neverReturned,
@@ -629,7 +637,7 @@ pub const Expression = union(enum) {
         };
         pub const Enumeration = struct {
             items: []EnumItem = &.{},
-            is_signed: bool,
+            tag_type: []const u8,
             is_exhaustive: bool = false,
         };
         pub const Function = struct {
@@ -978,7 +986,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return .{
                 .enumeration = .{
                     .items = items,
-                    .is_signed = is_signed,
+                    .tag_type = if (is_signed) "c_int" else "c_uint",
                 },
             };
         }
@@ -1062,6 +1070,34 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateDeclarations(self: *@This()) !void {
+            // convert constants to enum
+            var constant_map: std.StringHashMap(?*Expression) = .init(self.allocator);
+            for (self.old_root.type.container.decls) |decl| {
+                if (self.isTypeOf(decl.type, .function) or self.isType(decl.expr)) continue;
+                const value = self.extractInteger(decl.expr) orelse continue;
+                if (options.const_is_enum_item_fn(decl.name)) |enum_info| {
+                    const enum_expr, const is_new_enum = get: {
+                        if (self.new_namespace.getExpression(enum_info.name)) |expr| {
+                            break :get .{ @constCast(expr), false };
+                        } else {
+                            const expr = try self.createType(.{
+                                .enumeration = .{
+                                    .items = &.{},
+                                    .tag_type = enum_info.tag_type,
+                                },
+                            });
+                            try self.new_namespace.addExpression(enum_info.name, expr);
+                            break :get .{ expr, true };
+                        }
+                    };
+                    const item_name = try self.transformName(decl.name, .@"enum");
+                    try self.append(&enum_expr.type.enumeration.items, .{
+                        .name = item_name,
+                        .value = value,
+                    });
+                    try constant_map.put(decl.name, if (is_new_enum) enum_expr else null);
+                }
+            }
             if (options.c_error_type != null or options.c_error_values != null) {
                 // add error set first
                 const error_set, const non_error_count = try self.deriveErrorSet();
@@ -1076,18 +1112,26 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             // translate all declarations
             var new_name_map: std.StringHashMap(bool) = .init(self.allocator);
             for (self.old_root.type.container.decls) |decl| {
-                if (options.filter_fn(decl.name)) {
+                if (constant_map.get(decl.name)) |outcome| {
+                    // insert new enum type if decl is the first item
+                    const enum_type = outcome orelse continue;
+                    const new_name = self.new_namespace.getName(enum_type).?;
+                    try new_name_map.put(new_name, true);
+                    const doc_comment = try options.doc_comment_fn(self.allocator, decl.name, new_name);
+                    try self.append(&self.new_root.type.container.decls, .{
+                        .name = new_name,
+                        .expr = enum_type,
+                        .doc_comment = doc_comment,
+                    });
+                } else if (options.filter_fn(decl.name)) {
                     // get name in target namespace
                     const transform: NameContext = if (self.isTypeOf(decl.type, .function))
                         .@"fn"
-                    else switch (decl.expr.*) {
-                        .type, .identifier => .type,
-                        else => .@"const",
-                    };
+                    else if (self.isType(decl.expr))
+                        .type
+                    else
+                        .@"const";
                     const new_name = try self.transformName(decl.name, transform);
-                    if (std.mem.eql(u8, decl.name, "php_stream")) {
-                        std.debug.print("{s} => {s}\n", .{ decl.name, new_name });
-                    }
                     if (new_name_map.get(new_name)) |_| continue;
                     try new_name_map.put(new_name, true);
                     const new_type = if (decl.type) |t| try self.translateExpression(t) else null;
@@ -1459,7 +1503,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 return .{
                     .enumeration = .{
                         .items = new_items,
-                        .is_signed = e.is_signed,
+                        .tag_type = e.tag_type,
                     },
                 };
             }
@@ -1938,6 +1982,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             } else false;
         }
 
+        fn isType(self: *@This(), expr: *const Expression) bool {
+            if (expr.* == .type) return true;
+            if (expr.* == .identifier) {
+                if (self.old_namespace.getExpression(expr.identifier)) |ref_expr| {
+                    return self.isType(ref_expr);
+                } else if (std.zig.primitives.isPrimitive(expr.identifier)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         fn resolveType(self: *@This(), expr: *const Expression, ns: NamespaceType) *const Expression {
             if (expr.* != .identifier) return expr;
             const namespace = if (ns == .new) self.new_namespace else self.old_namespace;
@@ -1980,6 +2036,33 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
         }
 
+        fn extractInteger(self: *@This(), expr: *const Expression) ?i128 {
+            switch (expr.*) {
+                .any => |code| {
+                    var s: []const u8 = code;
+                    inline for (.{
+                        .{ "@as(c_int, ", ")" },
+                        .{ "@as(c_uint, ", ")" },
+                        .{ "@import(\"std\").zig.c_translation.promoteIntLiteral(c_int, ", ", .hex)" },
+                        .{ "@import(\"std\").zig.c_translation.promoteIntLiteral(c_uint, ", ", .hex)" },
+                        .{ "__UINT64_C(", ")" },
+                        .{ "__INT64_C(", ")" },
+                    }) |pair| {
+                        const start, const end = pair;
+                        if (std.mem.startsWith(u8, s, start) and std.mem.endsWith(u8, s, end)) {
+                            s = s[start.len .. s.len - end.len];
+                        }
+                    }
+                    return std.fmt.parseInt(i128, s, 0) catch null;
+                },
+                .identifier => |i| if (self.old_namespace.getExpression(i)) |ref_expr| {
+                    return self.extractInteger(ref_expr);
+                },
+                else => {},
+            }
+            return null;
+        }
+
         fn shouldReturnErrorUnion(
             self: *@This(),
             fn_name: []const u8,
@@ -2007,6 +2090,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var non_error_enum_count: usize = 0;
             if (options.c_error_type) |enum_name| {
                 if (self.old_namespace.getExpression(enum_name)) |expr| {
+                    if (expr.* == .type and expr.type == .enumeration) {
+                        for (expr.type.enumeration.items) |item| {
+                            if (options.enum_is_error_fn(item.name, item.value)) {
+                                const err_name = try self.transformName(item.name, .@"error");
+                                try self.append(&names, err_name);
+                            } else non_error_enum_count += 1;
+                        }
+                    }
+                }
+            }
+            if (options.error_enum) |enum_name| {
+                if (self.new_namespace.getExpression(enum_name)) |expr| {
                     if (expr.* == .type and expr.type == .enumeration) {
                         for (expr.type.enumeration.items) |item| {
                             if (options.enum_is_error_fn(item.name, item.value)) {
@@ -2179,18 +2274,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn obtainErrorScheme(self: *@This()) !?*const Expression {
-            if (options.c_error_type) |enum_name| {
+            const error_set = self.new_namespace.getExpression(options.error_set) orelse return error.Unexpected;
+            const error_enum_type: ?*const Expression = find: {
+                if (options.error_enum) |enum_name| {
+                    break :find self.new_namespace.getExpression(enum_name) orelse {
+                        std.debug.print("Unable to find error enum type '{s}'", .{enum_name});
+                        return error.Unexpected;
+                    };
+                } else if (options.c_error_type) |enum_name| {
+                    const enum_type_zig = translateCType(enum_name);
+                    if (self.old_namespace.getExpression(enum_type_zig)) |old_enum| {
+                        break :find try self.translateExpression(old_enum);
+                    } else {
+                        break :find try self.createIdentifier("{s}", .{enum_type_zig});
+                    }
+                }
+                break :find null;
+            };
+            if (error_enum_type) |new_enum| {
                 const fn_ref = try self.createIdentifier("api_translator.BasicErrorScheme", .{});
                 var arguments: []*const Expression = &.{};
-                const enum_type_zig = translateCType(enum_name);
-                if (self.old_namespace.getExpression(enum_type_zig)) |old_enum| {
-                    const new_enum = try self.translateExpression(old_enum);
-                    try self.append(&arguments, new_enum);
-                } else {
-                    try self.append(&arguments, try self.createIdentifier("{s}", .{enum_type_zig}));
-                }
-                const error_set = self.new_namespace.getExpression(options.error_set) orelse
-                    return error.Unexpected;
+                try self.append(&arguments, new_enum);
                 try self.append(&arguments, error_set);
                 try self.append(&arguments, try self.createIdentifier("{s}.Unexpected", .{options.error_set}));
                 return try self.createExpression(.{
@@ -2198,8 +2302,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 });
             } else if (options.c_error_values) |values| {
                 const fn_ref = try self.createIdentifier("api_translator.InvalidReturnValueScheme", .{});
-                const error_set = self.new_namespace.getExpression(options.error_set) orelse
-                    return error.Unexpected;
                 var arguments: []*const Expression = &.{};
                 try self.append(&arguments, error_set);
                 try self.append(&arguments, try self.createIdentifier("{s}.Unexpected", .{options.error_set}));
@@ -2453,7 +2555,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn printEnumerationDef(self: *@This(), e: Expression.Type.Enumeration, _: NamespaceType) anyerror!void {
-            try self.printFmt("enum({s}) {{\n", .{if (e.is_signed) "c_int" else "c_uint"});
+            try self.printFmt("enum({s}) {{\n", .{e.tag_type});
             const is_sequential = for (e.items, 0..) |item, index| {
                 if (index > 0 and item.value != e.items[index - 1].value + 1) break false;
             } else true;
@@ -2839,6 +2941,14 @@ pub fn notFunctionSpecific(_: []const u8, _: ?[]const u8, _: usize, _: []const u
 
 pub fn neverInput(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) bool {
     return false;
+}
+
+pub fn notErrorValue(_: []const u8) bool {
+    return false;
+}
+
+pub fn notEnumItem(_: []const u8) ?EnumInfo {
+    return null;
 }
 
 pub fn neverSliceLength(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?usize {
