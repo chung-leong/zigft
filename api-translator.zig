@@ -4,6 +4,7 @@ const fn_transform = @import("./fn-transform.zig");
 pub const EnumInfo = struct {
     name: []const u8,
     tag_type: []const u8,
+    is_packed_struct: bool = false,
 };
 pub const CodeGeneratorOptions = struct {
     pub const ErrorValue = struct {
@@ -24,9 +25,13 @@ pub const CodeGeneratorOptions = struct {
     c_root_struct: ?[]const u8 = null,
     add_simple_test: bool = true,
     late_bind_expr: ?[]const u8 = null,
+    ignore_omission: bool = false,
 
     // callback determining which declarations to include
     filter_fn: fn (name: []const u8) bool,
+
+    param_override_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?[]const u8 = noParamOverride,
+    retval_override_fn: fn (fn_name: []const u8, param_type: []const u8) ?[]const u8 = noRetvalOverride,
 
     // callback determining to const pointer to struct should become by-value
     type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
@@ -49,7 +54,7 @@ pub const CodeGeneratorOptions = struct {
     // callback returning the index of the corresponding pointer argument if it should be treated as the length of a slice pointer
     param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = neverSliceLength,
 
-    // callback for converting constants into enum
+    // callback for converting constants into enum and packed struct
     const_is_enum_item_fn: fn (const_name: []const u8) ?EnumInfo = notEnumItem,
 
     // calling determining whether positive status is needed
@@ -603,12 +608,14 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
 pub const Expression = union(enum) {
     identifier: []const u8,
+    empty: void,
     any: []const u8,
     type: Type,
     array_init: ArrayInit,
     struct_init: StructInit,
     function_call: FunctionCall,
     function_body: []const u8,
+    reference_to: *const Expression,
 
     pub const Type = union(enum) {
         container: Container,
@@ -690,6 +697,7 @@ pub const Declaration = struct {
     name: []const u8,
     type: ?*const Expression = null,
     alignment: ?[]const u8 = null,
+    extern_export: ?[]const u8 = null,
     mutable: bool = false,
     expr: *const Expression,
     doc_comment: ?[]const u8 = null,
@@ -783,6 +791,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         output_writer: std.io.AnyWriter,
         need_inout_import: bool,
         add_child_type: bool,
+        new_root_original_type: ?*const Expression,
 
         pub fn init(allocator: std.mem.Allocator) !*@This() {
             var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -809,6 +818,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.byte_array = .init(self.allocator);
             self.need_inout_import = false;
             self.add_child_type = false;
+            self.new_root_original_type = null;
             return self;
         }
 
@@ -871,6 +881,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const expr = try self.obtainExpressionEx(tree, decl.ast.init_node, true);
             try self.append(&self.old_root.type.container.decls, .{
                 .mutable = std.mem.eql(u8, "var", tree.tokenSlice(decl.ast.mut_token)),
+                .extern_export = if (decl.extern_export_token) |t| tree.tokenSlice(t) else null,
                 .name = var_name,
                 .type = var_type,
                 .alignment = nodeSlice(tree, decl.ast.align_node),
@@ -886,7 +897,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn obtainExpressionEx(self: *@This(), tree: Ast, node: Ast.Node.Index, is_rhs: bool) !*const Expression {
             var buffer1: [1]Ast.Node.Index = undefined;
             var buffer2: [2]Ast.Node.Index = undefined;
-            if (node == 0) return &.{ .any = "" };
+            if (node == 0) return self.createExpression(.{ .empty = {} });
             const type_maybe = if (tree.fullFnProto(&buffer1, node)) |fn_proto|
                 try self.obtainFunctionType(tree, fn_proto)
             else if (tree.fullContainerDecl(&buffer2, node)) |decl|
@@ -1072,12 +1083,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateDeclarations(self: *@This()) !void {
             // convert constants to enum
             var constant_map: std.StringHashMap(?*Expression) = .init(self.allocator);
+            var packed_structs: std.ArrayList(*Expression) = .init(self.allocator);
             for (self.old_root.type.container.decls) |decl| {
                 if (self.isTypeOf(decl.type, .function) or self.isType(decl.expr)) continue;
                 const value = self.extractInteger(decl.expr) orelse continue;
                 if (options.const_is_enum_item_fn(decl.name)) |enum_info| {
                     const enum_expr, const is_new_enum = get: {
                         if (self.new_namespace.getExpression(enum_info.name)) |expr| {
+                            if (!self.isTypeOf(expr, .enumeration)) {
+                                std.debug.print("'{s}' is not an enumeration type\n", .{enum_info.name});
+                                return error.Unexpected;
+                            }
                             break :get .{ @constCast(expr), false };
                         } else {
                             const expr = try self.createType(.{
@@ -1096,10 +1112,18 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .value = value,
                     });
                     try constant_map.put(decl.name, if (is_new_enum) enum_expr else null);
+                    if (is_new_enum and enum_info.is_packed_struct) {
+                        // remember that the enum is actually a packed struct
+                        try packed_structs.append(enum_expr);
+                    }
                 }
             }
+            // convert enums to packed structs now that we have the complete sets of values
+            for (packed_structs.items) |expr| {
+                expr.type = .{ .container = try self.convertEnumToPackedStruct(expr.type.enumeration) };
+            }
+            // add error set first if functions return one
             if (options.c_error_type != null or options.c_error_values != null) {
-                // add error set first
                 const error_set, const non_error_count = try self.deriveErrorSet();
                 try self.append(&self.new_root.type.container.decls, .{
                     .name = options.error_set,
@@ -1124,6 +1148,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         .doc_comment = doc_comment,
                     });
                 } else if (options.filter_fn(decl.name)) {
+                    // skip if decl results in @compileError
+                    if (decl.expr.* == .any) {
+                        const code = decl.expr.any;
+                        if (std.mem.containsAtLeast(u8, code, 1, "@compileError")) {
+                            if (!options.ignore_omission) {
+                                std.debug.print("Omitting '{s}' since it's defined as {s}\n", .{ decl.name, code });
+                            }
+                            continue;
+                        }
+                    }
                     // get name in target namespace
                     const transform: NameContext = if (self.isTypeOf(decl.type, .function))
                         .@"fn"
@@ -1134,10 +1168,20 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const new_name = try self.transformName(decl.name, transform);
                     if (new_name_map.get(new_name)) |_| continue;
                     try new_name_map.put(new_name, true);
+                    const doc_comment = try options.doc_comment_fn(self.allocator, decl.name, new_name);
+                    if (decl.extern_export) |e| {
+                        if (std.mem.eql(u8, e, "extern")) {
+                            try self.append(&self.new_root.type.container.decls, .{
+                                .name = new_name,
+                                .expr = try self.createExpression(.{ .reference_to = decl.expr }),
+                                .doc_comment = doc_comment,
+                            });
+                        }
+                        continue;
+                    }
                     const new_type = if (decl.type) |t| try self.translateExpression(t) else null;
                     const expr = try self.translateDefinition(decl.expr);
                     try self.new_namespace.addExpression(new_name, expr);
-                    const doc_comment = try options.doc_comment_fn(self.allocator, decl.name, new_name);
                     try self.append(&self.new_root.type.container.decls, .{
                         .name = new_name,
                         .type = new_type,
@@ -1243,21 +1287,23 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return self.translateExpression(expr);
         }
 
-        fn translateExpression(self: *@This(), expr: *const Expression) std.mem.Allocator.Error!*const Expression {
+        fn translateExpression(self: *@This(), expr: *const Expression) !*const Expression {
             return self.translateExpressionEx(expr, false);
         }
+
+        const TranslateError = std.mem.Allocator.Error || error{Unexpected};
 
         fn translateExpressionEx(
             self: *@This(),
             expr: *const Expression,
             is_pointer_target: bool,
-        ) std.mem.Allocator.Error!*const Expression {
+        ) TranslateError!*const Expression {
             if (self.old_to_new_map.get(expr)) |new_expr| {
                 return new_expr;
             } else {
                 switch (expr.*) {
                     .type => |t| {
-                        const new_expr = try self.createExpression(.{ .any = "" });
+                        const new_expr = try self.createExpression(.{ .empty = {} });
                         try self.old_to_new_map.put(expr, new_expr);
                         const new_type = switch (t) {
                             .container => try self.translateContainer(expr),
@@ -1298,37 +1344,42 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             };
         }
 
-        fn translateParameter(
-            self: *@This(),
-            param: Parameter,
+        const ParameterOptions = struct {
             is_pointer_target: bool,
             is_inout: bool,
             optionality: ?bool,
+            type_override: ?*const Expression,
+        };
+
+        fn translateParameter(
+            self: *@This(),
+            param: Parameter,
+            param_opt: ParameterOptions,
         ) !Parameter {
             const new_name = if (param.name) |n| try self.transformName(n, .param) else null;
-            const param_type = swap: {
+            const new_type = param_opt.type_override orelse swap: {
+                var param_type: *const Expression = param.type;
                 if (self.getPointerInfo(param.type)) |p| {
                     // const pointer to struct and union can become by-value argument
                     if (p.is_const and self.isTypeOf(p.child_type, .container)) {
                         if (!self.isOpaque(p.child_type)) {
                             const type_name = try self.obtainTypeName(p.child_type, .old);
-                            if (!is_pointer_target and options.type_is_by_value_fn(type_name)) {
-                                break :swap p.child_type;
+                            if (!param_opt.is_pointer_target and options.type_is_by_value_fn(type_name)) {
+                                param_type = p.child_type;
                             }
                         }
                     }
                 }
-                break :swap param.type;
+                var new_param_type = try self.translateExpression(param_type);
+                if (param_opt.optionality) |is_optional| {
+                    new_param_type = try self.changeOptionality(new_param_type, is_optional);
+                }
+                break :swap new_param_type;
             };
-
-            var new_type = try self.translateExpression(param_type);
-            if (optionality) |is_optional| {
-                new_type = try self.changeOptionality(new_type, is_optional);
-            }
             return .{
                 .name = new_name,
                 .type = new_type,
-                .is_inout = is_inout,
+                .is_inout = param_opt.is_inout,
             };
         }
 
@@ -1337,6 +1388,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 std.debug.print("Cannot convert '{s}' to container type\n", .{name});
                 return error.Unexpected;
             }
+            const original_type = try self.createExpression(expr.*);
+            self.new_root_original_type = original_type;
             if (std.mem.eql(u8, expr.identifier, "anyopaque")) {
                 expr.* = .{
                     .type = .{
@@ -1345,10 +1398,9 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 };
             } else {
                 var fields: []Field = &.{};
-                const base_type = try self.createExpression(expr.*);
                 try self.append(&fields, .{
                     .name = "_",
-                    .type = base_type,
+                    .type = original_type,
                 });
                 expr.* = .{
                     .type = .{
@@ -1430,83 +1482,84 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn translateEnumeration(self: *@This(), expr: *const Expression) !Expression.Type {
             const e = expr.type.enumeration;
+            var new_items: []EnumItem = &.{};
+            for (e.items) |item| {
+                const new_field = try self.translateEnumItem(item);
+                try self.append(&new_items, new_field);
+            }
+            const new_enum: Expression.Type.Enumeration = .{
+                .items = new_items,
+                .tag_type = e.tag_type,
+            };
             const enum_name = try self.obtainTypeName(expr, .old);
             if (options.enum_is_packed_struct_fn(enum_name)) {
-                var pow2_items: []EnumItem = &.{};
-                for (e.items) |item| {
-                    if (item.value != 0 and std.math.isPowerOfTwo(item.value)) {
-                        try self.append(&pow2_items, item);
-                    }
-                }
-                std.mem.sort(EnumItem, pow2_items, {}, struct {
-                    fn compare(_: void, lhs: EnumItem, rhs: EnumItem) bool {
-                        return lhs.value < rhs.value;
-                    }
-                }.compare);
-                var blank_field_name: []const u8 = "_";
-                var bits_used: isize = 0;
-                var bit_fields: []Field = &.{};
-                var new_fields: []Field = &.{};
-                for (pow2_items) |item| {
-                    const pos = @ctz(item.value);
-                    if (bits_used != pos) {
-                        // insert filler
-                        const blank_field = try self.createBlankField(blank_field_name, pos - bits_used);
-                        try self.append(&new_fields, blank_field);
-                        blank_field_name = try self.allocPrint("{s}{s}", .{ blank_field_name, "_" });
-                        bits_used = pos;
-                    }
-                    const new_field = try self.translateBitField(item);
-                    try self.append(&new_fields, new_field);
-                    try self.append(&bit_fields, new_field);
-                    bits_used += 1;
-                }
-                // insert final filler
-                const blank_field = try self.createBlankField(blank_field_name, -bits_used);
-                try self.append(&new_fields, blank_field);
-                var new_decls: []Declaration = &.{};
-                for (e.items) |item| {
-                    if (item.value == 0 or !std.math.isPowerOfTwo(item.value)) {
-                        var remaining = item.value;
-                        for (pow2_items) |other_item| remaining &= ~other_item.value;
-                        if (remaining == 0) {
-                            // it can be represented as a combination of field items
-                            var set_fields: []Field = &.{};
-                            for (pow2_items, 0..) |pow2_item, i| {
-                                if (item.value & pow2_item.value != 0) {
-                                    try self.append(&set_fields, bit_fields[i]);
-                                }
-                            }
-                            const decl = try self.createBitFieldDeclaration(item.name, set_fields);
-                            try self.append(&new_decls, decl);
-                        } else {
-                            const decl = try self.createIntDeclaration(item.name, item.value);
-                            try self.append(&new_decls, decl);
-                        }
-                    }
-                }
-                return .{
-                    .container = .{
-                        .layout = "packed",
-                        .kind = "struct",
-                        .backing_type = "c_uint",
-                        .fields = new_fields,
-                        .decls = new_decls,
-                    },
-                };
+                return .{ .container = try self.convertEnumToPackedStruct(new_enum) };
             } else {
-                var new_items: []EnumItem = &.{};
-                for (e.items) |item| {
-                    const new_field = try self.translateEnumItem(item);
-                    try self.append(&new_items, new_field);
-                }
-                return .{
-                    .enumeration = .{
-                        .items = new_items,
-                        .tag_type = e.tag_type,
-                    },
-                };
+                return .{ .enumeration = new_enum };
             }
+        }
+
+        fn convertEnumToPackedStruct(self: *@This(), e: Expression.Type.Enumeration) !Expression.Type.Container {
+            var pow2_items: []EnumItem = &.{};
+            for (e.items) |item| {
+                if (item.value != 0 and std.math.isPowerOfTwo(item.value)) {
+                    try self.append(&pow2_items, item);
+                }
+            }
+            std.mem.sort(EnumItem, pow2_items, {}, struct {
+                fn compare(_: void, lhs: EnumItem, rhs: EnumItem) bool {
+                    return lhs.value < rhs.value;
+                }
+            }.compare);
+            var blank_field_name: []const u8 = "_";
+            var bits_used: isize = 0;
+            var bit_fields: []Field = &.{};
+            var new_fields: []Field = &.{};
+            for (pow2_items) |item| {
+                const pos = @ctz(item.value);
+                if (bits_used != pos) {
+                    // insert filler
+                    const blank_field = try self.createBlankField(blank_field_name, pos - bits_used, null);
+                    try self.append(&new_fields, blank_field);
+                    blank_field_name = try self.allocPrint("{s}{s}", .{ blank_field_name, "_" });
+                    bits_used = pos;
+                }
+                const new_field = try self.translateBitField(item);
+                try self.append(&new_fields, new_field);
+                try self.append(&bit_fields, new_field);
+                bits_used += 1;
+            }
+            // insert final filler
+            const blank_field = try self.createBlankField(blank_field_name, -bits_used, e.tag_type);
+            try self.append(&new_fields, blank_field);
+            var new_decls: []Declaration = &.{};
+            for (e.items) |item| {
+                if (item.value == 0 or !std.math.isPowerOfTwo(item.value)) {
+                    var remaining = item.value;
+                    for (pow2_items) |other_item| remaining &= ~other_item.value;
+                    if (remaining == 0) {
+                        // it can be represented as a combination of field items
+                        var set_fields: []Field = &.{};
+                        for (pow2_items, 0..) |pow2_item, i| {
+                            if (item.value & pow2_item.value != 0) {
+                                try self.append(&set_fields, bit_fields[i]);
+                            }
+                        }
+                        const decl = try self.createBitFieldDeclaration(item.name, set_fields);
+                        try self.append(&new_decls, decl);
+                    } else {
+                        const decl = try self.createIntDeclaration(item.name, item.value);
+                        try self.append(&new_decls, decl);
+                    }
+                }
+            }
+            return .{
+                .layout = "packed",
+                .kind = "struct",
+                .backing_type = e.tag_type,
+                .fields = new_fields,
+                .decls = new_decls,
+            };
         }
 
         fn translateFunction(
@@ -1554,7 +1607,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             }
             // see if the translated function should return an error union
             const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(fn_name, expr);
-            const status_type = try self.translateExpression(f.return_type);
             const extra: usize = switch (return_error_union) {
                 true => switch (self.shouldIgnoreNonErrorRetval(fn_name, expr)) {
                     true => 0,
@@ -1566,17 +1618,45 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 false => if (self.isPrimitive(f.return_type, "void")) 0 else 1,
             };
             if (extra == 1) {
-                try self.append(&output_types, status_type);
+                const extra_output_type = find: {
+                    const type_name = try self.obtainTypeName(f.return_type, .old);
+                    if (options.retval_override_fn(fn_name, type_name)) |new_type_name| {
+                        if (self.new_namespace.getExpression(new_type_name)) |ref_type| {
+                            break :find ref_type;
+                        } else {
+                            std.debug.print("Unable to find new return type '{s}'", .{new_type_name});
+                            return error.Unexpected;
+                        }
+                    }
+                    break :find try self.translateExpression(f.return_type);
+                };
+                try self.append(&output_types, extra_output_type);
             }
             const arg_count = f.parameters.len + extra - output_types.len;
             for (f.parameters[0..arg_count], 0..) |param, index| {
                 // only pointer type can be optional
-                const is_optional: ?bool = if (self.getPointerInfo(param.type)) |p| check: {
-                    const type_name = try self.obtainTypeName(p.child_type, .old);
-                    break :check options.param_is_optional_fn(fn_name, param.name, index, type_name);
-                } else false;
-                const is_inout = inout_index == index;
-                const new_param = try self.translateParameter(param, is_pointer_target, is_inout, is_optional);
+                const type_name = try self.obtainTypeName(param.type, .old);
+                const new_param = try self.translateParameter(param, .{
+                    .is_pointer_target = is_pointer_target,
+                    .is_inout = inout_index == index,
+                    .optionality = check: {
+                        if (self.isPointer(param.type)) {
+                            break :check options.param_is_optional_fn(fn_name, param.name, index, type_name);
+                        }
+                        break :check false;
+                    },
+                    .type_override = find: {
+                        if (options.param_override_fn(fn_name, param.name, index, type_name)) |new_type_name| {
+                            if (self.new_namespace.getExpression(new_type_name)) |ref_type| {
+                                break :find ref_type;
+                            } else {
+                                std.debug.print("Unable to find new parameter type '{s}'", .{new_type_name});
+                                return error.Unexpected;
+                            }
+                        }
+                        break :find null;
+                    },
+                });
                 try self.append(&new_params, new_param);
             }
             const payload_type: *const Expression = switch (output_types.len) {
@@ -1638,8 +1718,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         // call to std.meta.Tuple()
                         const arg = eu.payload_type.function_call.arguments[0];
                         break :get arg.array_init.initializers;
-                    } else {
+                    } else if (!self.isPrimitive(eu.payload_type, "void")) {
                         break :get &.{eu.payload_type};
+                    } else {
+                        break :get &.{};
                     }
                 } else if (return_type.* == .function_call) {
                     const arg = return_type.function_call.arguments[0];
@@ -1682,8 +1764,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         const old_type = self.resolveType(sub.old_type, .old);
                         const new_type = self.resolveType(sub.new_type, .new);
                         for (global_substitution_counts) |*e| {
-                            if (isTypeEql(e.sub.old_type, old_type)) {
-                                if (isTypeEql(e.sub.new_type, new_type)) {
+                            if (self.isTypeEql(e.sub.old_type, old_type)) {
+                                if (self.isTypeEql(e.sub.new_type, new_type)) {
                                     e.score += 1;
                                     break;
                                 }
@@ -1713,7 +1795,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             var global_subs: []Substitution = &.{};
             for (global_substitution_counts) |*e| {
                 for (global_subs) |sub| {
-                    if (isTypeEql(sub.old_type, e.sub.old_type)) break;
+                    if (self.isTypeEql(sub.old_type, e.sub.old_type)) break;
                 } else {
                     try self.append(&global_subs, e.sub);
                 }
@@ -1747,10 +1829,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     const old_type = self.resolveType(sub.old_type, .old);
                     const new_type = self.resolveType(sub.new_type, .new);
                     const need_sub = for (global_subs) |g| {
-                        if (isTypeEql(g.old_type, old_type)) {
-                            break !isTypeEql(g.new_type, new_type);
+                        if (self.isTypeEql(g.old_type, old_type)) {
+                            break !self.isTypeEql(g.new_type, new_type);
                         }
-                    } else if (index != null) !isTypeEql(old_type, new_type) else false;
+                    } else if (index != null) !self.isTypeEql(old_type, new_type) else false;
                     if (need_sub) {
                         try self.append(&local_subs, .{ .index = index, .type = sub.new_type });
                     }
@@ -1809,10 +1891,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             } else return error.Unexpected;
         }
 
-        fn createBlankField(self: *@This(), name: []const u8, width: isize) !Field {
+        fn createBlankField(self: *@This(), name: []const u8, width: isize, backing_type: ?[]const u8) !Field {
             const field_type = switch (width > 0) {
                 true => try self.createIdentifier("u{d}", .{width}),
-                false => try self.createCode("std.meta.Int(.unsigned, @bitSizeOf(c_uint) - {d})", .{-width}),
+                false => try self.createCode("std.meta.Int(.unsigned, @bitSizeOf({s}) - {d})", .{
+                    backing_type.?,
+                    -width,
+                }),
             };
             return .{
                 .name = name,
@@ -2003,13 +2088,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return expr;
         }
 
-        fn isTypeEql(expr1: *const Expression, expr2: *const Expression) bool {
+        fn isTypeEql(self: *@This(), expr1: *const Expression, expr2: *const Expression) bool {
             if (expr1 == expr2) return true;
             if (expr1.* == .type and expr2.* == .type) {
                 switch (expr1.type) {
                     .pointer => |p1| switch (expr2.type) {
                         .pointer => |p2| {
-                            if (!isTypeEql(p1.child_type, p2.child_type)) return false;
+                            if (!self.isTypeEql(p1.child_type, p2.child_type)) return false;
                             if (!std.meta.eql(p1.alignment, p2.alignment)) return false;
                             if (!std.meta.eql(p1.sentinel, p2.sentinel)) return false;
                             if (p1.size != p2.size) return false;
@@ -2022,7 +2107,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     },
                     .optional => |o1| switch (expr2.type) {
                         .optional => |o2| {
-                            if (!isTypeEql(o1.child_type, o2.child_type)) return false;
+                            if (!self.isTypeEql(o1.child_type, o2.child_type)) return false;
                             return true;
                         },
                         else => return false,
@@ -2030,7 +2115,27 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     else => return false,
                 }
             } else if (expr1.* == .identifier and expr2.* == .identifier) {
-                return std.mem.eql(u8, expr1.identifier, expr2.identifier);
+                var id1 = expr1.identifier;
+                var id2 = expr2.identifier;
+                // pointer to void become pointer to anyopaque
+                if (std.mem.eql(u8, id1, "void")) id1 = "anyopaque";
+                if (std.mem.eql(u8, id2, "void")) id2 = "anyopaque";
+                if (std.mem.eql(u8, id1, id2)) {
+                    return true;
+                } else {
+                    var ref_expr1 = self.resolveType(expr1, .old);
+                    var ref_expr2 = self.resolveType(expr2, .old);
+                    if (self.new_root_original_type) |original_type| {
+                        // use original type of when target is the new root type
+                        if (ref_expr1 == self.new_root) ref_expr1 = original_type;
+                        if (ref_expr2 == self.new_root) ref_expr2 = original_type;
+                    }
+                    if (ref_expr1 != expr1 or ref_expr2 != expr2) {
+                        return self.isTypeEql(ref_expr1, ref_expr2);
+                    } else {
+                        return false;
+                    }
+                }
             } else {
                 return false;
             }
@@ -2422,6 +2527,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .array_init => |a| try self.printArrayInit(a, ns),
                 .struct_init => |s| try self.printStructInit(s, ns),
                 .function_call => |f| try self.printFunctionCall(f, ns),
+                .reference_to => |r| try self.printReferenceTo(r, ns),
                 .type => |t| switch (t) {
                     .container => |c| {
                         const current_root_before = self.current_root;
@@ -2436,6 +2542,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .error_union => |e| try self.printErrorUnionDef(e, ns),
                     .function => |f| try self.printFunctionDef(f, ns),
                 },
+                .empty => {},
             }
         }
 
@@ -2621,6 +2728,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.printRef(f.return_type, ns);
         }
 
+        fn printReferenceTo(self: *@This(), r: *const Expression, ns: NamespaceType) anyerror!void {
+            try self.printTxt("&");
+            try self.printRef(r, ns);
+        }
+
         fn printOptionalDef(self: *@This(), o: Expression.Type.Optional, ns: NamespaceType) anyerror!void {
             try self.printTxt("?");
             try self.printRef(o.child_type, ns);
@@ -2644,6 +2756,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn printDeclaration(self: *@This(), decl: Declaration, ns: NamespaceType) anyerror!void {
             if (decl.doc_comment) |c| try self.printDocComment(c);
             if (decl.public) try self.printTxt("pub ");
+            if (decl.extern_export) |e| try self.printFmt("{s}", .{e});
             const mut = if (decl.mutable) "var" else "const";
             try self.printFmt("{s} {s}", .{ mut, decl.name });
             if (decl.type) |t| {
@@ -2897,6 +3010,14 @@ test "snakify" {
     try expectEqualSlices(u8, "animal_green_dragon", name1);
     const name2 = try snakify(allocator, "AnimalGreenDragon", 6);
     try expectEqualSlices(u8, "green_dragon", name2);
+}
+
+pub fn noParamOverride(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?[]const u8 {
+    return null;
+}
+
+pub fn noRetvalOverride(_: []const u8, _: []const u8) ?[]const u8 {
+    return null;
 }
 
 pub fn makeNoChange(_: std.mem.Allocator, arg: []const u8) std.mem.Allocator.Error![]const u8 {
