@@ -538,6 +538,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     .pointer => @ptrCast(arg),
                     .optional => if (arg) |a| convert(T, a) else switch (@typeInfo(T)) {
                         .optional => null,
+                        .pointer => |pt| if (pt.is_allowzero) null else @panic("Unexpected null pointer"),
                         else => @panic("Unexpected null pointer"),
                     },
                     // converting "pass-by-value" to "pass-by-pointer"
