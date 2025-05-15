@@ -17,7 +17,7 @@ pub fn main() !void {
         .fn_name_fn = getFnName,
         .enum_name_fn = getEnumName,
         .error_name_fn = getErrorName,
-        .const_is_enum_item_fn = isEnumType,
+        .const_is_enum_item_fn = isEnumItem,
     }) = try .init(gpa.allocator());
     defer generator.deinit();
     // analyze the headers
@@ -70,7 +70,7 @@ fn overrideParam(_: []const u8, param_name: ?[]const u8, _: usize, _: []const u8
     } else null;
 }
 
-fn isEnumType(name: []const u8) ?api_translator.EnumInfo {
+fn isEnumItem(name: []const u8) ?api_translator.EnumInfo {
     return inline for (enum_types) |t| {
         if (std.mem.startsWith(u8, name, t.prefix)) break comptime t.type;
     } else null;

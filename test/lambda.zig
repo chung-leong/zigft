@@ -31,7 +31,7 @@ pub const isStruct1Null: fn () bool = c_to_zig.translate("lambda_is_struct1_null
 
 pub const acceptStruct2: fn (
     ptr: ?*const Struct,
-) Error!void = c_to_zig.translate("lambda_accept_struct2", true, false, .{});
+) Error!void = c_to_zig.translate("lambda_accept_struct2", true, false, .{ .@"0" = ?*const Struct });
 
 pub const isStruct2Null: fn () bool = c_to_zig.translate("lambda_is_struct2_null", false, false, .{});
 
@@ -49,7 +49,6 @@ pub const isUnionNull: fn () bool = c_to_zig.translate("lambda_is_union_null", f
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
-        .{ .old = [*c]const c.lambda_struct, .new = ?*const Struct },
         .{ .old = [*c]const c.lambda_union, .new = ?Union },
         .{ .old = c.lambda_struct_ptr, .new = StructPtr },
     },

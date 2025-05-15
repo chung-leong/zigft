@@ -425,6 +425,9 @@ test "CodeGenerator (theta)" {
         }
 
         fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            if (prefix.len > name.len) {
+                std.debug.print("name = {s}\n", .{name});
+            }
             return snakify(allocator, name, prefix.len);
         }
 
@@ -628,6 +631,101 @@ test "CodeGenerator (mu)" {
     const path = try std.fs.path.resolve(generator.allocator, &.{
         generator.cwd,
         "mu.zig",
+    });
+    const file = try std.fs.createFileAbsolute(path, .{});
+    try generator.print(file.writer());
+}
+
+test "CodeGenerator (nu)" {
+    const ns = struct {
+        const prefix = "nu_";
+        const enum_types = .{
+            .{
+                .prefix = "nu_error_",
+                .type = api_translator.EnumInfo{
+                    .name = "ErrorEnum",
+                    .tag_type = "c_int",
+                },
+            },
+            .{
+                .prefix = "nu_option_",
+                .type = api_translator.EnumInfo{
+                    .name = "Options",
+                    .tag_type = "u16",
+                    .is_packed_struct = true,
+                },
+            },
+        };
+        const type_overrides = .{
+            .options = "Options",
+            .arg_options = "Options",
+        };
+
+        fn filter(name: []const u8) bool {
+            return std.mem.startsWith(u8, name, prefix);
+        }
+
+        fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, false);
+        }
+
+        fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, prefix.len, true);
+        }
+
+        fn getEnumName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return inline for (enum_types) |t| {
+                if (std.mem.startsWith(u8, name, t.prefix)) {
+                    break snakify(allocator, name, t.prefix.len);
+                }
+            } else name;
+        }
+
+        fn getErrorName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+            return camelize(allocator, name, 0, true);
+        }
+
+        fn isEnumItem(name: []const u8) ?api_translator.EnumInfo {
+            return inline for (enum_types) |t| {
+                if (std.mem.startsWith(u8, name, t.prefix)) break t.type;
+            } else null;
+        }
+
+        fn overrideParam(_: []const u8, param_name: ?[]const u8, _: usize, _: []const u8) ?[]const u8 {
+            return inline for (std.meta.fields(@TypeOf(type_overrides))) |field| {
+                if (param_name) |name| {
+                    if (std.mem.eql(u8, name, field.name)) break @field(type_overrides, field.name);
+                }
+            } else null;
+        }
+
+        fn overrideField(_: []const u8, field_name: []const u8, _: []const u8) ?[]const u8 {
+            return inline for (std.meta.fields(@TypeOf(type_overrides))) |field| {
+                if (std.mem.eql(u8, field_name, field.name)) break @field(type_overrides, field.name);
+            } else null;
+        }
+    };
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var generator: *CodeGenerator(.{
+        .include_paths = &.{"."},
+        .header_paths = &.{"nu.c"},
+        .error_enum = "ErrorEnum",
+        .c_error_type = "int",
+        .c_root_struct = "nu",
+        .filter_fn = ns.filter,
+        .param_override_fn = ns.overrideParam,
+        .field_override_fn = ns.overrideField,
+        .type_name_fn = ns.getTypeName,
+        .fn_name_fn = ns.getFnName,
+        .enum_name_fn = ns.getEnumName,
+        .error_name_fn = ns.getErrorName,
+        .const_is_enum_item_fn = ns.isEnumItem,
+    }) = try .init(gpa.allocator());
+    defer generator.deinit();
+    try generator.analyze();
+    const path = try std.fs.path.resolve(generator.allocator, &.{
+        generator.cwd,
+        "nu.zig",
     });
     const file = try std.fs.createFileAbsolute(path, .{});
     try generator.print(file.writer());

@@ -32,6 +32,7 @@ pub const CodeGeneratorOptions = struct {
 
     param_override_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?[]const u8 = noParamOverride,
     retval_override_fn: fn (fn_name: []const u8, param_type: []const u8) ?[]const u8 = noRetvalOverride,
+    field_override_fn: fn (container_name: []const u8, field_name: []const u8, param_type: []const u8) ?[]const u8 = noFieldOverride,
 
     // callback determining to const pointer to struct should become by-value
     type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
@@ -535,7 +536,10 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 },
                 .pointer => switch (@typeInfo(AT)) {
                     .pointer => @ptrCast(arg),
-                    .optional => if (arg) |a| convert(T, a) else null,
+                    .optional => if (arg) |a| convert(T, a) else switch (@typeInfo(T)) {
+                        .optional => null,
+                        else => @panic("Unexpected null pointer"),
+                    },
                     // converting "pass-by-value" to "pass-by-pointer"
                     else => convert(T, &arg),
                 },
@@ -1335,11 +1339,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return expr;
         }
 
-        fn translateField(self: *@This(), field: Field) !Field {
+        fn translateField(self: *@This(), field: Field, type_override: ?*const Expression) !Field {
             const new_name = try self.transformName(field.name, .field);
             return .{
                 .name = new_name,
-                .type = try self.translateExpression(field.type),
+                .type = type_override orelse try self.translateExpression(field.type),
                 .alignment = field.alignment,
             };
         }
@@ -1438,8 +1442,21 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn translateContainer(self: *@This(), expr: *const Expression) !Expression.Type {
             const c = expr.type.container;
             var new_fields: []Field = &.{};
+            const container_name = try self.obtainTypeName(expr, .old);
             for (c.fields) |field| {
-                const new_field = try self.translateField(field);
+                const type_name = try self.obtainTypeName(field.type, .old);
+                const type_override = find: {
+                    if (options.field_override_fn(container_name, field.name, type_name)) |new_type_name| {
+                        if (self.new_namespace.getExpression(new_type_name)) |new_field_type| {
+                            break :find new_field_type;
+                        } else {
+                            std.debug.print("Unable to find new field type '{s}'", .{new_type_name});
+                            return error.Unexpected;
+                        }
+                    }
+                    break :find null;
+                };
+                const new_field = try self.translateField(field, type_override);
                 try self.append(&new_fields, new_field);
             }
             return .{
@@ -1832,7 +1849,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         if (self.isTypeEql(g.old_type, old_type)) {
                             break !self.isTypeEql(g.new_type, new_type);
                         }
-                    } else if (index != null) !self.isTypeEql(old_type, new_type) else false;
+                    } else !self.isTypeEql(old_type, new_type);
                     if (need_sub) {
                         try self.append(&local_subs, .{ .index = index, .type = sub.new_type });
                     }
@@ -1869,9 +1886,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn translateBitField(self: *@This(), item: EnumItem) !Field {
-            const new_name = try self.transformName(item.name, .@"enum");
             return .{
-                .name = new_name,
+                .name = item.name,
                 .type = try self.createIdentifier("bool", .{}),
                 .default_value = "false",
             };
@@ -2326,7 +2342,6 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 new_name: []const u8,
                 new_type: *const Expression,
             };
-            if (global_subs.len == 0) return null;
             var subs: []Sub = &.{};
             for (global_subs) |sub| {
                 const old_name = try self.obtainTypeName(sub.old_type, .new);
@@ -2361,6 +2376,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .struct_init = .{ .initializers = struct_initializers },
                 }));
             }
+            if (subs.len == 0) return null;
             return self.createExpression(.{
                 .array_init = .{
                     .initializers = slice_initializers,
@@ -2379,6 +2395,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         }
 
         fn obtainErrorScheme(self: *@This()) !?*const Expression {
+            if (options.c_error_type == null and options.c_error_values == null) return null;
             const error_set = self.new_namespace.getExpression(options.error_set) orelse return error.Unexpected;
             const error_enum_type: ?*const Expression = find: {
                 if (options.error_enum) |enum_name| {
@@ -3017,6 +3034,10 @@ pub fn noParamOverride(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?
 }
 
 pub fn noRetvalOverride(_: []const u8, _: []const u8) ?[]const u8 {
+    return null;
+}
+
+pub fn noFieldOverride(_: []const u8, _: []const u8, _: []const u8) ?[]const u8 {
     return null;
 }
 
