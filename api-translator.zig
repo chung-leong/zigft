@@ -32,7 +32,7 @@ pub const CodeGeneratorOptions = struct {
     retval_override_fn: fn (fn_name: []const u8, param_type: []const u8) ?[]const u8 = noRetvalOverride,
     field_override_fn: fn (container_name: []const u8, field_name: []const u8, param_type: []const u8) ?[]const u8 = noFieldOverride,
 
-    invalid_value_fn: fn (type_name: []const u8, new_type_name: []const u8) ?InvalidValue = ifOptionalPointer,
+    invalid_value_fn: fn (type_name: []const u8) ?InvalidValue = ifOptionalPointer,
 
     // callback determining to const pointer to struct should become by-value
     type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
@@ -2071,12 +2071,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn isReturningInvalidValue(self: *@This(), fn_expr: *const Expression) !bool {
             const ret_type = fn_expr.type.function.return_type;
-            const type_name = try self.obtainTypeName(ret_type, .old);
             const new_type = try self.translateExpression(ret_type);
-            const new_type_name = try self.obtainTypeName(new_type, .new);
-            const iv = self.invalid_value_map.get(ret_type) orelse check: {
-                if (options.invalid_value_fn(type_name, new_type_name)) |iv| {
-                    try self.invalid_value_map.put(ret_type, iv);
+            // if pointers kept optional then it's never invalid
+            if (self.isTypeOf(new_type, .optional)) return false;
+            const iv = self.invalid_value_map.get(new_type) orelse check: {
+                const type_name = try self.obtainTypeName(ret_type, .old);
+                if (options.invalid_value_fn(type_name)) |iv| {
+                    try self.invalid_value_map.put(new_type, iv);
                     // add error to error set
                     const es = @constCast(&self.new_error_set.type.error_set);
                     const has_name = for (es.names) |n| {
@@ -2431,13 +2432,17 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             // initializers for list of invalid values
             var array_initializers: []*const Expression = &.{};
             var iterator = self.invalid_value_map.iterator();
+            var added: std.StringHashMap(bool) = .init(self.allocator);
             while (iterator.next()) |entry| {
-                const old_type = entry.key_ptr.*;
+                const new_type = entry.key_ptr.*;
+                const new_type_name = try self.obtainTypeName(new_type, .new);
+                if (added.get(new_type_name) != null) continue;
+                try added.put(new_type_name, true);
                 const iv = entry.value_ptr.*;
                 var struct_initializers: []Expression.StructInit.Initializer = &.{};
                 try self.append(&struct_initializers, .{
                     .name = "type",
-                    .value = self.old_to_new_map.get(old_type) orelse return error.Unexpected,
+                    .value = new_type,
                 });
                 try self.append(&struct_initializers, .{
                     .name = "err_value",
@@ -3028,8 +3033,8 @@ test "snakify" {
     try expectEqualSlices(u8, "green_dragon", name2);
 }
 
-pub fn ifOptionalPointer(type_name: []const u8, new_type_name: []const u8) ?InvalidValue {
-    if (isOptionalPointer(type_name) and !isOptionalPointer(new_type_name)) return .{
+pub fn ifOptionalPointer(type_name: []const u8) ?InvalidValue {
+    if (isOptionalPointer(type_name)) return .{
         .err_name = "NullPointer",
         .err_value = "null",
     };

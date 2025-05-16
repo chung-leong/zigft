@@ -607,8 +607,8 @@ test "CodeGenerator (mu)" {
             return std.mem.startsWith(u8, name, prefix);
         }
 
-        fn getInvalidValue(type_name: []const u8, new_type_name: []const u8) ?api_translator.InvalidValue {
-            if (api_translator.ifOptionalPointer(type_name, new_type_name)) |iv| return iv;
+        fn getInvalidValue(type_name: []const u8) ?api_translator.InvalidValue {
+            if (api_translator.ifOptionalPointer(type_name)) |iv| return iv;
             if (std.mem.startsWith(u8, type_name, "mu_handle")) return .{
                 .err_name = "InvalidHandle",
                 .err_value = "INVALID_HANDLE",

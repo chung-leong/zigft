@@ -25,6 +25,7 @@ pub const Error = error{
     NotXmi,
     Max,
     Unexpected,
+    NullPointer,
 };
 pub const ErrorEnum = enum(c_int) {
     none,
@@ -77,7 +78,7 @@ pub const VIOFree = *const fn (
 
 pub const getString: fn (
     info: u16,
-) [*:0]const u8 = c_to_zig.translate("WildMidi_GetString", false, false, .{});
+) Error![*:0]const u8 = c_to_zig.translate("WildMidi_GetString", true, false, .{});
 
 pub const getVersion: fn () c_long = c_to_zig.translate("WildMidi_GetVersion", false, false, .{});
 
@@ -100,12 +101,12 @@ pub const masterVolume: fn (
 
 pub const open: fn (
     midifile: [*:0]const u8,
-) *@This() = c_to_zig.translate("WildMidi_Open", false, false, .{});
+) Error!*@This() = c_to_zig.translate("WildMidi_Open", true, false, .{});
 
 pub const openBuffer: fn (
     midibuffer: [*:0]const u8,
     size: u32,
-) *@This() = c_to_zig.translate("WildMidi_OpenBuffer", false, false, .{});
+) Error!*@This() = c_to_zig.translate("WildMidi_OpenBuffer", true, false, .{});
 
 pub const getMidiOutput: fn (
     handle: *@This(),
@@ -139,7 +140,7 @@ pub const convertBufferToMidi: fn (
 
 pub const getInfo: fn (
     handle: *@This(),
-) *Info = c_to_zig.translate("WildMidi_GetInfo", false, false, .{});
+) Error!*Info = c_to_zig.translate("WildMidi_GetInfo", true, false, .{});
 
 pub const fastSeek: fn (
     handle: *@This(),
@@ -158,9 +159,9 @@ pub const shutdown: fn () Error!void = c_to_zig.translate("WildMidi_Shutdown", t
 
 pub const getLyric: fn (
     handle: *@This(),
-) [*:0]u8 = c_to_zig.translate("WildMidi_GetLyric", false, false, .{});
+) Error![*:0]u8 = c_to_zig.translate("WildMidi_GetLyric", true, false, .{});
 
-pub const getError: fn () [*:0]u8 = c_to_zig.translate("WildMidi_GetError", false, false, .{});
+pub const getError: fn () Error![*:0]u8 = c_to_zig.translate("WildMidi_GetError", true, false, .{});
 
 pub const clearError: fn () void = c_to_zig.translate("WildMidi_ClearError", false, false, .{});
 
@@ -198,7 +199,12 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = [*c]u32, .new = *u32 },
         .{ .old = [*c]u8, .new = [*:0]u8 },
     },
-    .error_scheme = api_translator.BasicErrorScheme(ErrorEnum, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(ErrorEnum, Error, Error.Unexpected, .{
+        .{ .type = *Info, .err_value = null, .err = error.NullPointer },
+        .{ .type = *@This(), .err_value = null, .err = error.NullPointer },
+        .{ .type = [*:0]u8, .err_value = null, .err = error.NullPointer },
+        .{ .type = [*:0]const u8, .err_value = null, .err = error.NullPointer },
+    }),
 });
 
 test {

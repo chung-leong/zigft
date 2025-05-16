@@ -34,7 +34,6 @@ const c_to_zig = api_translator.Translator(.{
     },
     .error_scheme = api_translator.BasicErrorScheme(void, Error, Error.Unexpected, .{
         .{ .type = *anyopaque, .err_value = null, .err = error.NullPointer },
-        .{ .type = *anyopaque, .err_value = null, .err = error.NullPointer },
         .{ .type = *c_int, .err_value = null, .err = error.NullPointer },
         .{ .type = Handle, .err_value = c.INVALID_HANDLE, .err = error.InvalidHandle },
     }),

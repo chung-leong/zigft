@@ -47,13 +47,13 @@ pub const call1: fn () Error!void = c_to_zig.translate("eta_call1", true, false,
 pub const call2: fn (
     arg0: Struct,
     arg1: Hello,
-) Error!void = c_to_zig.translate("eta_call2", true, false, .{ .@"0" = Struct, .@"1" = Hello });
+) Error!void = c_to_zig.translate("eta_call2", true, false, .{ .@"1" = Hello });
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
     .substitutions = &.{
         .{ .old = [*c]const c.eta_call_table, .new = CallTable },
-        .{ .old = [*c]const c.eta_struct, .new = *const Struct },
+        .{ .old = [*c]const c.eta_struct, .new = Struct },
     },
     .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected, .{}),
 });
