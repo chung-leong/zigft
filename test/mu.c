@@ -9,6 +9,10 @@ void* mu_get_void_ptr(bool arg) {
     return (arg) ? &number : NULL;
 }
 
+void* mu_get_void_ptr_no_error() {
+    return &number;
+}
+
 int* mu_get_int_ptr(bool arg) {
     return (arg) ? &number : NULL;
 }

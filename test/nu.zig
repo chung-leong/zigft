@@ -9,6 +9,7 @@ pub const Error = error{
     File,
     InvalidArg,
     Unexpected,
+    NullPointer,
 };
 pub const ErrorEnum = enum(c_int) {
     none,
@@ -18,7 +19,7 @@ pub const ErrorEnum = enum(c_int) {
     _,
 };
 
-pub const get: fn () *@This() = c_to_zig.translate("nu_get", false, false, .{});
+pub const get: fn () Error!*@This() = c_to_zig.translate("nu_get", true, false, .{});
 
 pub const hello: fn (
     handle: *@This(),
@@ -52,7 +53,9 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = c.nu_struct, .new = Struct },
         .{ .old = u16, .new = Options },
     },
-    .error_scheme = api_translator.BasicErrorScheme(ErrorEnum, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(ErrorEnum, Error, Error.Unexpected, .{
+        .{ .type = *@This(), .err_value = null, .err = error.NullPointer },
+    }),
 });
 
 test {

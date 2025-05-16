@@ -6,12 +6,11 @@ pub const EnumInfo = struct {
     tag_type: []const u8,
     is_packed_struct: bool = false,
 };
+pub const InvalidValue = struct {
+    err_value: []const u8,
+    err_name: []const u8,
+};
 pub const CodeGeneratorOptions = struct {
-    pub const ErrorValue = struct {
-        type: []const u8,
-        name: []const u8,
-    };
-
     defines: []const []const u8 = &.{},
     include_paths: []const []const u8,
     header_paths: []const []const u8,
@@ -20,7 +19,6 @@ pub const CodeGeneratorOptions = struct {
     error_set: []const u8 = "Error",
     error_enum: ?[]const u8 = null,
     c_error_type: ?[]const u8 = null,
-    c_error_values: ?[]const ErrorValue = null,
     c_import: []const u8 = "c",
     c_root_struct: ?[]const u8 = null,
     add_simple_test: bool = true,
@@ -33,6 +31,8 @@ pub const CodeGeneratorOptions = struct {
     param_override_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?[]const u8 = noParamOverride,
     retval_override_fn: fn (fn_name: []const u8, param_type: []const u8) ?[]const u8 = noRetvalOverride,
     field_override_fn: fn (container_name: []const u8, field_name: []const u8, param_type: []const u8) ?[]const u8 = noFieldOverride,
+
+    invalid_value_fn: fn (type_name: []const u8, new_type_name: []const u8) ?InvalidValue = ifOptionalPointer,
 
     // callback determining to const pointer to struct should become by-value
     type_is_by_value_fn: fn (type_name: []const u8) bool = neverByValue,
@@ -108,6 +108,7 @@ pub fn BasicErrorScheme(
     old_enum_type: type,
     new_error_set: type,
     default_error: new_error_set,
+    invalid_values: anytype,
 ) type {
     @setEvalBranchQuota(2000000);
     const es_info = @typeInfo(new_error_set);
@@ -115,8 +116,8 @@ pub fn BasicErrorScheme(
     const en_info = @typeInfo(old_enum_type);
     const en_count = switch (en_info) {
         .@"enum" => |en| en.fields.len,
-        .int, .bool => 1,
-        else => @compileError("Enum, int, or bool expected, found '" ++ @typeName(old_enum_type) ++ "'"),
+        .int, .bool, .void => 1,
+        else => @compileError("Enum, int, bool, or void expected, found '" ++ @typeName(old_enum_type) ++ "'"),
     };
     const error_set = es_info.error_set orelse &.{};
     var error_enum_buffer: [error_set.len]struct {
@@ -154,6 +155,10 @@ pub fn BasicErrorScheme(
             non_error_status_buffer[0] = true;
             non_error_status_count += 1;
         },
+        .void => {
+            non_error_status_buffer[0] = {};
+            non_error_status_count += 1;
+        },
         else => unreachable,
     }
     const non_error_statuses = init: {
@@ -166,20 +171,50 @@ pub fn BasicErrorScheme(
         pub const Status = old_enum_type;
         pub const ErrorSet = new_error_set;
 
-        pub fn RetvalSubstitute(comptime T: type) type {
+        pub fn IntermediateReturnType(comptime T: type) type {
+            return inline for (invalid_values) |iv| {
+                if (iv.type == T) {
+                    break if (@typeInfo(iv.type) == .pointer) ?iv.type else iv.type;
+                }
+            } else if (!isStatus(T)) T else Status;
+        }
+
+        fn isStatus(comptime T: type) bool {
+            if (T == Status) return true;
             return switch (@typeInfo(Status)) {
-                .@"enum" => |en| if (en.tag_type == T) Status else T,
-                else => T,
+                .@"enum" => |en| en.tag_type == T,
+                else => false,
             };
         }
 
         pub fn OutputType(comptime T: type) type {
-            return if (T == Status and non_error_statuses.len <= 1) void else T;
+            return inline for (invalid_values) |iv| {
+                if (@typeInfo(iv.type) == .pointer) {
+                    if (T == ?iv.type) break iv.type;
+                } else {
+                    if (T == iv.type) break iv.type;
+                }
+            } else if (!isStatus(T)) T else switch (non_error_statuses.len) {
+                0, 1 => void,
+                else => Status,
+            };
         }
 
         pub fn check(retval: anytype) ErrorSet!OutputType(@TypeOf(retval)) {
             const T = @TypeOf(retval);
-            return switch (T) {
+            return inline for (invalid_values) |iv| {
+                // check invalid value table first
+                if (@typeInfo(iv.type) == .pointer) {
+                    if (T == ?iv.type) {
+                        break if (retval == iv.err_value) iv.err else retval.?;
+                    }
+                } else {
+                    if (T == iv.type) {
+                        break if (retval == iv.err_value) iv.err else retval;
+                    }
+                }
+            } else switch (T) {
+                // then see if retval is an error code
                 Status => if (std.mem.indexOfScalar(Status, &non_error_statuses, retval)) |_|
                     if (OutputType(T) == void) {} else retval
                 else for (error_enum_table) |entry| {
@@ -190,52 +225,8 @@ pub fn BasicErrorScheme(
         }
     };
 }
-pub fn InvalidReturnValueScheme(
-    error_set: type,
-    default_error: error_set,
-    invalid_values: anytype,
-) type {
-    return struct {
-        pub const ErrorSet = error_set;
-
-        pub fn RetvalSubstitute(comptime T: type) type {
-            return switch (@typeInfo(T)) {
-                .pointer => ?T,
-                else => T,
-            };
-        }
-
-        pub fn OutputType(comptime T: type) type {
-            return switch (@typeInfo(T)) {
-                .optional => |op| op.child,
-                else => T,
-            };
-        }
-
-        pub fn check(retval: anytype) ErrorSet!OutputType(@TypeOf(retval)) {
-            const T = @TypeOf(retval);
-            return switch (@typeInfo(T)) {
-                .optional => if (retval) |v| v else default_error,
-                else => inline for (invalid_values) |invalid_value| {
-                    const IV = @TypeOf(invalid_value);
-                    switch (@typeInfo(IV)) {
-                        .@"fn" => |f| {
-                            if (f.params.len != 1) @compileError("Function accepting one argument expected");
-                            if (f.return_type != bool) @compileError("Function returning bool expected");
-                            if (f.params[0].type == T)
-                                break if (invalid_value(retval)) default_error else retval;
-                        },
-                        else => if (T == IV) {
-                            break if (retval == invalid_value) default_error else retval;
-                        },
-                    }
-                } else @compileError("Unable to determine validity of '" ++ @typeName(T) ++ "'"),
-            };
-        }
-    };
-}
 pub const NullErrorScheme = struct {
-    pub fn OutputType(comptime T: type) type {
+    pub fn IntermediateReturnType(comptime T: type) type {
         return T;
     }
 };
@@ -258,7 +249,9 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             @setEvalBranchQuota(2000000);
             const old_fn = @typeInfo(OldFn).@"fn";
             const OldRT = old_fn.return_type.?;
-            const NewRT = RetvalSubstitute(OldRT, local_subs);
+            // Note: NewRT is not the new function's return type; it's just the old function's
+            // return type translated
+            const NewRT = Substitute(OldRT, local_subs, null, 0);
             const extra = switch (ignore_non_error_return_value) {
                 true => 0,
                 false => switch (return_error_union) {
@@ -340,7 +333,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             );
             const OldRT = @typeInfo(OldFn).@"fn".return_type.?;
             // NewRT is OldRT in the new namespace (usually an enum)
-            const NewRT = RetvalSubstitute(OldRT, local_subs);
+            const NewRT = Substitute(OldRT, local_subs, null, 0);
             // ReturnType is what the new function actually returns
             const ReturnType = @typeInfo(NewFn).@"fn".return_type.?;
             const Payload = switch (@typeInfo(ReturnType)) {
@@ -385,7 +378,11 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     } else @field(options.c_import_ns, fn_name);
                     // call original function
                     const old_rv = @call(.auto, func, old_args);
-                    const new_rv = convert(NewRT, old_rv);
+                    const IRT = switch (return_error_union) {
+                        true => options.error_scheme.IntermediateReturnType(NewRT),
+                        false => NewRT,
+                    };
+                    const new_rv = convert(IRT, old_rv);
                     // check outcome (if returning error union)
                     const output = switch (return_error_union) {
                         true => try options.error_scheme.check(new_rv),
@@ -592,14 +589,6 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 SwapType(T, .old_to_new);
         }
 
-        fn RetvalSubstitute(comptime T: type, tuple: anytype) type {
-            const NewRT = Substitute(T, tuple, null, 0);
-            return if (@hasDecl(options.error_scheme, "RetvalSubstitute"))
-                options.error_scheme.RetvalSubstitute(NewRT)
-            else
-                NewRT;
-        }
-
         fn WritableTarget(comptime T: type) ?type {
             const info = @typeInfo(T);
             if (info == .pointer and !info.pointer.is_const) {
@@ -797,6 +786,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         need_inout_import: bool,
         add_child_type: bool,
         new_root_original_type: ?*const Expression,
+        invalid_value_map: std.AutoHashMap(*const Expression, InvalidValue),
+        return_error_map: std.AutoHashMap(*const Expression, bool),
 
         pub fn init(allocator: std.mem.Allocator) !*@This() {
             var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -824,6 +815,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self.need_inout_import = false;
             self.add_child_type = false;
             self.new_root_original_type = null;
+            self.invalid_value_map = .init(self.allocator);
+            self.return_error_map = .init(self.allocator);
             return self;
         }
 
@@ -1055,7 +1048,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const code = try self.allocPrint(fmt, args);
                 return self.createExpression(.{ .any = code });
             } else {
-                return @constCast(&Expression{ .code = fmt });
+                return @constCast(&Expression{ .any = fmt });
             }
         }
 
@@ -1128,16 +1121,15 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 expr.type = .{ .container = try self.convertEnumToPackedStruct(expr.type.enumeration) };
             }
             // add error set first if functions return one
-            if (options.c_error_type != null or options.c_error_values != null) {
-                const error_set, const non_error_count = try self.deriveErrorSet();
-                try self.append(&self.new_root.type.container.decls, .{
-                    .name = options.error_set,
-                    .expr = error_set,
-                });
-                self.new_error_set = error_set;
-                self.non_error_enum_count = non_error_count;
-                try self.new_namespace.addExpression(options.error_set, error_set);
-            }
+            const error_set, const non_error_count = try self.deriveErrorSet();
+            try self.append(&self.new_root.type.container.decls, .{
+                .name = options.error_set,
+                .expr = error_set,
+            });
+            self.new_error_set = error_set;
+            self.non_error_enum_count = non_error_count;
+            try self.new_namespace.addExpression(options.error_set, error_set);
+
             // translate all declarations
             var new_name_map: std.StringHashMap(bool) = .init(self.allocator);
             for (self.old_root.type.container.decls) |decl| {
@@ -1239,8 +1231,8 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             }
                         }
                     } else unreachable;
-                    const return_error_union = self.shouldReturnErrorUnion(fn_name, t);
-                    const ignore_non_error_return_value = self.shouldIgnoreNonErrorRetval(fn_name, t);
+                    const return_error_union = try self.shouldReturnErrorUnion(fn_name, t);
+                    const ignore_non_error_return_value = try self.shouldIgnoreNonErrorRetval(fn_name, t);
                     const local_subs = try self.findLocalSubstitutions(t, new_type, global_subs);
                     const split_slices = try self.findSplitSlices(t, new_type);
                     // get translate() or translateMerge() call
@@ -1269,6 +1261,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 .name = options.translater,
                 .expr = try self.obtainTranslatorSetup(global_subs),
             });
+            // remove error set if it's not in use
+            if (!self.isUsingErrorSet()) {
+                self.remove(&self.new_root.type.container.decls, 0);
+            }
         }
 
         fn translateDefinition(self: *@This(), expr: *const Expression) !*const Expression {
@@ -1624,11 +1620,11 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 try self.append(&output_types, output_type);
             }
             // see if the translated function should return an error union
-            const return_error_union = !is_pointer_target and self.shouldReturnErrorUnion(fn_name, expr);
+            const return_error_union = !is_pointer_target and try self.shouldReturnErrorUnion(fn_name, expr);
             const extra: usize = switch (return_error_union) {
-                true => switch (self.shouldIgnoreNonErrorRetval(fn_name, expr)) {
+                true => switch (try self.shouldIgnoreNonErrorRetval(fn_name, expr)) {
                     true => 0,
-                    false => switch (self.isReturningStatus(expr)) {
+                    false => switch (try self.isReturningStatus(expr)) {
                         true => if (self.non_error_enum_count > 1) 1 else 0,
                         false => 1,
                     },
@@ -2065,23 +2061,35 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             try self.new_namespace.addExpression(name, base_type);
         }
 
-        fn isReturningStatus(self: *@This(), fn_expr: *const Expression) bool {
+        fn isReturningStatus(self: *@This(), fn_expr: *const Expression) !bool {
             const err_type = options.c_error_type orelse return false;
             const err_type_zig = translateCType(err_type);
             const ret_type = fn_expr.type.function.return_type;
-            const name = self.obtainTypeName(ret_type, .old) catch return false;
+            const name = try self.obtainTypeName(ret_type, .old);
             return std.mem.eql(u8, err_type_zig, name);
         }
 
-        fn isReturningInvalidValue(self: *@This(), fn_expr: *const Expression) bool {
-            const values = options.c_error_values orelse return false;
+        fn isReturningInvalidValue(self: *@This(), fn_expr: *const Expression) !bool {
             const ret_type = fn_expr.type.function.return_type;
-            // C pointers can be null, so they are considered potentially invalid values
-            if (self.isPointer(ret_type)) return true;
-            const name = self.obtainTypeName(ret_type, .old) catch return false;
-            return for (values) |value| {
-                if (std.mem.eql(u8, value.type, name)) break true;
-            } else false;
+            const type_name = try self.obtainTypeName(ret_type, .old);
+            const new_type = try self.translateExpression(ret_type);
+            const new_type_name = try self.obtainTypeName(new_type, .new);
+            const iv = self.invalid_value_map.get(ret_type) orelse check: {
+                if (options.invalid_value_fn(type_name, new_type_name)) |iv| {
+                    try self.invalid_value_map.put(ret_type, iv);
+                    // add error to error set
+                    const es = @constCast(&self.new_error_set.type.error_set);
+                    const has_name = for (es.names) |n| {
+                        if (std.mem.eql(u8, n, iv.err_name)) break true;
+                    } else false;
+                    if (!has_name) {
+                        try self.append(&es.names, iv.err_name);
+                    }
+                    break :check iv;
+                }
+                break :check null;
+            };
+            return iv != null;
         }
 
         fn isType(self: *@This(), expr: *const Expression) bool {
@@ -2189,22 +2197,22 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             self: *@This(),
             fn_name: []const u8,
             fn_expr: *const Expression,
-        ) bool {
-            return if (self.isReturningStatus(fn_expr) or self.isReturningInvalidValue(fn_expr))
-                options.error_union_is_returned_fn(fn_name)
-            else
-                false;
+        ) !bool {
+            return self.return_error_map.get(fn_expr) orelse check: {
+                const can_return = (try self.isReturningStatus(fn_expr)) or (try self.isReturningInvalidValue(fn_expr));
+                const does_return = can_return and options.error_union_is_returned_fn(fn_name);
+                try self.return_error_map.put(fn_expr, does_return);
+                break :check does_return;
+            };
         }
 
         fn shouldIgnoreNonErrorRetval(
             self: *@This(),
             fn_name: []const u8,
             fn_expr: *const Expression,
-        ) bool {
-            return if (self.non_error_enum_count > 1 and self.isReturningStatus(fn_expr))
-                !options.status_is_returned_fn(fn_name)
-            else
-                false;
+        ) !bool {
+            const can_return = self.non_error_enum_count > 1 and (try self.isReturningStatus(fn_expr));
+            return can_return and !options.status_is_returned_fn(fn_name);
         }
 
         fn deriveErrorSet(self: *@This()) !std.meta.Tuple(&.{ *const Expression, usize }) {
@@ -2395,10 +2403,16 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return name;
         }
 
+        fn isUsingErrorSet(self: *@This()) bool {
+            if (options.c_error_type != null or options.error_enum != null) return true;
+            if (self.invalid_value_map.count() != 0) return true;
+            return false;
+        }
+
         fn obtainErrorScheme(self: *@This()) !?*const Expression {
-            if (options.c_error_type == null and options.c_error_values == null) return null;
+            if (!self.isUsingErrorSet()) return null;
             const error_set = self.new_namespace.getExpression(options.error_set) orelse return error.Unexpected;
-            const error_enum_type: ?*const Expression = find: {
+            const error_enum = find: {
                 if (options.error_enum) |enum_name| {
                     break :find self.new_namespace.getExpression(enum_name) orelse {
                         std.debug.print("Unable to find error enum type '{s}'", .{enum_name});
@@ -2412,63 +2426,47 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                         break :find try self.createIdentifier("{s}", .{enum_type_zig});
                     }
                 }
-                break :find null;
+                break :find try self.createCode("void", .{});
             };
-            if (error_enum_type) |new_enum| {
-                const fn_ref = try self.createIdentifier("api_translator.BasicErrorScheme", .{});
-                var arguments: []*const Expression = &.{};
-                try self.append(&arguments, new_enum);
-                try self.append(&arguments, error_set);
-                try self.append(&arguments, try self.createIdentifier("{s}.Unexpected", .{options.error_set}));
-                return try self.createExpression(.{
-                    .function_call = .{ .fn_ref = fn_ref, .arguments = arguments },
+            // initializers for list of invalid values
+            var array_initializers: []*const Expression = &.{};
+            var iterator = self.invalid_value_map.iterator();
+            while (iterator.next()) |entry| {
+                const old_type = entry.key_ptr.*;
+                const iv = entry.value_ptr.*;
+                var struct_initializers: []Expression.StructInit.Initializer = &.{};
+                try self.append(&struct_initializers, .{
+                    .name = "type",
+                    .value = self.old_to_new_map.get(old_type) orelse return error.Unexpected,
                 });
-            } else if (options.c_error_values) |values| {
-                const fn_ref = try self.createIdentifier("api_translator.InvalidReturnValueScheme", .{});
-                var arguments: []*const Expression = &.{};
-                try self.append(&arguments, error_set);
-                try self.append(&arguments, try self.createIdentifier("{s}.Unexpected", .{options.error_set}));
-                var array_initializers: []*const Expression = &.{};
-                for (values) |value| {
-                    const value_type_zig = translateCType(value.type);
-                    const old_type = self.old_namespace.getExpression(value_type_zig) orelse
-                        try self.createIdentifier("{s}", .{value_type_zig});
-                    const new_type = try self.translateExpression(old_type);
-                    var value_ref = self.old_namespace.getExpression(value.name) orelse
-                        try self.createCode("{s}", .{value.name});
-                    if (self.isTypeOf(new_type, .enumeration) or self.isTypeOf(new_type, .container)) {
-                        // need @bitCast()
-                        var bc_arguments: []*const Expression = &.{};
-                        try self.append(&bc_arguments, value_ref);
-                        value_ref = try self.createExpression(.{
-                            .function_call = .{
-                                .fn_ref = try self.createIdentifier("@bitCast", .{}),
-                                .arguments = bc_arguments,
-                            },
-                        });
-                    }
-                    var as_arguments: []*const Expression = &.{};
-                    try self.append(&as_arguments, new_type);
-                    try self.append(&as_arguments, value_ref);
-                    try self.append(&array_initializers, try self.createExpression(.{
-                        .function_call = .{
-                            .fn_ref = try self.createIdentifier("@as", .{}),
-                            .arguments = as_arguments,
-                        },
-                    }));
-                }
-                try self.append(&arguments, try self.createExpression(.{
-                    .array_init = .{
-                        .initializers = array_initializers,
-                        .is_multiline = array_initializers.len > 0,
-                    },
+                try self.append(&struct_initializers, .{
+                    .name = "err_value",
+                    .value = try self.createIdentifier("{s}", .{iv.err_value}),
+                });
+                try self.append(&struct_initializers, .{
+                    .name = "err",
+                    .value = try self.createIdentifier("error.{s}", .{iv.err_name}),
+                });
+                try self.append(&array_initializers, try self.createExpression(.{
+                    .struct_init = .{ .initializers = struct_initializers },
                 }));
-                return try self.createExpression(.{
-                    .function_call = .{ .fn_ref = fn_ref, .arguments = arguments },
-                });
-            } else {
-                return null;
             }
+            const invalid_values = try self.createExpression(.{
+                .array_init = .{
+                    .initializers = array_initializers,
+                    .is_multiline = true,
+                },
+            });
+            const def_error = try self.createIdentifier("{s}.Unexpected", .{options.error_set});
+            const fn_ref = try self.createIdentifier("api_translator.BasicErrorScheme", .{});
+            var arguments: []*const Expression = &.{};
+            try self.append(&arguments, error_enum);
+            try self.append(&arguments, error_set);
+            try self.append(&arguments, def_error);
+            try self.append(&arguments, invalid_values);
+            return try self.createExpression(.{
+                .function_call = .{ .fn_ref = fn_ref, .arguments = arguments },
+            });
         }
 
         fn obtainTypeName(self: *@This(), expr: *const Expression, ns: NamespaceType) ![]const u8 {
@@ -3030,6 +3028,20 @@ test "snakify" {
     try expectEqualSlices(u8, "green_dragon", name2);
 }
 
+pub fn ifOptionalPointer(type_name: []const u8, new_type_name: []const u8) ?InvalidValue {
+    if (isOptionalPointer(type_name) and !isOptionalPointer(new_type_name)) return .{
+        .err_name = "NullPointer",
+        .err_value = "null",
+    };
+    return null;
+}
+
+pub fn isOptionalPointer(type_name: []const u8) bool {
+    return inline for (.{ "[*c]", "?*", "?[" }) |prefix| {
+        if (std.mem.startsWith(u8, type_name, prefix)) break true;
+    } else false;
+}
+
 pub fn noParamOverride(_: []const u8, _: ?[]const u8, _: usize, _: []const u8) ?[]const u8 {
     return null;
 }
@@ -3150,7 +3162,7 @@ test "Translator.SwapType" {
             .{ .old = *OldStruct, .new = *NewStruct },
             .{ .old = [*]OldStruct, .new = [*]NewStruct },
         },
-        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected),
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected, .{}),
     });
     const SwapType = c_to_zig.SwapType;
     const T1 = SwapType(OldStruct, .old_to_new);
@@ -3181,7 +3193,7 @@ test "Translator.Substitute" {
             .{ .old = *OldStruct, .new = *NewStruct },
             .{ .old = [*]OldStruct, .new = [*]NewStruct },
         },
-        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected),
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected, .{}),
     });
     const Substitute = c_to_zig.Substitute;
     const T1 = Substitute(OldStruct, .{}, 0, 1);
@@ -3202,7 +3214,7 @@ test "Translator.WritableTarget" {
     const c = struct {};
     const c_to_zig = Translator(.{
         .c_import_ns = c,
-        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected),
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected, .{}),
     });
     const WritableTarget = c_to_zig.WritableTarget;
     const Null = @TypeOf(null);
@@ -3224,7 +3236,7 @@ test "Translator.convert (basic)" {
     const c = struct {};
     const c_to_zig = Translator(.{
         .c_import_ns = c,
-        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected),
+        .error_scheme = BasicErrorScheme(c_uint, error{Unexpected}, error.Unexpected, .{}),
     });
     const convert = c_to_zig.convert;
     const OldStruct1 = extern struct {
@@ -3291,7 +3303,7 @@ test "Translator.convert (function pointer)" {
         .substitutions = &.{
             .{ .old = *const OldStruct1, .new = *const NewStruct1 },
         },
-        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, error.Unexpected),
+        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, error.Unexpected, .{}),
     });
     const convert = c_to_zig.convert;
     const ns = struct {
@@ -3346,7 +3358,7 @@ test "Translator.Translated" {
             .{ .old = []const OldStruct, .new = []const NewStruct },
             .{ .old = ?*const OldStruct, .new = *const NewStruct },
         },
-        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, error.Unexpected),
+        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, error.Unexpected, .{}),
     });
     const Fn1 = c_to_zig.Translated(fn (i32, OldStruct) StatusEnum, true, false, .{});
     try expectEqual(fn (i32, NewStruct) ErrorSet!void, Fn1);
@@ -3404,7 +3416,7 @@ test "Translator.translate" {
         .substitutions = &.{
             .{ .old = OldStruct, .new = NewStruct },
         },
-        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, error.Unexpected),
+        .error_scheme = BasicErrorScheme(StatusEnum, ErrorSet, error.Unexpected, .{}),
     });
     _ = ActionEnum;
     const func1 = c_to_zig.translate("hello", true, false, .{});

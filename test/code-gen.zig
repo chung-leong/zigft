@@ -607,6 +607,15 @@ test "CodeGenerator (mu)" {
             return std.mem.startsWith(u8, name, prefix);
         }
 
+        fn getInvalidValue(type_name: []const u8, new_type_name: []const u8) ?api_translator.InvalidValue {
+            if (api_translator.ifOptionalPointer(type_name, new_type_name)) |iv| return iv;
+            if (std.mem.startsWith(u8, type_name, "mu_handle")) return .{
+                .err_name = "InvalidHandle",
+                .err_value = "INVALID_HANDLE",
+            };
+            return null;
+        }
+
         fn getFnName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
             return camelize(allocator, name, prefix.len, false);
         }
@@ -614,17 +623,20 @@ test "CodeGenerator (mu)" {
         fn getTypeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
             return camelize(allocator, name, prefix.len, true);
         }
+
+        fn isReturningError(fn_name: []const u8) bool {
+            return !std.mem.endsWith(u8, fn_name, "_no_error");
+        }
     };
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     var generator: *CodeGenerator(.{
         .include_paths = &.{"."},
         .header_paths = &.{"mu.c"},
-        .c_error_values = &.{
-            .{ .type = "mu_handle", .name = "INVALID_HANDLE" },
-        },
         .filter_fn = ns.filter,
+        .invalid_value_fn = ns.getInvalidValue,
         .type_name_fn = ns.getTypeName,
         .fn_name_fn = ns.getFnName,
+        .error_union_is_returned_fn = ns.isReturningError,
     }) = try .init(gpa.allocator());
     defer generator.deinit();
     try generator.analyze();

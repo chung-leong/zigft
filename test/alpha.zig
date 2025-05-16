@@ -93,7 +93,7 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = [*c]const c.alpha_struct, .new = *const Struct },
         .{ .old = c.alpha_struct, .new = Struct },
     },
-    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected, .{}),
 });
 
 test {

@@ -18,7 +18,7 @@ pub const fail: fn () Error!void = c_to_zig.translate("gamma_fail", true, false,
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
-    .error_scheme = api_translator.BasicErrorScheme(bool, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(bool, Error, Error.Unexpected, .{}),
 });
 
 test {

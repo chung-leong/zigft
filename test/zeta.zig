@@ -41,7 +41,7 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = c.zeta_callback1, .new = Callback1 },
         .{ .old = c.zeta_callback2, .new = Callback2 },
     },
-    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected, .{}),
 });
 
 test {

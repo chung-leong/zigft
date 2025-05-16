@@ -54,7 +54,7 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = [*c]const u8, .new = [*:0]const u8 },
         .{ .old = c.beta_union, .new = Union },
     },
-    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected, .{}),
 });
 
 test {

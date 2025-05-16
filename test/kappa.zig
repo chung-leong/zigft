@@ -23,7 +23,7 @@ pub const getLastStatus: fn () Status = c_to_zig.translate("kappa_get_last_statu
 
 const c_to_zig = api_translator.Translator(.{
     .c_import_ns = c,
-    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected, .{}),
 });
 
 test {

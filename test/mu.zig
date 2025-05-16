@@ -6,11 +6,15 @@ const c = @cImport({
 
 pub const Error = error{
     Unexpected,
+    NullPointer,
+    InvalidHandle,
 };
 
 pub const getVoidPtr: fn (
     arg: bool,
 ) Error!*anyopaque = c_to_zig.translate("mu_get_void_ptr", true, false, .{});
+
+pub const getVoidPtrNoError: fn () *anyopaque = c_to_zig.translate("mu_get_void_ptr_no_error", false, false, .{});
 
 pub const getIntPtr: fn (
     arg: bool,
@@ -28,8 +32,11 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = ?*anyopaque, .new = *anyopaque },
         .{ .old = [*c]c_int, .new = *c_int },
     },
-    .error_scheme = api_translator.InvalidReturnValueScheme(Error, Error.Unexpected, .{
-        @as(Handle, c.INVALID_HANDLE),
+    .error_scheme = api_translator.BasicErrorScheme(void, Error, Error.Unexpected, .{
+        .{ .type = *anyopaque, .err_value = null, .err = error.NullPointer },
+        .{ .type = *anyopaque, .err_value = null, .err = error.NullPointer },
+        .{ .type = *c_int, .err_value = null, .err = error.NullPointer },
+        .{ .type = Handle, .err_value = c.INVALID_HANDLE, .err = error.InvalidHandle },
     }),
 });
 

@@ -52,7 +52,7 @@ const c_to_zig = api_translator.Translator(.{
         .{ .old = [*c]const c.lambda_union, .new = ?Union },
         .{ .old = c.lambda_struct_ptr, .new = StructPtr },
     },
-    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected),
+    .error_scheme = api_translator.BasicErrorScheme(Status, Error, Error.Unexpected, .{}),
 });
 
 test {
