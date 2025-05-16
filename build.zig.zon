@@ -1,0 +1,14 @@
+.{
+    .name = .zigft,
+    .version = "0.14.5",
+    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0x1a39135b9f815f01,
+    .paths = .{
+        "api-translator.zig",
+        "build.zig",
+        "build.zig.zon",
+        "fn-binding.zig",
+        "fn-transform.zig",
+        "zigft.zig",
+    },
+}
