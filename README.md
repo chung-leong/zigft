@@ -269,7 +269,7 @@ sum = 126
 Binding to inline functions with `comptime` or `anytype` arguments is impossible, however.
 
 As you've seen already in the example involving 
-[`std.debug.print()`](https://ziglang.org/documentation/0.14.0/std/#std.debug.print), binding to 
+[`std.debug.print()`](https://ziglang.org/documentation/0.14.1/std/#std.debug.print), binding to 
 functions with `comptime` and `anytype` arguments is permitted as long as the resulting function 
 will have no such arguments. 
 
