@@ -1,6 +1,6 @@
 const std = @import("std");
-
 const expectEqual = std.testing.expectEqual;
+const expect = std.testing.expect;
 
 /// Take a function that accepts a tuple as its only argument and create a new one with the tuple
 /// elements spread across the argument list.
@@ -379,4 +379,54 @@ fn getTupleFields(comptime FT: type) []const std.builtin.Type.StructField {
     }
     const Tuple = @typeInfo(FT).@"fn".params[0].type.?;
     return @typeInfo(Tuple).@"struct".fields;
+}
+
+/// Take an inline function create a regular function
+pub fn uninline(func: anytype) Uninlined(@TypeOf(func)) {
+    const FT = @TypeOf(func);
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return func;
+    const ns = struct {
+        inline fn call(args: std.meta.ArgsTuple(FT)) f.return_type.? {
+            return @call(.auto, func, args);
+        }
+    };
+    return spreadArgs(ns.call, .auto);
+}
+
+test "uninline" {
+    const ns = struct {
+        inline fn a(x: i32, y: i32) i32 {
+            return x + y;
+        }
+
+        fn b(x: i32) i32 {
+            return x;
+        }
+
+        const new_a = uninline(a);
+        const new_b = uninline(b);
+    };
+    try expectEqual(.auto, @typeInfo(@TypeOf(ns.new_a)).@"fn".calling_convention);
+    try expectEqual(ns.b, ns.new_b);
+}
+
+/// Return type of uninline().
+pub fn Uninlined(comptime FT: type) type {
+    const f = @typeInfo(FT).@"fn";
+    if (f.calling_convention != .@"inline") return FT;
+    return @Type(.{
+        .@"fn" = .{
+            .calling_convention = .auto,
+            .is_generic = f.is_generic,
+            .is_var_args = f.is_var_args,
+            .return_type = f.return_type,
+            .params = f.params,
+        },
+    });
+}
+
+test "Uninlined" {
+    try expectEqual(fn () void, Uninlined(fn () callconv(.@"inline") void));
+    try expectEqual(fn () void, Uninlined(fn () void));
 }

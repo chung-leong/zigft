@@ -4,8 +4,8 @@ Zigft is a small library that lets you perform function transform in Zig. Consis
 files, it's designed to be used in source form. Simply download the file you need from this repo, 
 place it in your `src` directory, and import it into your own code.
 
-[`fn-transform.zig`](#fn-transformzig) provides the library's core functionality. 
-[`fn-binding.zig`](#fn-bindingzig) meanwhile gives you the ability to bind variables to a function.
+[fn-transform.zig](#fn-transformzig) provides the library's core functionality. 
+[fn-binding.zig](#fn-bindingzig) meanwhile gives you the ability to bind variables to a function.
 
 This project's code was developed original for [Zigar](https://github.com/chung-leong/zigar). 
 Check it out of you haven't already learned of its existence.
@@ -13,7 +13,7 @@ Check it out of you haven't already learned of its existence.
 ## fn-transform.zig
 
 `fn-transform.zig` provides a single function: 
-[`spreadArgs()`](https://chung-leong.github.io/zigft/#zigft.fn-transform.spreadArgs). It takes a
+[spreadArgs()](https://chung-leong.github.io/zigft/#zigft.fn-transform.spreadArgs). It takes a
 function that accepts a tuple as the only argument and returns a new function where the tuple 
 elements are spread across the argument list. For example, if the following function is the input:
 
@@ -189,8 +189,8 @@ error: CantaloupeExploded
 ## fn-binding.zig
 
 `fn-binding.zig` provides a [set of functions](https://chung-leong.github.io/zigft/#zigft.fn-binding)
-related to function binding. [`bind()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.bind)
-and [`unbind()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.unbind) are the pair you 
+related to function binding. [bind()](https://chung-leong.github.io/zigft/#zigft.fn-binding.bind)
+and [unbind()](https://chung-leong.github.io/zigft/#zigft.fn-binding.unbind) are the pair you 
 will most likely use.
 
 The first argument to `bind()` can be either `fn (...)` or `*const fn (...)`. The second argument 
@@ -269,7 +269,7 @@ sum = 126
 Binding to inline functions with `comptime` or `anytype` arguments is impossible, however.
 
 As you've seen already in the example involving 
-[`std.debug.print()`](https://ziglang.org/documentation/0.14.1/std/#std.debug.print), binding to 
+[std.debug.print()](https://ziglang.org/documentation/0.14.1/std/#std.debug.print), binding to 
 functions with `comptime` and `anytype` arguments is permitted as long as the resulting function 
 will have no such arguments. 
 
@@ -297,10 +297,10 @@ Meow!
 ???
 ```
 
-Use [`define()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.define) instead in this
+Use [define()](https://chung-leong.github.io/zigft/#zigft.fn-binding.define) instead in this
 scenario if you dislike the appearance of `catch unreachable`.
 
-[`closure()`](https://chung-leong.github.io/zigft/#zigft.fn-binding.close) lets you conveniently
+[closure()](https://chung-leong.github.io/zigft/#zigft.fn-binding.close) lets you conveniently
 creating a closure with the help of an inline struct type:
 
 ```zig
