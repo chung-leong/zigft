@@ -48,7 +48,7 @@ pub fn destroy(allocator: std.mem.Allocator, fn_ptr: *const anyopaque) void {
             defer protect(true);
             header_ptr.signature = 0;
             const binding_ptr: [*]u8 = @ptrCast(header_ptr);
-            const alignment: std.mem.Alignment = @enumFromInt(@ctz(header_ptr.alignment));
+            const alignment: std.mem.Alignment = @enumFromInt(header_ptr.alignment);
             allocator.rawFree(binding_ptr[0..header_ptr.len], alignment, 0);
         }
     }
@@ -248,7 +248,15 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .pointer => fn_address_index + @sizeOf(usize),
                 else => unreachable,
             };
-            const max_align = @max(@alignOf(Header), @alignOf(CT));
+            const max_align: std.mem.Alignment = switch (@max(@alignOf(Header), @alignOf(CT))) {
+                1 => .@"1",
+                2 => .@"2",
+                4 => .@"4",
+                8 => .@"8",
+                16 => .@"16",
+                32 => .@"32",
+                else => .@"64",
+            };
             const new_bytes = try allocator.alignedAlloc(u8, max_align, binding_len);
             const header_ptr: *Header = @ptrCast(@alignCast(new_bytes.ptr));
             const instr_slice: []u8 = new_bytes[instr_index .. instr_index + instr_len];
@@ -257,7 +265,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
             header_ptr.* = .{
                 .ctx_offset = @intCast(ctx_index - instr_index),
                 .len = @intCast(binding_len),
-                .alignment = @intCast(max_align),
+                .alignment = @intFromEnum(max_align),
             };
             const actual_instr_len = try encodeInstructions(instr_slice, @intFromPtr(ctx_ptr), func);
             assert(instr_len == actual_instr_len);
@@ -1039,6 +1047,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
 
 /// Return type of bindWithCallConv(), createWithCallConv(), etc.
 pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, cc: ?std.builtin.CallingConvention) type {
+    @setEvalBranchQuota(1000000);
     const FT = FnType(T);
     const f = @typeInfo(FT).@"fn";
     const params = @typeInfo(FT).@"fn".params;
