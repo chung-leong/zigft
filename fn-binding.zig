@@ -104,7 +104,7 @@ pub fn defineWithCallConv(
     func: anytype,
     vars: anytype,
     comptime cc: std.builtin.CallingConvention,
-) BoundFn(@TypeOf(func), @TypeOf(vars)) {
+) BoundFnWithCallConv(@TypeOf(func), @TypeOf(vars), cc) {
     if (!@inComptime()) @compileError("This function can only be called in comptime");
     return Binding(@TypeOf(func), @TypeOf(vars), cc).getComptime(func, vars).*;
 }
