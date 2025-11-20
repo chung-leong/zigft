@@ -1,3 +1,7 @@
+## 0.15.2 (Nov 20, 2025)
+
+* Updated code for 0.15.2
+
 ## 0.14.5 (May 16, 2025)
 
 * Allowing void and int to be used as the root type
