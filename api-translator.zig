@@ -286,34 +286,25 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 break :init types[start_index..];
             };
             const param_count = old_fn.params.len + extra - OutputTypes.len;
-            var params: [param_count]std.builtin.Type.Fn.Param = undefined;
-            inline for (old_fn.params, 0..) |param, index| {
-                if (index < param_count) {
-                    params[index] = .{
-                        .type = Substitute(param.type.?, local_subs, index, old_fn.params.len),
-                        .is_generic = false,
-                        .is_noalias = false,
-                    };
+            var param_types: [param_count]type = undefined;
+            var param_attrs: [param_count]std.builtin.Type.Fn.Param.Attributes = undefined;
+            inline for (old_fn.params, 0..) |param, i| {
+                if (i < param_count) {
+                    param_types[i] = Substitute(param.type.?, local_subs, i, old_fn.params.len);
+                    param_attrs[i] = .{ .@"noalias" = false };
                 }
             }
             // determine the payload of the return type
             const Payload = switch (OutputTypes.len) {
                 0 => void,
                 1 => OutputTypes[0],
-                else => std.meta.Tuple(OutputTypes),
+                else => @Tuple(OutputTypes),
             };
-            return @Type(.{
-                .@"fn" = .{
-                    .calling_convention = .auto,
-                    .is_generic = false,
-                    .is_var_args = false,
-                    .return_type = switch (return_error_union) {
-                        true => options.error_scheme.ErrorSet!Payload,
-                        else => Payload,
-                    },
-                    .params = &params,
-                },
-            });
+            const RT = switch (return_error_union) {
+                true => options.error_scheme.ErrorSet!Payload,
+                else => Payload,
+            };
+            return @Fn(&param_types, &param_attrs, RT, .{});
         }
 
         pub fn translate(
@@ -408,11 +399,17 @@ pub fn Translator(comptime options: TranslatorOptions) type {
         pub fn SliceType(comptime T: type) type {
             return switch (@typeInfo(T)) {
                 .pointer => |pt| define: {
-                    var new_pt = pt;
-                    new_pt.size = .slice;
-                    new_pt.sentinel_ptr = null;
-                    if (@typeInfo(new_pt.child) == .@"opaque") new_pt.child = u8;
-                    break :define @Type(.{ .pointer = new_pt });
+                    const ET = switch (@typeInfo(pt.child)) {
+                        .@"opaque" => u8,
+                        else => pt.child,
+                    };
+                    break :define @Pointer(.slice, .{
+                        .@"const" = pt.is_const,
+                        .@"volatile" = pt.is_volatile,
+                        .@"allowzero" = pt.is_allowzero,
+                        .@"addrspace" = pt.address_space,
+                        .@"align" = pt.alignment,
+                    }, ET, null);
                 },
                 .optional => |op| ?SliceType(op.child),
                 else => @compileError("Argument is not a pointer"),
@@ -429,7 +426,8 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                 else => @compileError("Function type expected, received '" ++ @typeName(OldFn) ++ "'"),
             };
             const param_count = old_fn.params.len - pairs.len;
-            var new_params: [param_count]std.builtin.Type.Fn.Param = undefined;
+            var param_types: [param_count]type = undefined;
+            var param_attrs: [param_count]std.builtin.Type.Fn.Param.Attributes = undefined;
             var j: usize = 0;
             inline for (old_fn.params, 0..) |param, i| {
                 const PT = param.type orelse @compileError("Cannot merge generic argument");
@@ -437,11 +435,14 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     if (pair.len_index == i) break true;
                 } else false;
                 if (!is_index) {
-                    new_params[j] = param;
                     const is_ptr = inline for (pairs) |pair| {
                         if (pair.ptr_index == i) break true;
                     } else false;
-                    if (is_ptr) new_params[j].type = SliceType(PT);
+                    param_types[j] = switch (is_ptr) {
+                        true => SliceType(PT),
+                        false => PT,
+                    };
+                    param_attrs[j] = .{ .@"noalias" = param.is_noalias };
                     j += 1;
                 } else {
                     switch (@typeInfo(PT)) {
@@ -450,9 +451,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                     }
                 }
             }
-            var new_fn = old_fn;
-            new_fn.params = &new_params;
-            return @Type(.{ .@"fn" = new_fn });
+            return @Fn(&param_types, &param_attrs, old_fn.return_type.?, .{ .@"callconv" = old_fn.calling_convention });
         }
 
         pub fn mergeSlice(
@@ -772,6 +771,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         arena: std.heap.ArenaAllocator,
         allocator: std.mem.Allocator,
         cwd: []const u8,
+        io: std.Io,
         indent_level: usize,
         indented: bool,
         close_bracket_stack: std.ArrayList([]const u8),
@@ -791,12 +791,13 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         invalid_value_map: std.AutoHashMap(*const Expression, InvalidValue),
         return_error_map: std.AutoHashMap(*const Expression, bool),
 
-        pub fn init(allocator: std.mem.Allocator) !*@This() {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io) !*@This() {
             var arena: std.heap.ArenaAllocator = .init(allocator);
             var self = try arena.allocator().create(@This());
             self.arena = arena;
             self.allocator = self.arena.allocator();
-            self.cwd = try std.process.getCwdAlloc(self.allocator);
+            self.cwd = try std.process.currentPathAlloc(io, self.allocator);
+            self.io = io;
             self.indent_level = 0;
             self.indented = false;
             self.close_bracket_stack = .empty;
@@ -1681,7 +1682,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     }));
                     break :define try self.createExpression(.{
                         .function_call = .{
-                            .fn_ref = try self.createIdentifier("std.meta.Tuple", .{}),
+                            .fn_ref = try self.createIdentifier("@Tuple", .{}),
                             .arguments = arguments,
                         },
                     });
@@ -1724,7 +1725,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             const output_types: []const *const Expression = get: {
                 if (self.getTypeInfo(return_type, .error_union)) |eu| {
                     if (eu.payload_type.* == .function_call) {
-                        // call to std.meta.Tuple()
+                        // call to @Tuple()
                         const arg = eu.payload_type.function_call.arguments[0];
                         break :get arg.array_init.initializers;
                     } else if (!self.isPrimitive(eu.payload_type, "void")) {
@@ -2211,7 +2212,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             return can_return and !options.status_is_returned_fn(fn_name);
         }
 
-        fn deriveErrorSet(self: *@This()) !std.meta.Tuple(&.{ *const Expression, usize }) {
+        fn deriveErrorSet(self: *@This()) !@Tuple(&.{ *const Expression, usize }) {
             var names: [][]const u8 = &.{};
             var non_error_enum_count: usize = 0;
             if (options.c_error_type) |enum_name| {
@@ -2508,11 +2509,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 try self.printTxt("const inout = api_translator.inout;\n");
             }
             try self.printTxt("\n");
-            try self.printFmt("const {s} = @cImport({{\n", .{options.c_import});
-            for (options.header_paths) |path| {
-                try self.printFmt("@cInclude(\"{s}\");\n", .{path});
-            }
-            try self.printTxt("}});\n\n");
+            try self.printFmt("const {s} = @import(\"{s}\");\n\n", .{ options.c_import, options.c_import });
         }
 
         const PrintError = std.Io.Writer.Error || std.mem.Allocator.Error;
@@ -2860,11 +2857,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 const arg = try self.allocPrint("-D{s}", .{define});
                 try self.append(&argv, arg);
             }
-            const result = try std.process.Child.run(.{
-                .allocator = self.allocator,
-                .argv = argv,
-                .max_output_bytes = 1024 * 1024 * 128,
-            });
+            const result = try std.process.run(self.allocator, self.io, .{ .argv = argv });
             if (result.stderr.len != 0) {
                 std.debug.print("{s}\n", .{result.stderr});
                 return error.Failure;
@@ -2879,7 +2872,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     include_path,
                     path,
                 });
-                if (std.fs.accessAbsolute(full_path, .{})) |_| {
+                if (std.Io.Dir.accessAbsolute(self.io, full_path, .{})) |_| {
                     return full_path;
                 } else |_| self.allocator.free(full_path);
             }
@@ -3367,7 +3360,7 @@ test "Translator.Translated" {
     const Fn3 = c_to_zig.Translated(fn (i32, *OldStruct) StatusEnum, true, false, .{});
     try expectEqual(fn (i32) ErrorSet!NewStruct, Fn3);
     const Fn4 = c_to_zig.Translated(fn (i32, *bool, *OldStruct) StatusEnum, true, false, .{});
-    try expectEqual(fn (i32) ErrorSet!std.meta.Tuple(&.{ bool, NewStruct }), Fn4);
+    try expectEqual(fn (i32) ErrorSet!@Tuple(&.{ bool, NewStruct }), Fn4);
     const Fn5 = c_to_zig.Translated(fn (i32, OldStruct) bool, false, false, .{});
     try expectEqual(fn (i32, NewStruct) bool, Fn5);
     const Fn6 = c_to_zig.Translated(fn (i32, OldStruct) c_int, false, false, .{});

@@ -1766,7 +1766,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
         pub fn decode(bytes: [*]const u8) std.meta.Tuple(&.{ @This(), Attributes, usize }) {
             var i: usize = 0;
             var instr: @This() = .{};
-            if (std.meta.intToEnum(Prefix, bytes[i]) catch null) |prefix| {
+            if (std.enums.fromInt(Prefix, bytes[i])) |prefix| {
                 i += 1;
                 instr.prefix = prefix;
             }
@@ -2491,7 +2491,6 @@ pub const ExecutablePageAllocator = struct {
             aligned_len
         else
             mem.alignForward(usize, aligned_len + max_drop_len, page_size);
-        const hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .unordered);
         var map_flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
         if (builtin.target.os.tag.isDarwin()) {
             // set MAP_JIT
@@ -2500,9 +2499,9 @@ pub const ExecutablePageAllocator = struct {
             map_flags = @bitCast(map_flags_u32);
         }
         const slice = posix.mmap(
-            hint,
+            null,
             overalloc_len,
-            posix.PROT.READ | posix.PROT.WRITE | std.posix.PROT.EXEC,
+            .{ .READ = true, .WRITE = true, .EXEC = true },
             map_flags,
             -1,
             0,
@@ -2515,8 +2514,6 @@ pub const ExecutablePageAllocator = struct {
         if (drop_len != 0) posix.munmap(slice[0..drop_len]);
         const remaining_len = overalloc_len - drop_len;
         if (remaining_len > aligned_len) posix.munmap(@alignCast(result_ptr[aligned_len..remaining_len]));
-        const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr + aligned_len);
-        _ = @cmpxchgStrong(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, hint, new_hint, .monotonic, .monotonic);
         return result_ptr;
     }
 
