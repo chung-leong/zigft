@@ -339,6 +339,5 @@ Function binding requires hardware-specific code. CPU architectures currently su
 
 ## Support for earlier versions of Zig
 
-The main branch of Zigft is designed for Zig 0.15.x. Use the code in the v.0.14.1 branch if you're 
-still on the other version of Zig.
-
+The main branch of Zigft is designed for Zig 0.16.x. Use the code pinned to the `v0.15.0` tag branch 
+if you're still on the oold version of Zig. Code for 0.14.x is the `v0.14.1` branch.
