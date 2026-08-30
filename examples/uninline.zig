@@ -1,17 +1,17 @@
 const std = @import("std");
 const fn_transform = @import("zigft/fn-transform.zig");
 
-fn Uninlined(comptime FT: type) type {
+pub fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
     if (f.calling_convention != .@"inline") return FT;
-    return @Type(.{
-        .@"fn" = .{
-            .calling_convention = .auto,
-            .is_generic = f.is_generic,
-            .is_var_args = f.is_var_args,
-            .return_type = f.return_type,
-            .params = f.params,
-        },
+    var param_types: [f.params.len]type = undefined;
+    var param_attrs: [f.params.len]std.builtin.Type.Fn.Param.Attributes = undefined;
+    inline for (f.params, 0..) |param, i| {
+        param_types[i] = param.type.?;
+        param_attrs[i] = .{ .@"noalias" = param.is_noalias };
+    }
+    return @Fn(&param_types, &param_attrs, f.return_type.?, .{
+        .varargs = f.is_var_args,
     });
 }
 

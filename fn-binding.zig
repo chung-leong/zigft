@@ -5,11 +5,12 @@ const expectEqual = std.testing.expectEqual;
 const assert = std.debug.assert;
 const maxInt = std.math.maxInt;
 const mem = std.mem;
-const windows = std.os.windows;
 const posix = std.posix;
 const page_size_min = std.heap.page_size_min;
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
+
+const c = @import("c");
 
 const fn_transform = @import("fn-transform.zig");
 
@@ -104,13 +105,13 @@ pub fn defineWithCallConv(
     func: anytype,
     vars: anytype,
     comptime cc: std.builtin.CallingConvention,
-) BoundFnWithCallConv(@TypeOf(func), @TypeOf(vars), cc) {
+) BoundFn(@TypeOf(func), @TypeOf(vars)) {
     if (!@inComptime()) @compileError("This function can only be called in comptime");
     return Binding(@TypeOf(func), @TypeOf(vars), cc).getComptime(func, vars).*;
 }
 
 /// Create a function closure.
-pub fn close(comptime T: type, vars: T) !*const BoundFn(@TypeOf(onlyFn(T)), std.meta.Tuple(&.{T})) {
+pub fn close(comptime T: type, vars: T) !*const BoundFn(@TypeOf(onlyFn(T)), @Tuple(&.{T})) {
     const func = onlyFn(T);
     return try bind(func, .{vars});
 }
@@ -120,7 +121,7 @@ pub fn closeWithCallConv(
     comptime T: type,
     vars: T,
     comptime cc: std.builtin.CallingConvention,
-) !*const BoundFnWithCallConv(@TypeOf(onlyFn(T)), std.meta.Tuple(&.{T}), cc) {
+) !*const BoundFnWithCallConv(@TypeOf(onlyFn(T)), @Tuple(&.{T}), cc) {
     const func = onlyFn(T);
     return try bindWithCallConv(func, .{vars}, cc);
 }
@@ -128,18 +129,12 @@ pub fn closeWithCallConv(
 /// Enable or disable write protection on executable memory on platforms that has the feature.
 pub fn protect(state: bool) void {
     if (builtin.target.os.tag.isDarwin()) {
-        const c = @cImport({
-            @cInclude("pthread.h");
-        });
         c.pthread_jit_write_protect_np(if (state) 1 else 0);
     }
 }
 
 fn invalidate(slice: []u8) void {
     if (builtin.target.os.tag.isDarwin()) {
-        const c = @cImport({
-            @cInclude("libkern/OSCacheControl.h");
-        });
         c.sys_icache_invalidate(slice.ptr, slice.len);
     }
 }
@@ -190,12 +185,13 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
     const BFArgsTuple = std.meta.ArgsTuple(BFT);
-    const ArgsTuple = init: {
-        // std.meta.ArgsTuple() fails when anytype is in the argument list
-        const params = @typeInfo(FT).@"fn".params;
-        var tuple_fields: [params.len]std.builtin.Type.StructField = undefined;
-        inline for (params, 0..) |param, index| {
-            const name = std.fmt.comptimePrint("{d}", .{index});
+    const ArgsStruct = init: {
+        const f = @typeInfo(FT).@"fn";
+        var field_names: [f.params.len][]const u8 = undefined;
+        var field_types: [f.params.len]type = undefined;
+        var field_attrs: [f.params.len]std.builtin.Type.StructField.Attributes = undefined;
+        inline for (f.params, 0..) |param, i| {
+            const name = std.fmt.comptimePrint("{d}", .{i});
             const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
                 // find the variable bound to this param, if any
                 inline for (ctx_mapping) |m| {
@@ -209,22 +205,14 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     }
                 } else break :find .{ null, null };
             };
-            tuple_fields[index] = .{
-                .name = name,
-                .type = var_type orelse (param.type orelse unreachable),
+            field_names[i] = name;
+            field_types[i] = var_type orelse param.type.?;
+            field_attrs[i] = .{
+                .@"comptime" = var_def_ptr != null,
                 .default_value_ptr = var_def_ptr,
-                .is_comptime = var_def_ptr != null,
-                .alignment = 0,
             };
         }
-        break :init @Type(.{
-            .@"struct" = .{
-                .is_tuple = true,
-                .layout = .auto,
-                .decls = &.{},
-                .fields = &tuple_fields,
-            },
-        });
+        break :init @Struct(.auto, null, &field_names, &field_types, &field_attrs);
     };
 
     return struct {
@@ -278,7 +266,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
         pub fn getComptime(comptime func: anytype, comptime vars: anytype) *const BFT {
             const ns = struct {
                 inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
-                    var args: ArgsTuple = undefined;
+                    var args: ArgsStruct = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(vars, m.src);
                     return @call(.auto, func, args);
@@ -298,7 +286,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     // insert nop x 3 so we can find the displacement for target in the instruction stream
                     insertNOPs(&target);
                     const ctx_ptr: *const CT = @ptrFromInt(target[0]);
-                    var args: ArgsTuple = undefined;
+                    var args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
                     switch (@typeInfo(@TypeOf(func))) {
@@ -1046,14 +1034,16 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
 }
 
 /// Return type of bindWithCallConv(), createWithCallConv(), etc.
-pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, cc: ?std.builtin.CallingConvention) type {
+pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, call_conv: ?std.builtin.CallingConvention) type {
     @setEvalBranchQuota(1000000);
     const FT = FnType(T);
     const f = @typeInfo(FT).@"fn";
     const params = @typeInfo(FT).@"fn".params;
     const fields = @typeInfo(CT).@"struct".fields;
     const context_mapping = getContextMapping(FT, CT);
-    var new_params: [params.len - fields.len]std.builtin.Type.Fn.Param = undefined;
+    const param_count = params.len - fields.len;
+    var param_types: [param_count]type = undefined;
+    var param_attrs: [param_count]std.builtin.Type.Fn.Param.Attributes = undefined;
     var index = 0;
     for (params, 0..) |param, number| {
         const name = std.fmt.comptimePrint("{d}", .{number});
@@ -1061,15 +1051,14 @@ pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, cc: ?std.builtin
             if (param.type == null) {
                 @compileError("A variable must be bound to an 'anytype' parameter");
             }
-            new_params[index] = param;
+            param_types[index] = param.type.?;
+            param_attrs[index] = .{ .@"noalias" = param.is_noalias };
             index += 1;
         }
     }
-    var new_f = f;
-    new_f.params = &new_params;
-    new_f.is_generic = false;
-    if (cc) |c| new_f.calling_convention = c;
-    return @Type(.{ .@"fn" = new_f });
+    return @Fn(&param_types, &param_attrs, f.return_type.?, .{
+        .@"callconv" = call_conv orelse f.calling_convention,
+    });
 }
 
 /// Return type of bind(), create(), etc.
@@ -1763,7 +1752,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
             return table;
         }
 
-        pub fn decode(bytes: [*]const u8) std.meta.Tuple(&.{ @This(), Attributes, usize }) {
+        pub fn decode(bytes: [*]const u8) @Tuple(&.{ @This(), Attributes, usize }) {
             var i: usize = 0;
             var instr: @This() = .{};
             if (std.enums.fromInt(Prefix, bytes[i])) |prefix| {
@@ -2444,15 +2433,15 @@ pub const ExecutablePageAllocator = struct {
             // this logic first tries a call with exactly the size requested,
             // before falling back to the loop below.
             // https://devblogs.microsoft.com/oldnewthing/?p=42223
-            const addr = windows.VirtualAlloc(
+            const addr = c.VirtualAlloc(
                 null,
                 // VirtualAlloc will round the length to a multiple of page size.
                 // "If the lpAddress parameter is NULL, this value is rounded up to
                 // the next page boundary".
                 n,
-                windows.MEM_COMMIT | windows.MEM_RESERVE,
-                windows.PAGE_EXECUTE_READWRITE,
-            ) catch return null;
+                c.MEM_COMMIT | c.MEM_RESERVE,
+                c.PAGE_EXECUTE_READWRITE,
+            ) orelse return null;
 
             if (mem.isAligned(@intFromPtr(addr), alignment_bytes))
                 return @ptrCast(addr);
@@ -2461,26 +2450,26 @@ pub const ExecutablePageAllocator = struct {
             // sufficiently aligned address, then free the entire range and
             // immediately allocate the desired subset. Another thread may have won
             // the race to map the target range, in which case a retry is needed.
-            windows.VirtualFree(addr, 0, windows.MEM_RELEASE);
+            _ = c.VirtualFree(addr, 0, c.MEM_RELEASE);
 
             const overalloc_len = n + alignment_bytes - page_size;
             const aligned_len = mem.alignForward(usize, n, page_size);
 
             while (true) {
-                const reserved_addr = windows.VirtualAlloc(
+                const reserved_addr = c.VirtualAlloc(
                     null,
                     overalloc_len,
-                    windows.MEM_RESERVE,
-                    windows.PAGE_NOACCESS,
-                ) catch return null;
+                    c.MEM_RESERVE,
+                    c.PAGE_NOACCESS,
+                ) orelse return null;
                 const aligned_addr = mem.alignForward(usize, @intFromPtr(reserved_addr), alignment_bytes);
-                windows.VirtualFree(reserved_addr, 0, windows.MEM_RELEASE);
-                const ptr = windows.VirtualAlloc(
+                _ = c.VirtualFree(reserved_addr, 0, c.MEM_RELEASE);
+                const ptr = c.VirtualAlloc(
                     @ptrFromInt(aligned_addr),
                     aligned_len,
-                    windows.MEM_COMMIT | windows.MEM_RESERVE,
-                    windows.PAGE_READWRITE,
-                ) catch continue;
+                    c.MEM_COMMIT | c.MEM_RESERVE,
+                    c.PAGE_READWRITE,
+                ) orelse continue;
                 return @ptrCast(ptr);
             }
         }
