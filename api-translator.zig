@@ -287,7 +287,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             };
             const param_count = old_fn.params.len + extra - OutputTypes.len;
             var param_types: [param_count]type = undefined;
-            var param_attrs: [param_count]std.builtin.Type.Fn.Param.Attributes = undefined;
+            var param_attrs: [param_count]std.lang.Type.Fn.ParamAttributes = undefined;
             inline for (old_fn.params, 0..) |param, i| {
                 if (i < param_count) {
                     param_types[i] = Substitute(param.type.?, local_subs, i, old_fn.params.len);
@@ -404,7 +404,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
                         else => pt.child,
                     };
                     break :define @Pointer(.slice, .{
-                        .@"const" = pt.is_const,
+                        .@"const" = pt.attrs.@"const",
                         .@"volatile" = pt.is_volatile,
                         .@"allowzero" = pt.is_allowzero,
                         .@"addrspace" = pt.address_space,
@@ -427,7 +427,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
             };
             const param_count = old_fn.params.len - pairs.len;
             var param_types: [param_count]type = undefined;
-            var param_attrs: [param_count]std.builtin.Type.Fn.Param.Attributes = undefined;
+            var param_attrs: [param_count]std.lang.Type.Fn.ParamAttributes = undefined;
             var j: usize = 0;
             inline for (old_fn.params, 0..) |param, i| {
                 const PT = param.type orelse @compileError("Cannot merge generic argument");
@@ -594,7 +594,7 @@ pub fn Translator(comptime options: TranslatorOptions) type {
 
         fn WritableTarget(comptime T: type) ?type {
             const info = @typeInfo(T);
-            if (info == .pointer and !info.pointer.is_const) {
+            if (info == .pointer and !info.pointer.attrs.@"const") {
                 const Target = info.pointer.child;
                 if (@typeInfo(Target) != .@"opaque" and @sizeOf(Target) != 0) return Target;
             }
@@ -634,7 +634,7 @@ pub const Expression = union(enum) {
             child_type: *const Expression,
             alignment: ?[]const u8,
             sentinel: ?[]const u8,
-            size: std.builtin.Type.Pointer.Size,
+            size: std.lang.Type.Pointer.Size,
             is_const: bool,
             is_volatile: bool,
             allows_zero: bool,
@@ -843,7 +843,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (options.header_paths) |path| {
                 const full_path = try self.findSourceFile(path);
                 const output = try self.translateHeaderFile(full_path);
-                const source = try self.allocator.dupeZ(u8, output);
+                const source = try self.allocator.dupeSentinel(u8, output, 0);
                 const tree = try Ast.parse(self.allocator, source, .zig);
                 for (tree.rootDecls()) |node| {
                     var buffer1: [1]Ast.Node.Index = undefined;
@@ -962,10 +962,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .child_type = try self.obtainExpression(tree, ptr_type.ast.child_type),
                     .sentinel = if (ptr_type.ast.sentinel.unwrap()) |n| nodeSlice(tree, n) else null,
                     .size = ptr_type.size,
-                    .is_const = ptr_type.const_token != null,
-                    .is_volatile = ptr_type.volatile_token != null,
-                    .allows_zero = ptr_type.allowzero_token != null,
-                    .alignment = if (ptr_type.ast.align_node.unwrap()) |n| nodeSlice(tree, n) else null,
+                    .attrs = .{
+                        .@"const" = ptr_type.const_token != null,
+                        .@"volatile" = ptr_type.volatile_token != null,
+                        .allowszero = ptr_type.allowzero_token != null,
+                        .@"align" = if (ptr_type.ast.align_node.unwrap()) |n| nodeSlice(tree, n) else null,
+                    },
                 },
             };
         }
@@ -1358,7 +1360,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 var param_type: *const Expression = param.type;
                 if (self.getPointerInfo(param.type)) |p| {
                     // const pointer to struct and union can become by-value argument
-                    if (p.is_const and self.isTypeOf(p.child_type, .container)) {
+                    if (p.attrs.@"const" and self.isTypeOf(p.child_type, .container)) {
                         if (!self.isOpaque(p.child_type)) {
                             const type_name = try self.obtainTypeName(p.child_type, .old);
                             if (!param_opt.is_pointer_target and options.type_is_by_value_fn(type_name)) {
@@ -1477,9 +1479,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     .alignment = p.alignment,
                     .sentinel = if (is_null_terminated) "0" else null,
                     .size = if (is_many) .many else .one,
-                    .is_const = p.is_const,
-                    .is_volatile = p.is_volatile,
-                    .allows_zero = p.allows_zero,
+                    .attrs = p.attrs,
                 },
             };
             if (is_optional) {
@@ -1991,7 +1991,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
 
         fn isWriteTarget(self: *@This(), expr: ?*const Expression) bool {
             if (self.getPointerInfo(expr)) |p| {
-                if (!p.is_const and !self.isOpaque(p.child_type)) {
+                if (!p.attrs.@"const" and !self.isOpaque(p.child_type)) {
                     return true;
                 }
             }
@@ -2120,7 +2120,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                             if (!std.meta.eql(p1.alignment, p2.alignment)) return false;
                             if (!std.meta.eql(p1.sentinel, p2.sentinel)) return false;
                             if (p1.size != p2.size) return false;
-                            if (p1.is_const != p2.is_const) return false;
+                            if (p1.attrs.@"const" != p2.attrs.@"const") return false;
                             if (p1.is_volatile != p2.is_volatile) return false;
                             if (p1.allows_zero != p2.allows_zero) return false;
                             return true;
@@ -2677,7 +2677,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             if (p.sentinel) |s| try self.printFmt(":{s}", .{s});
             if (p.size != .one) try self.printTxt("]");
             if (p.allows_zero) try self.printTxt("allows_zero ");
-            if (p.is_const) try self.printTxt("const ");
+            if (p.attrs.@"const") try self.printTxt("const ");
             if (p.alignment) |a| try self.printFmt("align({s}) ", .{a});
             if (p.is_volatile) try self.printTxt("volatile ");
             try self.printRef(p.child_type, ns);
@@ -2920,10 +2920,10 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
         fn GrandchildOf(comptime T: type) type {
             return switch (@typeInfo(T)) {
                 .pointer => |pt| check: {
-                    if (pt.is_const) @compileError("Cannot make modification through a const pointer");
+                    if (pt.attrs.@"const") @compileError("Cannot make modification through a const pointer");
                     break :check switch (@typeInfo(pt.child)) {
                         .pointer => |pt2| check2: {
-                            if (pt2.is_const) @compileError("Slice is const");
+                            if (pt2.attrs.@"const") @compileError("Slice is const");
                             break :check2 pt2.child;
                         },
                         else => @compileError("Not a pointer to a slice"),

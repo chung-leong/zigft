@@ -189,7 +189,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
         const f = @typeInfo(FT).@"fn";
         var field_names: [f.params.len][]const u8 = undefined;
         var field_types: [f.params.len]type = undefined;
-        var field_attrs: [f.params.len]std.builtin.Type.StructField.Attributes = undefined;
+        var field_attrs: [f.params.len]std.lang.Type.Struct.FieldAttributes = undefined;
         inline for (f.params, 0..) |param, i| {
             const name = std.fmt.comptimePrint("{d}", .{i});
             const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
@@ -762,11 +762,12 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u8 = @ptrCast(ptr);
                     const nop = @intFromEnum(Instruction.Opcode.nop);
                     const sp = 4;
-                    var registers = [1]isize{0} ** switch (@bitSizeOf(usize)) {
+                    const register_count = switch (@bitSizeOf(usize)) {
                         32 => 8,
                         64 => 16,
                         else => unreachable,
                     };
+                    var registers: [register_count]isize = @splat(0);
                     var i: usize = 0;
                     while (i < 262144) {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
@@ -820,7 +821,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .aarch64 => {
                     var instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     const nop: u32 = @bitCast(Instruction.NOP{});
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     var prev_index: ?usize = null;
                     var i: usize = 0;
                     while (i < 65536) : (i += 1) {
@@ -859,7 +860,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                     registers[31] = 0;
                                 }
                             } else if (match(Instruction.BL, instr)) |bl| {
-                                if (builtin.mode == .ReleaseSmall) {
+                                if (builtin.mode == .release_small) {
                                     // jump to outlined section (happen only when optimizing for size)
                                     if (prev_index != null) break;
                                     const old_pc: isize = @bitCast(@intFromPtr(&instrs[i]));
@@ -870,7 +871,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                     i = 0;
                                 }
                             } else if (match(Instruction.RET, instr)) |_| {
-                                if (builtin.mode == .ReleaseSmall) {
+                                if (builtin.mode == .release_small) {
                                     // return from outlined section
                                     if (prev_index == null) break;
                                     instrs = @ptrCast(@alignCast(ptr));
@@ -885,7 +886,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     var instrs: [*]const u16 = @ptrCast(@alignCast(ptr));
                     const nop: u16 = @bitCast(Instruction.NOP.C{});
                     const sp = 2;
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     var prev_index: ?usize = null;
                     var i: usize = 0;
                     while (i < 131072) : (i += 1) {
@@ -900,12 +901,12 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                 const amount: isize = addi.imm12;
                                 registers[addi.rd] = registers[addi.rs] + amount;
                             } else if (match(Instruction.AUIPC, instr)) |auipc| {
-                                if (builtin.mode == .ReleaseSmall) {
+                                if (builtin.mode == .release_small) {
                                     const pc: isize = @bitCast(@intFromPtr(&instrs[i - 1]));
                                     registers[auipc.rd] = pc + (@as(isize, auipc.imm20) << 12);
                                 }
                             } else if (match(Instruction.JALR, instr)) |jalr| {
-                                if (builtin.mode == .ReleaseSmall) {
+                                if (builtin.mode == .release_small) {
                                     // jump to outlined section (happen only when optimizing for size)
                                     if (prev_index != null) break;
                                     const new_pc: usize = @bitCast(registers[jalr.rs] + jalr.imm12);
@@ -944,7 +945,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                 const amount: isize = @bitCast(int);
                                 registers[sp] = registers[sp] + amount;
                             } else if (match(Instruction.JALR.C, instr)) |_| {
-                                if (builtin.mode == .ReleaseSmall) {
+                                if (builtin.mode == .release_small) {
                                     // return from outlined section
                                     // this check need to happen before the one for ADD.C since
                                     // JALR.C looks like ADD.C with rs = 0
@@ -964,7 +965,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     // li 0, 0 is used as nop instead of regular nop
                     const nop: u32 = @bitCast(Instruction.ADDI{ .ra = 0, .rt = 0, .imm16 = 0 });
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     for (0..65536) |i| {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
                             index = registers[11];
@@ -998,7 +999,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .arm => {
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     const nop: u32 = @bitCast(Instruction.NOP{});
-                    var registers = [1]isize{0} ** 16;
+                    var registers: [16]isize = @splat(0);
                     for (0..65536) |i| {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
                             index = registers[4];
@@ -1043,7 +1044,7 @@ pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, call_conv: ?std.
     const context_mapping = getContextMapping(FT, CT);
     const param_count = params.len - fields.len;
     var param_types: [param_count]type = undefined;
-    var param_attrs: [param_count]std.builtin.Type.Fn.Param.Attributes = undefined;
+    var param_attrs: [param_count]std.lang.Type.Fn.ParamAttributes = undefined;
     var index = 0;
     for (params, 0..) |param, number| {
         const name = std.fmt.comptimePrint("{d}", .{number});
@@ -2420,6 +2421,12 @@ pub const ExecutablePageAllocator = struct {
         .resize = std.heap.PageAllocator.vtable.resize,
         .free = std.heap.PageAllocator.vtable.free,
     };
+    const enable_hints = switch (builtin.target.os.tag) {
+        .openbsd => false,
+        else => true,
+    };
+    const stack_direction = builtin.target.stackGrowth();
+    var addr_hint: ?[*]align(page_size_min) u8 = null;
 
     pub fn map(n: usize, alignment: mem.Alignment) ?[*]u8 {
         const page_size = std.heap.pageSize();
@@ -2474,12 +2481,12 @@ pub const ExecutablePageAllocator = struct {
             }
         }
 
-        const aligned_len = mem.alignForward(usize, n, page_size);
+        const page_aligned_len = mem.alignForward(usize, n, page_size);
         const max_drop_len = alignment_bytes - @min(alignment_bytes, page_size);
-        const overalloc_len = if (max_drop_len <= aligned_len - n)
-            aligned_len
+        const overalloc_len = if (max_drop_len <= page_aligned_len - n)
+            page_aligned_len
         else
-            mem.alignForward(usize, aligned_len + max_drop_len, page_size);
+            mem.alignForward(usize, page_aligned_len + max_drop_len, page_size);
         var map_flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
         if (builtin.target.os.tag.isDarwin()) {
             // set MAP_JIT
@@ -2487,8 +2494,26 @@ pub const ExecutablePageAllocator = struct {
             map_flags_u32 |= 0x0800;
             map_flags = @bitCast(map_flags_u32);
         }
+        const maybe_unaligned_hint, const hint = blk: {
+            if (!enable_hints) break :blk .{ null, null };
+
+            const maybe_unaligned_hint = @atomicLoad(@TypeOf(addr_hint), &addr_hint, .unordered);
+
+            // For the very first mmap, let the kernel pick a good starting address;
+            // we'll begin doing our hinting from there.
+            if (maybe_unaligned_hint == null) break :blk .{ null, null };
+
+            // Aligning hint does not use mem.alignPointer, because it is slow.
+            // Aligning hint does not use mem.alignForward, because it asserts that there will be no overflow.
+            const hint: ?[*]align(page_size_min) u8 = @ptrFromInt(switch (stack_direction) {
+                .down => ((@intFromPtr(maybe_unaligned_hint) -% page_aligned_len) & ~(alignment_bytes - 1)) -% max_drop_len,
+                .up => (@intFromPtr(maybe_unaligned_hint) +% (alignment_bytes - 1)) & ~(alignment_bytes - 1),
+            });
+
+            break :blk .{ maybe_unaligned_hint, hint };
+        };
         const slice = posix.mmap(
-            null,
+            hint,
             overalloc_len,
             .{ .READ = true, .WRITE = true, .EXEC = true },
             map_flags,
@@ -2502,7 +2527,14 @@ pub const ExecutablePageAllocator = struct {
         const drop_len = result_ptr - slice.ptr;
         if (drop_len != 0) posix.munmap(slice[0..drop_len]);
         const remaining_len = overalloc_len - drop_len;
-        if (remaining_len > aligned_len) posix.munmap(@alignCast(result_ptr[aligned_len..remaining_len]));
+        if (remaining_len > page_aligned_len) posix.munmap(@alignCast(result_ptr[page_aligned_len..remaining_len]));
+        if (enable_hints) {
+            const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr + switch (stack_direction) {
+                .up => page_aligned_len,
+                .down => 0,
+            });
+            _ = @cmpxchgStrong(@TypeOf(addr_hint), &addr_hint, maybe_unaligned_hint, new_hint, .monotonic, .monotonic);
+        }
         return result_ptr;
     }
 

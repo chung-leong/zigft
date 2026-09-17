@@ -5,13 +5,13 @@ pub fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
     if (f.calling_convention != .@"inline") return FT;
     var param_types: [f.params.len]type = undefined;
-    var param_attrs: [f.params.len]std.builtin.Type.Fn.Param.Attributes = undefined;
+    var param_attrs: [f.params.len]std.lang.Type.Fn.ParamAttributes = undefined;
     inline for (f.params, 0..) |param, i| {
         param_types[i] = param.type.?;
         param_attrs[i] = .{ .@"noalias" = param.is_noalias };
     }
     return @Fn(&param_types, &param_attrs, f.return_type.?, .{
-        .varargs = f.is_var_args,
+        .varargs = f.attrs.varargs,
     });
 }
 

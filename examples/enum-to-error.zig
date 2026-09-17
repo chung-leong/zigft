@@ -21,14 +21,14 @@ const NewErrorSet = error{
 fn Translated(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
     var param_types: [f.params.len]type = undefined;
-    var param_attrs: [f.params.len]std.builtin.Type.Fn.Param.Attributes = undefined;
+    var param_attrs: [f.params.len]std.lang.Type.Fn.ParamAttributes = undefined;
     inline for (f.params, 0..) |param, i| {
         param_types[i] = param.type.?;
         param_attrs[i] = .{ .@"noalias" = param.is_noalias };
     }
     const RT = NewErrorSet!void;
     const NFT = @Fn(&param_types, &param_attrs, RT, .{
-        .varargs = f.is_var_args,
+        .varargs = f.attrs.varargs,
     });
     return NFT;
 }
