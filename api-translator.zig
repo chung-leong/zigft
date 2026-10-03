@@ -843,7 +843,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
             for (options.header_paths) |path| {
                 const full_path = try self.findSourceFile(path);
                 const output = try self.translateHeaderFile(full_path);
-                const source = try self.allocator.dupeZ(u8, output);
+                const source = try self.allocator.dupeSentinel(u8, output, 0);
                 const tree = try Ast.parse(self.allocator, source, .zig);
                 for (tree.rootDecls()) |node| {
                     var buffer1: [1]Ast.Node.Index = undefined;
