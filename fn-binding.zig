@@ -185,14 +185,13 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
     const BFArgsTuple = std.meta.ArgsTuple(BFT);
-    const ArgsStruct = init: {
+    const ArgsTuple = init: {
+        // std.meta.ArgsTuple() fails when anytype is in the argument list
         const f = @typeInfo(FT).@"fn";
-        var field_names: [f.params.len][]const u8 = undefined;
         var field_types: [f.params.len]type = undefined;
-        var field_attrs: [f.params.len]std.builtin.Type.StructField.Attributes = undefined;
         inline for (f.params, 0..) |param, i| {
             const name = std.fmt.comptimePrint("{d}", .{i});
-            const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
+            const var_type: ?type = find: {
                 // find the variable bound to this param, if any
                 inline for (ctx_mapping) |m| {
                     if (std.mem.eql(u8, name, m.dest)) {
@@ -200,19 +199,14 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                         const ctx_fields = @typeInfo(CT).@"struct".fields;
                         inline for (ctx_fields) |field| {
                             if (std.mem.eql(u8, m.src, field.name))
-                                break :find .{ field.type, field.default_value_ptr };
+                                break :find field.type;
                         }
                     }
-                } else break :find .{ null, null };
+                } else break :find null;
             };
-            field_names[i] = name;
             field_types[i] = var_type orelse param.type.?;
-            field_attrs[i] = .{
-                .@"comptime" = var_def_ptr != null,
-                .default_value_ptr = var_def_ptr,
-            };
         }
-        break :init @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+        break :init @Tuple(&field_types);
     };
 
     return struct {
@@ -266,7 +260,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
         pub fn getComptime(comptime func: anytype, comptime vars: anytype) *const BFT {
             const ns = struct {
                 inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
-                    var args: ArgsStruct = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(vars, m.src);
                     return @call(.auto, func, args);
@@ -286,7 +280,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     // insert nop x 3 so we can find the displacement for target in the instruction stream
                     insertNOPs(&target);
                     const ctx_ptr: *const CT = @ptrFromInt(target[0]);
-                    var args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
                     switch (@typeInfo(@TypeOf(func))) {
@@ -762,11 +756,12 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u8 = @ptrCast(ptr);
                     const nop = @intFromEnum(Instruction.Opcode.nop);
                     const sp = 4;
-                    var registers = [1]isize{0} ** switch (@bitSizeOf(usize)) {
+                    const regigster_count = switch (@bitSizeOf(usize)) {
                         32 => 8,
                         64 => 16,
                         else => unreachable,
                     };
+                    var registers: [regigster_count]isize = @splat(0);
                     var i: usize = 0;
                     while (i < 262144) {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
@@ -820,7 +815,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .aarch64 => {
                     var instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     const nop: u32 = @bitCast(Instruction.NOP{});
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     var prev_index: ?usize = null;
                     var i: usize = 0;
                     while (i < 65536) : (i += 1) {
@@ -885,7 +880,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     var instrs: [*]const u16 = @ptrCast(@alignCast(ptr));
                     const nop: u16 = @bitCast(Instruction.NOP.C{});
                     const sp = 2;
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     var prev_index: ?usize = null;
                     var i: usize = 0;
                     while (i < 131072) : (i += 1) {
@@ -964,7 +959,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     // li 0, 0 is used as nop instead of regular nop
                     const nop: u32 = @bitCast(Instruction.ADDI{ .ra = 0, .rt = 0, .imm16 = 0 });
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     for (0..65536) |i| {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
                             index = registers[11];
@@ -998,7 +993,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .arm => {
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     const nop: u32 = @bitCast(Instruction.NOP{});
-                    var registers = [1]isize{0} ** 16;
+                    var registers: [16]isize = @splat(0);
                     for (0..65536) |i| {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
                             index = registers[4];
