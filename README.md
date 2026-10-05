@@ -272,7 +272,7 @@ sum = 126
 Binding to inline functions with `comptime` or `anytype` arguments is impossible, however.
 
 As you've seen already in the example involving 
-[std.debug.print()](https://ziglang.org/documentation/0.16.0/std/#std.debug.print), binding to 
+[std.debug.print()](https://ziglang.org/documentation/0.17.0/std/#std.debug.print), binding to 
 functions with `comptime` and `anytype` arguments is permitted as long as the resulting function 
 will have no such arguments. 
 
@@ -342,5 +342,5 @@ Function binding requires hardware-specific code. CPU architectures currently su
 
 ## Support for earlier versions of Zig
 
-The main branch of Zigft is designed for Zig 0.16.x. Use the code pinned to the `v0.15.0` tag branch 
-if you're still on the oold version of Zig. Code for 0.14.x is the `v0.14.1` branch.
+The main branch of Zigft is designed for Zig 0.17.x. Use the code pinned to the `v0.16.0` or 
+`v0.15.0` tag if you're still on an old version of Zig. Code for 0.14.x is the `v0.14.1` branch.
