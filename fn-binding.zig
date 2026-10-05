@@ -1379,8 +1379,6 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"rol/ror/etc r/m imm8" = 0xc1,
             @"ret imm16" = 0xc2,
             ret = 0xc3,
-            @"vex imm16" = 0xc4,
-            @"vex imm8" = 0xc5,
             @"mov r/m8 imm8" = 0xc6,
             @"mov r/m imm32" = 0xc7,
             @"enter imm16 imm8" = 0xc8,
@@ -1663,6 +1661,13 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"paddd xmm xmm/m128" = 0xfe,
             _,
         };
+        const VexOpcode = enum(u8) {
+            @"vmovd xmm xmm/m128" = 0x6e,
+            @"vmovdq xmm xmm/m128" = 0x6f,
+            @"vmovd xmm/m128 xmm" = 0x7e,
+            @"vmovdq xmm/m128 xmm" = 0x7f,
+            _,
+        };
         pub const Prefix = enum(u8) {
             es = 0x26,
             cs = 0x2e,
@@ -1673,6 +1678,8 @@ const Instruction = switch (builtin.target.cpu.arch) {
             os = 0x66,
             as = 0x67,
             wait = 0x9b,
+            vex3 = 0xc4,
+            vex2 = 0xc5,
             f0 = 0xf0,
             f2 = 0xf2,
             f3 = 0xf3,
@@ -1707,6 +1714,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
         };
         const attribute_table = buildAttributeTable(Opcode);
         const ext_attribute_table = buildAttributeTable(ExtOpcode);
+        const vex_attribute_table = buildAttributeTable(VexOpcode);
 
         fn buildAttributeTable(comptime ET: type) [256]Attributes {
             @setEvalBranchQuota(200000);
@@ -1753,6 +1761,14 @@ const Instruction = switch (builtin.target.cpu.arch) {
             if (std.enums.fromInt(Prefix, bytes[i])) |prefix| {
                 i += 1;
                 instr.prefix = prefix;
+                if (prefix == .vex2) {
+                    instr.prefix_byte2 = bytes[i];
+                    i += 1;
+                } else if (prefix == .vex3) {
+                    instr.prefix_byte2 = bytes[i];
+                    instr.prefix_byte3 = bytes[i + 1];
+                    i += 2;
+                }
             }
             var wide = false;
             if (@bitSizeOf(usize) == 64) {
@@ -1769,7 +1785,9 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 instr.ext_opcode = @enumFromInt(bytes[i]);
                 i += 1;
             }
-            const attrs = if (instr.ext_opcode) |opcode|
+            const attrs = if (instr.isVex())
+                vex_attribute_table[@intFromEnum(instr.opcode)]
+            else if (instr.ext_opcode) |opcode|
                 ext_attribute_table[@intFromEnum(opcode)]
             else
                 attribute_table[@intFromEnum(instr.opcode)];
@@ -1852,7 +1870,13 @@ const Instruction = switch (builtin.target.cpu.arch) {
             unreachable;
         }
 
+        pub fn isVex(self: @This()) bool {
+            return self.prefix == .vex2 or self.prefix == .vex3;
+        }
+
         prefix: ?Prefix = null,
+        prefix_byte2: ?u8 = null,
+        prefix_byte3: ?u8 = null,
         rex: ?REX = null,
         opcode: Opcode = .nop,
         ext_opcode: ?ExtOpcode = null,
