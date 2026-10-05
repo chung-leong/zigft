@@ -185,14 +185,13 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
     const BFArgsTuple = std.meta.ArgsTuple(BFT);
-    const ArgsStruct = init: {
+    const ArgsTuple = init: {
+        // std.meta.ArgsTuple() fails when anytype is in the argument list
         const f = @typeInfo(FT).@"fn";
-        var field_names: [f.params.len][]const u8 = undefined;
         var field_types: [f.params.len]type = undefined;
-        var field_attrs: [f.params.len]std.builtin.Type.StructField.Attributes = undefined;
         inline for (f.params, 0..) |param, i| {
             const name = std.fmt.comptimePrint("{d}", .{i});
-            const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
+            const var_type: ?type = find: {
                 // find the variable bound to this param, if any
                 inline for (ctx_mapping) |m| {
                     if (std.mem.eql(u8, name, m.dest)) {
@@ -200,19 +199,14 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                         const ctx_fields = @typeInfo(CT).@"struct".fields;
                         inline for (ctx_fields) |field| {
                             if (std.mem.eql(u8, m.src, field.name))
-                                break :find .{ field.type, field.default_value_ptr };
+                                break :find field.type;
                         }
                     }
-                } else break :find .{ null, null };
+                } else break :find null;
             };
-            field_names[i] = name;
             field_types[i] = var_type orelse param.type.?;
-            field_attrs[i] = .{
-                .@"comptime" = var_def_ptr != null,
-                .default_value_ptr = var_def_ptr,
-            };
         }
-        break :init @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+        break :init @Tuple(&field_types);
     };
 
     return struct {
@@ -266,7 +260,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
         pub fn getComptime(comptime func: anytype, comptime vars: anytype) *const BFT {
             const ns = struct {
                 inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
-                    var args: ArgsStruct = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(vars, m.src);
                     return @call(.auto, func, args);
@@ -286,7 +280,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     // insert nop x 3 so we can find the displacement for target in the instruction stream
                     insertNOPs(&target);
                     const ctx_ptr: *const CT = @ptrFromInt(target[0]);
-                    var args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
                     switch (@typeInfo(@TypeOf(func))) {
@@ -762,11 +756,12 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u8 = @ptrCast(ptr);
                     const nop = @intFromEnum(Instruction.Opcode.nop);
                     const sp = 4;
-                    var registers = [1]isize{0} ** switch (@bitSizeOf(usize)) {
+                    const regigster_count = switch (@bitSizeOf(usize)) {
                         32 => 8,
                         64 => 16,
                         else => unreachable,
                     };
+                    var registers: [regigster_count]isize = @splat(0);
                     var i: usize = 0;
                     while (i < 262144) {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
@@ -820,7 +815,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .aarch64 => {
                     var instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     const nop: u32 = @bitCast(Instruction.NOP{});
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     var prev_index: ?usize = null;
                     var i: usize = 0;
                     while (i < 65536) : (i += 1) {
@@ -885,7 +880,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     var instrs: [*]const u16 = @ptrCast(@alignCast(ptr));
                     const nop: u16 = @bitCast(Instruction.NOP.C{});
                     const sp = 2;
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     var prev_index: ?usize = null;
                     var i: usize = 0;
                     while (i < 131072) : (i += 1) {
@@ -964,7 +959,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     // li 0, 0 is used as nop instead of regular nop
                     const nop: u32 = @bitCast(Instruction.ADDI{ .ra = 0, .rt = 0, .imm16 = 0 });
-                    var registers = [1]isize{0} ** 32;
+                    var registers: [32]isize = @splat(0);
                     for (0..65536) |i| {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
                             index = registers[11];
@@ -998,7 +993,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                 .arm => {
                     const instrs: [*]const u32 = @ptrCast(@alignCast(ptr));
                     const nop: u32 = @bitCast(Instruction.NOP{});
-                    var registers = [1]isize{0} ** 16;
+                    var registers: [16]isize = @splat(0);
                     for (0..65536) |i| {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
                             index = registers[4];
@@ -1384,8 +1379,6 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"rol/ror/etc r/m imm8" = 0xc1,
             @"ret imm16" = 0xc2,
             ret = 0xc3,
-            @"vex imm16" = 0xc4,
-            @"vex imm8" = 0xc5,
             @"mov r/m8 imm8" = 0xc6,
             @"mov r/m imm32" = 0xc7,
             @"enter imm16 imm8" = 0xc8,
@@ -1668,6 +1661,24 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"paddd xmm xmm/m128" = 0xfe,
             _,
         };
+        const VexOpcode = enum(u8) {
+            // handling only a small subset for now
+            @"vmovs xmm xmm/m128" = 0x10,
+            @"vmovs xmm/m128 xmm" = 0x11,
+            @"vmovlp xmm xmm/m128" = 0x12,
+            @"vmovlp xmm/m128 xmm" = 0x13,
+            @"vmovhp xmm xmm/m128" = 0x16,
+            @"vmovhp xmm/m128 xmm" = 0x17,
+            @"vmovap xmm xmm/m128" = 0x28,
+            @"vmovap xmm/m128 xmm" = 0x29,
+            @"vmovntps xmm xmm/m128" = 0x2b,
+            @"vmovmskpd xmm xmm/m128" = 0x2d,
+            @"vmovd xmm xmm/m128" = 0x6e,
+            @"vmovdq xmm xmm/m128" = 0x6f,
+            @"vmovd xmm/m128 xmm" = 0x7e,
+            @"vmovdq xmm/m128 xmm" = 0x7f,
+            _,
+        };
         pub const Prefix = enum(u8) {
             es = 0x26,
             cs = 0x2e,
@@ -1678,6 +1689,8 @@ const Instruction = switch (builtin.target.cpu.arch) {
             os = 0x66,
             as = 0x67,
             wait = 0x9b,
+            vex3 = 0xc4,
+            vex2 = 0xc5,
             f0 = 0xf0,
             f2 = 0xf2,
             f3 = 0xf3,
@@ -1712,6 +1725,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
         };
         const attribute_table = buildAttributeTable(Opcode);
         const ext_attribute_table = buildAttributeTable(ExtOpcode);
+        const vex_attribute_table = buildAttributeTable(VexOpcode);
 
         fn buildAttributeTable(comptime ET: type) [256]Attributes {
             @setEvalBranchQuota(200000);
@@ -1758,6 +1772,14 @@ const Instruction = switch (builtin.target.cpu.arch) {
             if (std.enums.fromInt(Prefix, bytes[i])) |prefix| {
                 i += 1;
                 instr.prefix = prefix;
+                if (prefix == .vex2) {
+                    instr.prefix_byte2 = bytes[i];
+                    i += 1;
+                } else if (prefix == .vex3) {
+                    instr.prefix_byte2 = bytes[i];
+                    instr.prefix_byte3 = bytes[i + 1];
+                    i += 2;
+                }
             }
             var wide = false;
             if (@bitSizeOf(usize) == 64) {
@@ -1774,7 +1796,9 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 instr.ext_opcode = @enumFromInt(bytes[i]);
                 i += 1;
             }
-            const attrs = if (instr.ext_opcode) |opcode|
+            const attrs = if (instr.isVex())
+                vex_attribute_table[@intFromEnum(instr.opcode)]
+            else if (instr.ext_opcode) |opcode|
                 ext_attribute_table[@intFromEnum(opcode)]
             else
                 attribute_table[@intFromEnum(instr.opcode)];
@@ -1857,7 +1881,13 @@ const Instruction = switch (builtin.target.cpu.arch) {
             unreachable;
         }
 
+        pub fn isVex(self: @This()) bool {
+            return self.prefix == .vex2 or self.prefix == .vex3;
+        }
+
         prefix: ?Prefix = null,
+        prefix_byte2: ?u8 = null,
+        prefix_byte3: ?u8 = null,
         rex: ?REX = null,
         opcode: Opcode = .nop,
         ext_opcode: ?ExtOpcode = null,
