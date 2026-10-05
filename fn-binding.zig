@@ -1662,6 +1662,13 @@ const Instruction = switch (builtin.target.cpu.arch) {
             _,
         };
         const VexOpcode = enum(u8) {
+            // handling only a small subset for now
+            @"vmovs xmm xmm/m128" = 0x10,
+            @"vmovs xmm/m128 xmm" = 0x11,
+            @"vmovlp xmm xmm/m128" = 0x12,
+            @"vmovlp xmm/m128 xmm" = 0x13,
+            @"vmovhp xmm xmm/m128" = 0x16,
+            @"vmovhp xmm/m128 xmm" = 0x17,
             @"vmovd xmm xmm/m128" = 0x6e,
             @"vmovdq xmm xmm/m128" = 0x6f,
             @"vmovd xmm/m128 xmm" = 0x7e,
