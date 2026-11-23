@@ -914,7 +914,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                             const instr = instrs[i];
                             if (match(Instruction.ADDI.C, instr)) |addi| {
                                 const IntRemaining = @Int(.signed, @bitSizeOf(isize) - 5);
-                                const int: packed struct(isize) {
+                                const int: bitpack struct(isize) {
                                     @"4:0": u5,
                                     @"63:5": IntRemaining,
                                 } = .{ .@"4:0" = addi.nzimm_0_4, .@"63:5" = addi.nzimm_5 };
@@ -922,7 +922,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                 registers[addi.rd] = registers[addi.rd] + amount;
                             } else if (match(Instruction.ADDI.C.SP, instr)) |addisp| {
                                 const IntRemaining = @Int(.signed, @bitSizeOf(isize) - 9);
-                                const int: packed struct(isize) {
+                                const int: bitpack struct(isize) {
                                     @"3:0": u4 = 0,
                                     @"4": u1,
                                     @"5": u1,
@@ -1694,25 +1694,25 @@ const Instruction = switch (builtin.target.cpu.arch) {
             f2 = 0xf2,
             f3 = 0xf3,
         };
-        pub const REX = packed struct {
+        pub const REX = bitpack struct {
             b: u1 = 0,
             x: u1 = 0,
             r: u1 = 0,
             w: bool = true,
             pat: u4 = 4,
         };
-        pub const ModRM = packed struct {
+        pub const ModRM = bitpack struct {
             rm: u3,
             reg: u3,
             mod: u2,
         };
-        pub const SIB = packed struct {
+        pub const SIB = bitpack struct {
             base: u3,
             index: u3,
             scale: u2,
         };
 
-        const Attributes = packed struct {
+        const Attributes = bitpack struct {
             has_mod_rm: bool = false,
             has_imm8: bool = false,
             has_imm16: bool = false,
@@ -1900,52 +1900,52 @@ const Instruction = switch (builtin.target.cpu.arch) {
         imm64: ?u64 = null,
     },
     .aarch64 => union(enum) {
-        pub const ADD = packed struct(u32) {
+        pub const ADD = bitpack struct(u32) {
             rd: u5,
             rn: u5,
             imm12: u12,
             shift: u1,
             @"31:23": u9 = 0b1001_0001_0,
         };
-        pub const SUB = packed struct(u32) {
+        pub const SUB = bitpack struct(u32) {
             rd: u5,
             rn: u5,
             imm12: u12,
             shift: u1,
             @"31:23": u9 = 0b1101_0001_0,
         };
-        pub const AND = packed struct(u32) {
+        pub const AND = bitpack struct(u32) {
             rd: u5,
             rn: u5,
             imm: u13,
             @"32:22": u9 = 0b100100100,
         };
-        pub const MOV = packed struct(u32) {
+        pub const MOV = bitpack struct(u32) {
             rd: u5,
             rn: u5 = 0b11111,
             imm6: u6,
             rm: u5,
             @"31:22": u11 = 0b1010_1010_000,
         };
-        pub const LDR = packed struct(u32) {
+        pub const LDR = bitpack struct(u32) {
             rt: u5,
             imm19: u19,
             @"31:24": u8 = 0b0101_1000,
         };
-        pub const STR = packed struct(u32) {
+        pub const STR = bitpack struct(u32) {
             rt: u5,
             rn: u5,
             imm12: u12,
             @"31:22": u10 = 0b1111_1001_00,
 
-            pub const PRE = packed struct(u32) {
+            pub const PRE = bitpack struct(u32) {
                 rt: u5,
                 rn: u5,
                 @"11:10": u2 = 0b11,
                 imm9: i9,
                 @"31:21": u11 = 0b1111_1000_000,
             };
-            pub const POST = packed struct(u32) {
+            pub const POST = bitpack struct(u32) {
                 rt: u5,
                 rn: u5,
                 @"11:10": u2 = 0b01,
@@ -1953,21 +1953,21 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 @"31:21": u11 = 0b1111_1000_000,
             };
         };
-        pub const STP = packed struct(u32) {
+        pub const STP = bitpack struct(u32) {
             rt: u5,
             rn: u5,
             rt2: u5,
             imm7: i7,
             @"31:22": u10 = 0b1010_1001_00,
 
-            pub const PRE = packed struct(u32) {
+            pub const PRE = bitpack struct(u32) {
                 rt: u5,
                 rn: u5,
                 rt2: u5,
                 imm7: i7,
                 @"31:22": u10 = 0b1010_1001_10,
             };
-            pub const POST = packed struct(u32) {
+            pub const POST = bitpack struct(u32) {
                 rt: u5,
                 rn: u5,
                 rt2: u5,
@@ -1975,21 +1975,21 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 @"31:22": u10 = 0b1010_1000_10,
             };
         };
-        pub const BR = packed struct(u32) {
+        pub const BR = bitpack struct(u32) {
             rm: u5 = 0b0000,
             rn: u5,
             @"31:10": u22 = 0b1101_0110_0001_1111_0000_00,
         };
-        pub const BL = packed struct(u32) {
+        pub const BL = bitpack struct(u32) {
             imm26: i26,
             @"31:26": u6 = 0b100101,
         };
-        pub const RET = packed struct(u32) {
+        pub const RET = bitpack struct(u32) {
             rm: u5 = 0,
             rn: u5,
             @"31:10": u22 = 0b1101011001011111000000,
         };
-        pub const NOP = packed struct(u32) {
+        pub const NOP = bitpack struct(u32) {
             @"31:0": u32 = 0b1101_0101_0000_0011_0010_0000_0001_1111,
         };
 
@@ -2003,21 +2003,21 @@ const Instruction = switch (builtin.target.cpu.arch) {
         literal: usize,
     },
     .riscv32, .riscv64 => union(enum) {
-        pub const ADDI = packed struct(u32) {
+        pub const ADDI = bitpack struct(u32) {
             @"6:0": u7 = 0b0010_011,
             rd: u5,
             @"14-12": u3 = 0b000,
             rs: u5,
             imm12: i12,
 
-            pub const C = packed struct(u16) {
+            pub const C = bitpack struct(u16) {
                 @"1:0": u2 = 0b01,
                 nzimm_0_4: u5,
                 rd: u5,
                 nzimm_5: i1,
                 @"15:13": u3 = 0b000,
 
-                pub const SP = packed struct(u16) {
+                pub const SP = bitpack struct(u16) {
                     @"1:0": u2 = 0b01,
                     nzimm_46875: u5,
                     @"11:7": u5 = 0b0001_0,
@@ -2026,7 +2026,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 };
             };
         };
-        pub const ADD = packed struct(u32) {
+        pub const ADD = bitpack struct(u32) {
             @"6:0": u7 = 0b0110_011,
             rd: u5,
             @"14:12": u3 = 0b000,
@@ -2034,38 +2034,38 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs2: u5,
             @"31:27": i7 = 0b0000_000,
 
-            pub const C = packed struct(u16) {
+            pub const C = bitpack struct(u16) {
                 @"1:0": u2 = 0b10,
                 rs: u5,
                 rd: u5,
                 @"15:12": u4 = 0b1000,
             };
         };
-        pub const LUI = packed struct(u32) {
+        pub const LUI = bitpack struct(u32) {
             @"6:0": u7 = 0b0110_111,
             rd: u5,
             imm20: i20,
         };
-        pub const AUIPC = packed struct(u32) {
+        pub const AUIPC = bitpack struct(u32) {
             @"6:0": u7 = 0b0010_111,
             rd: u5,
             imm20: i20,
         };
-        pub const LD = packed struct(u32) {
+        pub const LD = bitpack struct(u32) {
             @"6:0": u7 = 0b0000_011,
             rd: u5,
             @"14:12": u3 = 0b011,
             rs: u5,
             imm12: i12,
         };
-        pub const LW = packed struct(u32) {
+        pub const LW = bitpack struct(u32) {
             @"6:0": u7 = 0b0000_011,
             rd: u5,
             @"14:12": u3 = 0b010,
             rs: u5,
             imm12: i12,
         };
-        pub const SD = packed struct(u32) {
+        pub const SD = bitpack struct(u32) {
             @"6:0": u7 = 0b0100_011,
             imm12_4_0: u5,
             @"14:12": u3 = 0b011,
@@ -2073,7 +2073,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs2: u5,
             imm12_11_5: i7,
         };
-        pub const SW = packed struct(u32) {
+        pub const SW = bitpack struct(u32) {
             @"6:0": u7 = 0b0100_011,
             imm12_4_0: u5,
             @"14:12": u3 = 0b010,
@@ -2081,7 +2081,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs2: u5,
             imm12_11_5: i7,
         };
-        pub const SUB = packed struct(u32) {
+        pub const SUB = bitpack struct(u32) {
             @"6:0": u7 = 0b0110_011,
             rd: u5,
             @"14:12": u3 = 0b000,
@@ -2089,20 +2089,20 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs2: u5,
             @"31:27": u7 = 0b0100_000,
         };
-        pub const JALR = packed struct(u32) {
+        pub const JALR = bitpack struct(u32) {
             @"6:0": u7 = 0b1100_111,
             rd: u5,
             @"14:0": u3 = 0b000,
             rs: u5,
             imm12: i12,
 
-            pub const C = packed struct(u16) {
+            pub const C = bitpack struct(u16) {
                 @"6:0": u7 = 0b0000010,
                 rs1: u5,
                 @"15:12": u4 = 0b1000,
             };
         };
-        pub const JAL = packed struct(u32) {
+        pub const JAL = bitpack struct(u32) {
             @"6:0": u7 = 0b1101_111,
             rd: u5,
             @"offset19:12": u8,
@@ -2110,10 +2110,10 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"offset10:1": u10,
             offset20: u1,
         };
-        pub const NOP = packed struct(u32) {
+        pub const NOP = bitpack struct(u32) {
             @"31:0": u32 = 0b0000_0000_0000_0000_0000_0000_0001_0011,
 
-            pub const C = packed struct(u16) {
+            pub const C = bitpack struct(u16) {
                 @"15:0": u16 = 0b0000_0000_0000_0001,
             };
         };
@@ -2131,31 +2131,31 @@ const Instruction = switch (builtin.target.cpu.arch) {
         literal: usize,
     },
     .powerpc, .powerpcle, .powerpc64, .powerpc64le => union(enum) {
-        pub const ADDI = packed struct(u32) {
+        pub const ADDI = bitpack struct(u32) {
             imm16: i16,
             ra: u5,
             rt: u5,
             @"31:26": u6 = 14,
         };
-        pub const ADDIS = packed struct(u32) {
+        pub const ADDIS = bitpack struct(u32) {
             imm16: i16,
             ra: u5,
             rt: u5,
             @"31:26": u6 = 15,
         };
-        pub const ORI = packed struct(u32) {
+        pub const ORI = bitpack struct(u32) {
             imm16: u16,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 24,
         };
-        pub const ORIS = packed struct(u32) {
+        pub const ORIS = bitpack struct(u32) {
             imm16: u16,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 25,
         };
-        pub const RLDIC = packed struct(u32) {
+        pub const RLDIC = bitpack struct(u32) {
             rc: u1,
             sh2: u1,
             @"4:2": u3 = 2,
@@ -2165,46 +2165,46 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs: u5,
             @"31:26": u6 = 30,
         };
-        pub const LD = packed struct {
+        pub const LD = bitpack struct {
             @"1:0": u2 = 0,
             ds: i14,
             ra: u5,
             rt: u5,
             @"31:26": u6 = 58,
         };
-        pub const LW = packed struct {
+        pub const LW = bitpack struct {
             ds: i16,
             ra: u5,
             rt: u5,
             @"31:26": u6 = 32,
         };
-        pub const STD = packed struct {
+        pub const STD = bitpack struct {
             @"1:0": u2 = 0,
             ds: i14,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 62,
         };
-        pub const STW = packed struct {
+        pub const STW = bitpack struct {
             ds: i16,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 36,
         };
-        pub const STDU = packed struct {
+        pub const STDU = bitpack struct {
             @"1:0": u2 = 1,
             ds: i14,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 62,
         };
-        pub const STWU = packed struct {
+        pub const STWU = bitpack struct {
             ds: i16,
             ra: u5,
             rs: u5,
             @"31:26": u6 = 37,
         };
-        pub const STDUX = packed struct {
+        pub const STDUX = bitpack struct {
             @"0": u1 = 0,
             @"10:1": i10 = 181,
             rb: u5,
@@ -2212,7 +2212,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs: u5,
             @"31:26": u6 = 31,
         };
-        pub const STWUX = packed struct {
+        pub const STWUX = bitpack struct {
             @"0": u1,
             @"10:1": i10 = 183,
             rb: u5,
@@ -2220,7 +2220,7 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs: u5,
             @"31:26": u6 = 31,
         };
-        pub const OR = packed struct(u32) {
+        pub const OR = bitpack struct(u32) {
             @"0": u1 = 0,
             @"9:1": u10 = 444,
             rb: u5,
@@ -2228,20 +2228,20 @@ const Instruction = switch (builtin.target.cpu.arch) {
             rs: u5,
             @"31:26": u6 = 31,
         };
-        pub const SUBFIC = packed struct(u32) {
+        pub const SUBFIC = bitpack struct(u32) {
             imm16: i16,
             ra: u5,
             rt: u5,
             @"31:26": u6 = 8,
         };
-        pub const MTCTR = packed struct(u32) {
+        pub const MTCTR = bitpack struct(u32) {
             @"0": u1 = 0,
             @"9:1": u10 = 467,
             spr: u10 = 0x120,
             rs: u5,
             @"31:26": u6 = 31,
         };
-        pub const BCTRL = packed struct(u32) {
+        pub const BCTRL = bitpack struct(u32) {
             lk: u1 = 0,
             @"10:1": u10 = 528,
             bh: u2 = 0b00000,
@@ -2271,47 +2271,47 @@ const Instruction = switch (builtin.target.cpu.arch) {
         literal: usize,
     },
     .arm => union(enum) {
-        const LDR = packed struct(u32) {
+        const LDR = bitpack struct(u32) {
             imm12: u12,
             rt: u4,
             rn: u4,
             @"31:20": u12 = 0b1110_0101_1001,
         };
-        const STR = packed struct(u32) {
+        const STR = bitpack struct(u32) {
             imm12: u12,
             rt: u4,
             rn: u4,
             @"31:20": u12 = 0b1110_0101_1000,
         };
-        const ADD = packed struct(u32) {
+        const ADD = bitpack struct(u32) {
             imm12: u12,
             rd: u4,
             rn: u4,
             @"31:20": u12 = 0b1110_0010_1000,
         };
-        const SUB = packed struct(u32) {
+        const SUB = bitpack struct(u32) {
             imm12: u12,
             rd: u4,
             rn: u4,
             @"31:20": u12 = 0b1110_0010_0100,
         };
-        const MOV = packed struct(u32) {
+        const MOV = bitpack struct(u32) {
             rm: u4,
             @"11:4": u8 = 0,
             rd: u4,
             @"31:15": u16 = 0b1110_0001_1010_0000,
         };
-        const BX = packed struct(u32) {
+        const BX = bitpack struct(u32) {
             rm: u4,
             flags: u4 = 0b0001,
             imm12: u12 = 0b1111_1111_1111,
             @"31:20": u12 = 0b1110_0001_0010,
         };
-        const PUSH = packed struct(u32) {
+        const PUSH = bitpack struct(u32) {
             regs: u16,
             @"31:20": u16 = 0b1110_1001_0010_1101,
         };
-        const NOP = packed struct(u32) {
+        const NOP = bitpack struct(u32) {
             @"31:0": u32 = 0b1110_0011_0010_0000_1111_0000_0000_0000,
         };
 
@@ -2366,7 +2366,7 @@ const InstructionEncoder = struct {
     fn add(self: *@This(), instr: anytype) void {
         switch (@typeInfo(@TypeOf(instr))) {
             .@"struct" => |st| {
-                if (st.layout == .@"packed") {
+                if (st.layout == .@"bitpack") {
                     self.write(instr);
                 } else {
                     inline for (st.field_names) |field_name| {
@@ -2405,7 +2405,7 @@ const InstructionEncoder = struct {
         encoder.add(u);
         const o: ?u32 = null;
         encoder.add(o);
-        const s: packed struct {
+        const s: bitpack struct {
             a: u32 = 456,
         } = .{};
         encoder.add(s);
@@ -2430,7 +2430,7 @@ const InstructionEncoder = struct {
         var encoder: InstructionEncoder = .{ .output = &bytes };
         const u: u32 = 123;
         encoder.write(u);
-        const s: packed struct {
+        const s: bitpack struct {
             a: u32 = 456,
         } = .{};
         encoder.write(s);

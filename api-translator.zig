@@ -43,7 +43,7 @@ pub const CodeGeneratorOptions = struct {
 
     // callback determining which enum items represent errors
     enum_is_error_fn: fn (item_name: []const u8, value: i128) bool = isNonZero,
-    // callback determining if an enum type is a packed struct
+    // callback determining if an enum type is a bitpack struct
     enum_is_packed_struct_fn: fn (enum_name: []const u8) bool = neverPackedStruct,
 
     // callbacks determining particular pointer attributes
@@ -59,7 +59,7 @@ pub const CodeGeneratorOptions = struct {
     // callback returning the index of the corresponding pointer argument if it should be treated as the length of a slice pointer
     param_is_slice_len_fn: fn (fn_name: []const u8, param_name: ?[]const u8, param_index: usize, param_type: []const u8) ?usize = neverSliceLength,
 
-    // callback for converting constants into enum and packed struct
+    // callback for converting constants into enum and bitpack struct
     const_is_enum_item_fn: fn (const_name: []const u8) ?EnumInfo = notEnumItem,
 
     // calling determining whether positive status is needed
@@ -1109,12 +1109,12 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                     });
                     try constant_map.put(self.allocator, decl.name, if (is_new_enum) enum_expr else null);
                     if (is_new_enum and enum_info.is_packed_struct) {
-                        // remember that the enum is actually a packed struct
+                        // remember that the enum is actually a bitpack struct
                         try packed_structs.append(self.allocator, enum_expr);
                     }
                 }
             }
-            // convert enums to packed structs now that we have the complete sets of values
+            // convert enums to bitpack structs now that we have the complete sets of values
             for (packed_structs.items) |expr| {
                 expr.type = .{ .container = try self.convertEnumToPackedStruct(expr.type.enumeration) };
             }
@@ -1404,7 +1404,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 expr.* = .{
                     .type = .{
                         .container = .{
-                            .layout = "packed",
+                            .layout = "bitpack",
                             .kind = "struct",
                             .fields = fields,
                         },
@@ -1564,7 +1564,7 @@ pub fn CodeGenerator(comptime options: CodeGeneratorOptions) type {
                 }
             }
             return .{
-                .layout = "packed",
+                .layout = "bitpack",
                 .kind = "struct",
                 .backing_type = e.tag_type,
                 .fields = new_fields,
@@ -3240,7 +3240,7 @@ test "Translator.convert (basic)" {
         a: i32,
         b: i32,
     };
-    const NewStruct2 = packed struct(u32) {
+    const NewStruct2 = bitpack struct(u32) {
         flag1: bool = true,
         flag2: bool = false,
         flag3: bool = true,

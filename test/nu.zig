@@ -40,7 +40,7 @@ pub const foo: fn (
     options: Options,
 ) Struct = c_to_zig.translate("nu_foo", false, false, .{});
 
-pub const Options = packed struct(u16) {
+pub const Options = bitpack struct(u16) {
     one: bool = false,
     two: bool = false,
     three: bool = false,

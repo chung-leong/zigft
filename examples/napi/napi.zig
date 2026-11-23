@@ -51,7 +51,7 @@ pub const CallbackInfo = *opaque {};
 /// https://nodejs.org/api/n-api.html#napi_deferred
 pub const Deferred = *opaque {};
 /// https://nodejs.org/api/n-api.html#napi_property_attributes
-pub const PropertyAttributes = packed struct(c_uint) {
+pub const PropertyAttributes = bitpack struct(c_uint) {
     writable: bool = false,
     enumerable: bool = false,
     configurable: bool = false,
@@ -160,7 +160,7 @@ pub const CollectionMode = enum(c_uint) {
     _,
 };
 /// https://nodejs.org/api/n-api.html#napi_key_filter
-pub const Filter = packed struct(c_uint) {
+pub const Filter = bitpack struct(c_uint) {
     writable: bool = false,
     enumerable: bool = false,
     configurable: bool = false,

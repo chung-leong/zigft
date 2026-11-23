@@ -165,7 +165,7 @@ pub const getError: fn () Error![*:0]u8 = c_to_zig.translate("WildMidi_GetError"
 
 pub const clearError: fn () void = c_to_zig.translate("WildMidi_ClearError", false, false, .{});
 
-pub const MixerOptions = packed struct(u16) {
+pub const MixerOptions = bitpack struct(u16) {
     log_volume: bool = false,
     enhanced_resampling: bool = false,
     reverb: bool = false,

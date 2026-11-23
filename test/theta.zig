@@ -18,7 +18,7 @@ pub const Status = enum(c_uint) {
     wrong_dwarf,
     _,
 };
-pub const Flags = packed struct(c_uint) {
+pub const Flags = bitpack struct(c_uint) {
     happy: bool = false,
     grumpy: bool = false,
     sleepy: bool = false,
