@@ -344,3 +344,5 @@ Function binding requires hardware-specific code. CPU architectures currently su
 
 The main branch of Zigft is designed for Zig 0.17.x. Use the code pinned to the `v0.16.0` or 
 `v0.15.0` tag if you're still on an old version of Zig. Code for 0.14.x is the `v0.14.1` branch.
+
+You're using `master`, try the development branch. It was last updated on 2026/11/23.
