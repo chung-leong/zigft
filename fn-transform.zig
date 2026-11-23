@@ -9,9 +9,10 @@ const expect = std.testing.expect;
 /// function.
 pub fn spreadArgs(func: anytype, comptime conv: ?std.builtin.CallingConvention) SpreadFn(@TypeOf(func), conv) {
     const pyramid = getPyramid(func, conv);
-    const info = getTupleInfo(@TypeOf(func));
-    const caller_name = std.fmt.comptimePrint("call{d}", .{info.field_types.len});
+    const field_types = getTupleTypes(@TypeOf(func));
+    const caller_name = std.fmt.comptimePrint("call{d}", .{field_types.len});
     if (!@hasDecl(pyramid, caller_name)) {
+        @compileLog(caller_name);
         @compileError("Too many arguments");
     }
     return @field(pyramid, caller_name);
@@ -19,16 +20,16 @@ pub fn spreadArgs(func: anytype, comptime conv: ?std.builtin.CallingConvention) 
 
 /// Return type of spreadArgs().
 pub fn SpreadFn(comptime T: type, comptime conv: ?std.builtin.CallingConvention) type {
-    const info = getTupleInfo(T);
+    const field_types = getTupleTypes(T);
     const f = @typeInfo(T).@"fn";
-    var param_types: [info.field_types.len]type = undefined;
-    var param_attrs: [info.field_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
-    inline for (info.field_types, 0..) |FT, i| {
+    var param_types: [field_types.len]type = undefined;
+    var param_attrs: [field_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
+    inline for (field_types, 0..) |FT, i| {
         param_types[i] = FT;
         param_attrs[i] = .{};
     }
     return @Fn(&param_types, &param_attrs, f.return_type.?, .{
-        .@"callconv" = conv orelse f.calling_convention,
+        .@"callconv" = conv orelse f.attrs.@"callconv",
     });
 }
 
@@ -78,16 +79,16 @@ test "spreadArgs" {
 
 fn getPyramid(func: anytype, comptime conv: ?std.builtin.CallingConvention) type {
     const PT = comptime param_types: {
-        const info = getTupleInfo(@TypeOf(func));
-        var list: [info.field_types.len]type = undefined;
-        for (info.field_types, 0..) |FT, index| {
+        const field_types = getTupleTypes(@TypeOf(func));
+        var list: [field_types.len]type = undefined;
+        for (field_types, 0..) |FT, index| {
             list[index] = FT;
         }
         break :param_types list;
     };
     const f = @typeInfo(@TypeOf(func)).@"fn";
     const RT = f.return_type.?;
-    const cc = conv orelse f.calling_convention;
+    const cc = conv orelse f.attrs.@"callconv";
     return struct {
         pub fn call0() callconv(cc) RT {
             return func(.{});
@@ -351,7 +352,7 @@ fn getPyramid(func: anytype, comptime conv: ?std.builtin.CallingConvention) type
     };
 }
 
-fn getTupleInfo(comptime FT: type) std.lang.Type.Struct {
+fn getTupleTypes(comptime FT: type) []const type {
     const valid = switch (@typeInfo(FT)) {
         .@"fn" => |f| is_tuple: {
             if (f.param_types.len == 1) {
@@ -370,14 +371,14 @@ fn getTupleInfo(comptime FT: type) std.lang.Type.Struct {
         @compileError("Function accepting a tuple as argument expected");
     }
     const Tuple = @typeInfo(FT).@"fn".param_types[0].?;
-    return @typeInfo(Tuple).@"struct";
+    return @typeInfo(Tuple).@"struct".field_types;
 }
 
 /// Take an inline function create a regular function
 pub fn uninline(func: anytype) Uninlined(@TypeOf(func)) {
     const FT = @TypeOf(func);
     const f = @typeInfo(FT).@"fn";
-    if (f.calling_convention != .@"inline") return func;
+    if (f.attrs.@"callconv" != .@"inline") return func;
     const ns = struct {
         inline fn call(args: std.meta.ArgsTuple(FT)) f.return_type.? {
             return @call(.auto, func, args);
@@ -399,19 +400,19 @@ test "uninline" {
         const new_a = uninline(a);
         const new_b = uninline(b);
     };
-    try expectEqual(.auto, @typeInfo(@TypeOf(ns.new_a)).@"fn".calling_convention);
+    try expectEqual(.auto, @typeInfo(@TypeOf(ns.new_a)).@"fn".attrs.@"callconv");
     try expectEqual(ns.b, ns.new_b);
 }
 
 /// Return type of uninline().
 pub fn Uninlined(comptime FT: type) type {
     const f = @typeInfo(FT).@"fn";
-    if (f.calling_convention != .@"inline") return FT;
+    if (f.attrs.@"callconv" != .@"inline") return FT;
     var param_types: [f.param_types.len]type = undefined;
-    var param_attrs: [f.param_types.len]std.lang.Type.Fn.ParamAttributes = undefined;
+    var param_attrs: [f.param_attrs.len]std.lang.Type.Fn.ParamAttributes = undefined;
     inline for (f.param_types, 0..) |param_type, i| {
         param_types[i] = param_type.?;
-        param_attrs[i] = .{ .@"noalias" = f.param_attrs[i].is_noalias };
+        param_attrs[i] = f.param_attrs[i];
     }
     return @Fn(&param_types, &param_attrs, f.return_type.?, .{
         .varargs = f.attrs.varargs,

@@ -704,16 +704,16 @@ test "CodeGenerator (nu)" {
         }
 
         fn overrideParam(_: []const u8, param_name: ?[]const u8, _: usize, _: []const u8) ?[]const u8 {
-            return inline for (std.meta.fields(@TypeOf(type_overrides))) |field| {
+            return inline for (std.meta.fieldNames(@TypeOf(type_overrides))) |field_name| {
                 if (param_name) |name| {
-                    if (std.mem.eql(u8, name, field.name)) break @field(type_overrides, field.name);
+                    if (std.mem.eql(u8, name, field_name)) break @field(type_overrides, field_name);
                 }
             } else null;
         }
 
-        fn overrideField(_: []const u8, field_name: []const u8, _: []const u8) ?[]const u8 {
-            return inline for (std.meta.fields(@TypeOf(type_overrides))) |field| {
-                if (std.mem.eql(u8, field_name, field.name)) break @field(type_overrides, field.name);
+        fn overrideField(_: []const u8, name: []const u8, _: []const u8) ?[]const u8 {
+            return inline for (std.meta.fieldNames(@TypeOf(type_overrides))) |field_name| {
+                if (std.mem.eql(u8, field_name, name)) break @field(type_overrides, field_name);
             } else null;
         }
     };

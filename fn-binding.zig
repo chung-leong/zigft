@@ -141,16 +141,16 @@ fn invalidate(slice: []u8) void {
 
 /// Return the only public function that exists in the given namespace.
 pub fn onlyFn(comptime ns: type) find: {
-    const T: type = for (std.meta.declarations(ns)) |decl| {
-        const DT = @TypeOf(@field(ns, decl.name));
+    const T: type = for (std.meta.declarations(ns)) |decl_name| {
+        const DT = @TypeOf(@field(ns, decl_name));
         if (@typeInfo(DT) == .@"fn") break DT;
     } else @TypeOf(undefined);
     break :find T;
 } {
     var fn_name: ?[]const u8 = null;
-    inline for (std.meta.declarations(ns)) |decl| {
-        if (@typeInfo(@TypeOf(@field(ns, decl.name))) == .@"fn") {
-            if (fn_name == null) fn_name = decl.name else {
+    inline for (std.meta.declarations(ns)) |decl_name| {
+        if (@typeInfo(@TypeOf(@field(ns, decl_name))) == .@"fn") {
+            if (fn_name == null) fn_name = decl_name else {
                 @compileError("Found multiple public functions in " ++ @typeName(ns));
             }
         }
@@ -179,40 +179,34 @@ const Header = extern struct {
 
 fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.CallingConvention) type {
     const FT = FnType(T);
-    const calling_convention: std.builtin.CallingConvention = cc orelse @typeInfo(FT).@"fn".calling_convention;
+    const calling_convention: std.builtin.CallingConvention = cc orelse @typeInfo(FT).@"fn".attrs.@"callconv";
     const BFT = BoundFnWithCallConv(FT, CT, calling_convention);
     const AddressPosition = struct { offset: isize, stack_offset: isize, stack_align_mask: ?isize };
     const arg_mapping = getArgumentMapping(FT, CT);
     const ctx_mapping = getContextMapping(FT, CT);
     const BFArgsTuple = std.meta.ArgsTuple(BFT);
-    const ArgsStruct = init: {
+    const ArgsTuple = init: {
+        // std.meta.ArgsTuple() fails when anytype is in the argument list
         const f = @typeInfo(FT).@"fn";
-        var field_names: [f.params.len][]const u8 = undefined;
-        var field_types: [f.params.len]type = undefined;
-        var field_attrs: [f.params.len]std.lang.Type.Struct.FieldAttributes = undefined;
-        inline for (f.params, 0..) |param, i| {
+        var field_types: [f.param_types.len]type = undefined;
+        inline for (f.param_types, 0..) |param_type, i| {
             const name = std.fmt.comptimePrint("{d}", .{i});
-            const var_type: ?type, const var_def_ptr: ?*const anyopaque = find: {
+            const var_type: ?type = find: {
                 // find the variable bound to this param, if any
                 inline for (ctx_mapping) |m| {
                     if (std.mem.eql(u8, name, m.dest)) {
                         // find the type (and default value) from the bound variable
-                        const ctx_fields = @typeInfo(CT).@"struct".fields;
-                        inline for (ctx_fields) |field| {
-                            if (std.mem.eql(u8, m.src, field.name))
-                                break :find .{ field.type, field.default_value_ptr };
+                        const st = @typeInfo(CT).@"struct";
+                        inline for (st.field_names, 0..) |field_name, j| {
+                            if (std.mem.eql(u8, m.src, field_name))
+                                break :find st.field_types[j];
                         }
                     }
-                } else break :find .{ null, null };
+                } else break :find null;
             };
-            field_names[i] = name;
-            field_types[i] = var_type orelse param.type.?;
-            field_attrs[i] = .{
-                .@"comptime" = var_def_ptr != null,
-                .default_value_ptr = var_def_ptr,
-            };
+            field_types[i] = var_type orelse param_type.?;
         }
-        break :init @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+        break :init @Tuple(&field_types);
     };
 
     return struct {
@@ -266,7 +260,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
         pub fn getComptime(comptime func: anytype, comptime vars: anytype) *const BFT {
             const ns = struct {
                 inline fn call(bf_args: BFArgsTuple) @typeInfo(BFT).@"fn".return_type.? {
-                    var args: ArgsStruct = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(vars, m.src);
                     return @call(.auto, func, args);
@@ -286,7 +280,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     // insert nop x 3 so we can find the displacement for target in the instruction stream
                     insertNOPs(&target);
                     const ctx_ptr: *const CT = @ptrFromInt(target[0]);
-                    var args: std.meta.ArgsTuple(@TypeOf(func)) = undefined;
+                    var args: ArgsTuple = undefined;
                     inline for (arg_mapping) |m| @field(args, m.dest) = @field(bf_args, m.src);
                     inline for (ctx_mapping) |m| @field(args, m.dest) = @field(ctx_ptr.*, m.src);
                     switch (@typeInfo(@TypeOf(func))) {
@@ -762,12 +756,12 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                     const instrs: [*]const u8 = @ptrCast(ptr);
                     const nop = @intFromEnum(Instruction.Opcode.nop);
                     const sp = 4;
-                    const register_count = switch (@bitSizeOf(usize)) {
+                    const regigster_count = switch (@bitSizeOf(usize)) {
                         32 => 8,
                         64 => 16,
                         else => unreachable,
                     };
-                    var registers: [register_count]isize = @splat(0);
+                    var registers: [regigster_count]isize = @splat(0);
                     var i: usize = 0;
                     while (i < 262144) {
                         if (instrs[i] == nop and instrs[i + 1] == nop and instrs[i + 2] == nop) {
@@ -919,7 +913,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                         } else {
                             const instr = instrs[i];
                             if (match(Instruction.ADDI.C, instr)) |addi| {
-                                const IntRemaining = std.meta.Int(.signed, @bitSizeOf(isize) - 5);
+                                const IntRemaining = @Int(.signed, @bitSizeOf(isize) - 5);
                                 const int: packed struct(isize) {
                                     @"4:0": u5,
                                     @"63:5": IntRemaining,
@@ -927,7 +921,7 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
                                 const amount: isize = @bitCast(int);
                                 registers[addi.rd] = registers[addi.rd] + amount;
                             } else if (match(Instruction.ADDI.C.SP, instr)) |addisp| {
-                                const IntRemaining = std.meta.Int(.signed, @bitSizeOf(isize) - 9);
+                                const IntRemaining = @Int(.signed, @bitSizeOf(isize) - 9);
                                 const int: packed struct(isize) {
                                     @"3:0": u4 = 0,
                                     @"4": u1,
@@ -1035,30 +1029,29 @@ fn Binding(comptime T: type, comptime CT: type, comptime cc: ?std.builtin.Callin
 }
 
 /// Return type of bindWithCallConv(), createWithCallConv(), etc.
-pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, call_conv: ?std.builtin.CallingConvention) type {
+pub fn BoundFnWithCallConv(comptime T: type, comptime CT: type, call_conv: ?std.lang.CallingConvention) type {
     @setEvalBranchQuota(1000000);
     const FT = FnType(T);
     const f = @typeInfo(FT).@"fn";
-    const params = @typeInfo(FT).@"fn".params;
-    const fields = @typeInfo(CT).@"struct".fields;
+    const field_types = @typeInfo(CT).@"struct".field_types;
     const context_mapping = getContextMapping(FT, CT);
-    const param_count = params.len - fields.len;
+    const param_count = f.param_types.len - field_types.len;
     var param_types: [param_count]type = undefined;
     var param_attrs: [param_count]std.lang.Type.Fn.ParamAttributes = undefined;
     var index = 0;
-    for (params, 0..) |param, number| {
-        const name = std.fmt.comptimePrint("{d}", .{number});
+    for (f.param_types, 0..) |param_type, i| {
+        const name = std.fmt.comptimePrint("{d}", .{i});
         if (!isMapped(&context_mapping, name)) {
-            if (param.type == null) {
+            if (param_type == null) {
                 @compileError("A variable must be bound to an 'anytype' parameter");
             }
-            param_types[index] = param.type.?;
-            param_attrs[index] = .{ .@"noalias" = param.is_noalias };
+            param_types[index] = param_type.?;
+            param_attrs[index] = f.param_attrs[i];
             index += 1;
         }
     }
     return @Fn(&param_types, &param_attrs, f.return_type.?, .{
-        .@"callconv" = call_conv orelse f.calling_convention,
+        .@"callconv" = call_conv orelse f.attrs.@"callconv",
     });
 }
 
@@ -1082,16 +1075,16 @@ const Mapping = struct {
 };
 
 fn getArgumentMapping(comptime FT: type, comptime CT: type) return_type: {
-    const params = @typeInfo(FT).@"fn".params;
-    const fields = @typeInfo(CT).@"struct".fields;
-    break :return_type [params.len - fields.len]Mapping;
+    const param_types = @typeInfo(FT).@"fn".param_types;
+    const field_types = @typeInfo(CT).@"struct".field_types;
+    break :return_type [param_types.len - field_types.len]Mapping;
 } {
-    const params = @typeInfo(FT).@"fn".params;
-    const fields = @typeInfo(CT).@"struct".fields;
+    const param_types = @typeInfo(FT).@"fn".param_types;
+    const field_types = @typeInfo(CT).@"struct".field_types;
     const context_mapping = getContextMapping(FT, CT);
-    var mapping: [params.len - fields.len]Mapping = undefined;
-    var src_index = params.len - fields.len;
-    var dest_index = params.len;
+    var mapping: [param_types.len - field_types.len]Mapping = undefined;
+    var src_index = param_types.len - field_types.len;
+    var dest_index = param_types.len;
     while (dest_index >= 1) {
         dest_index -= 1;
         const dest_name = std.fmt.comptimePrint("{d}", .{dest_index});
@@ -1119,24 +1112,24 @@ test "getArgumentMapping" {
 }
 
 fn getContextMapping(comptime FT: type, comptime CT: type) return_type: {
-    const fields = @typeInfo(CT).@"struct".fields;
-    break :return_type [fields.len]Mapping;
+    const field_names = @typeInfo(CT).@"struct".field_names;
+    break :return_type [field_names.len]Mapping;
 } {
-    const params = @typeInfo(FT).@"fn".params;
-    const fields = @typeInfo(CT).@"struct".fields;
-    var mapping: [fields.len]Mapping = undefined;
-    for (fields, 0..) |field, index| {
-        var number = std.fmt.parseInt(isize, field.name, 10) catch @compileError("Invalid argument specifier");
-        if (number >= params.len) {
+    const param_types = @typeInfo(FT).@"fn".param_types;
+    const field_names = @typeInfo(CT).@"struct".field_names;
+    var mapping: [field_names.len]Mapping = undefined;
+    for (field_names, 0..) |field_name, index| {
+        var number = std.fmt.parseInt(isize, field_name, 10) catch @compileError("Invalid argument specifier");
+        if (number >= param_types.len) {
             @compileError("Index exceeds argument count");
         } else if (number < 0) {
-            number = @as(i32, @intCast(params.len)) + number;
+            number = @as(i32, @intCast(param_types.len)) + number;
             if (number < 0) {
                 @compileError("Negative index points to non-existing argument");
             }
         }
         const dest_name = std.fmt.comptimePrint("{d}", .{number});
-        mapping[index] = .{ .src = field.name, .dest = dest_name };
+        mapping[index] = .{ .src = field_name, .dest = dest_name };
     }
     return mapping;
 }
@@ -1385,8 +1378,6 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"rol/ror/etc r/m imm8" = 0xc1,
             @"ret imm16" = 0xc2,
             ret = 0xc3,
-            @"vex imm16" = 0xc4,
-            @"vex imm8" = 0xc5,
             @"mov r/m8 imm8" = 0xc6,
             @"mov r/m imm32" = 0xc7,
             @"enter imm16 imm8" = 0xc8,
@@ -1669,6 +1660,24 @@ const Instruction = switch (builtin.target.cpu.arch) {
             @"paddd xmm xmm/m128" = 0xfe,
             _,
         };
+        const VexOpcode = enum(u8) {
+            // handling only a small subset for now
+            @"vmovs xmm xmm/m128" = 0x10,
+            @"vmovs xmm/m128 xmm" = 0x11,
+            @"vmovlp xmm xmm/m128" = 0x12,
+            @"vmovlp xmm/m128 xmm" = 0x13,
+            @"vmovhp xmm xmm/m128" = 0x16,
+            @"vmovhp xmm/m128 xmm" = 0x17,
+            @"vmovap xmm xmm/m128" = 0x28,
+            @"vmovap xmm/m128 xmm" = 0x29,
+            @"vmovntps xmm xmm/m128" = 0x2b,
+            @"vmovmskpd xmm xmm/m128" = 0x2d,
+            @"vmovd xmm xmm/m128" = 0x6e,
+            @"vmovdq xmm xmm/m128" = 0x6f,
+            @"vmovd xmm/m128 xmm" = 0x7e,
+            @"vmovdq xmm/m128 xmm" = 0x7f,
+            _,
+        };
         pub const Prefix = enum(u8) {
             es = 0x26,
             cs = 0x2e,
@@ -1679,6 +1688,8 @@ const Instruction = switch (builtin.target.cpu.arch) {
             os = 0x66,
             as = 0x67,
             wait = 0x9b,
+            vex3 = 0xc4,
+            vex2 = 0xc5,
             f0 = 0xf0,
             f2 = 0xf2,
             f3 = 0xf3,
@@ -1713,41 +1724,42 @@ const Instruction = switch (builtin.target.cpu.arch) {
         };
         const attribute_table = buildAttributeTable(Opcode);
         const ext_attribute_table = buildAttributeTable(ExtOpcode);
+        const vex_attribute_table = buildAttributeTable(VexOpcode);
 
         fn buildAttributeTable(comptime ET: type) [256]Attributes {
             @setEvalBranchQuota(200000);
             var table: [256]Attributes = undefined;
-            for (@typeInfo(ET).@"enum".fields) |field| {
+            const en = @typeInfo(ET).@"enum";
+            for (en.field_names, 0..) |field_name, i| {
                 var attrs: Attributes = .{};
-                const name = field.name;
                 // modR/M byte is needed when the instruction works with
-                if (std.mem.containsAtLeast(u8, name, 1, " r") or std.mem.containsAtLeast(u8, name, 1, " xmm") or name[0] == 'f') {
+                if (std.mem.containsAtLeast(u8, field_name, 1, " r") or std.mem.containsAtLeast(u8, field_name, 1, " xmm") or field_name[0] == 'f') {
                     attrs.has_mod_rm = true;
                 }
-                if (std.mem.endsWith(u8, name, " imm8")) {
+                if (std.mem.endsWith(u8, field_name, " imm8")) {
                     attrs.has_imm8 = true;
-                } else if (std.mem.endsWith(u8, name, " imm32")) {
+                } else if (std.mem.endsWith(u8, field_name, " imm32")) {
                     attrs.has_imm32 = true;
-                } else if (std.mem.endsWith(u8, name, " imm32/64")) {
+                } else if (std.mem.endsWith(u8, field_name, " imm32/64")) {
                     attrs.@"has_imm32/64" = true;
                 }
-                if (std.mem.containsAtLeast(u8, name, 1, " moffs8")) {
+                if (std.mem.containsAtLeast(u8, field_name, 1, " moffs8")) {
                     attrs.has_imm8 = true;
-                } else if (std.mem.containsAtLeast(u8, name, 1, " moffs32")) {
+                } else if (std.mem.containsAtLeast(u8, field_name, 1, " moffs32")) {
                     attrs.has_imm32 = true;
-                } else if (std.mem.containsAtLeast(u8, name, 1, " moffs32/64")) {
+                } else if (std.mem.containsAtLeast(u8, field_name, 1, " moffs32/64")) {
                     attrs.@"has_imm32/64" = true;
-                } else if (std.mem.containsAtLeast(u8, name, 1, " imm16")) {
+                } else if (std.mem.containsAtLeast(u8, field_name, 1, " imm16")) {
                     attrs.has_imm16 = true;
                 }
-                if (std.mem.startsWith(u8, name, "push ")) {
+                if (std.mem.startsWith(u8, field_name, "push ")) {
                     attrs.pushes = true;
-                    attrs.affects_all = std.mem.endsWith(u8, name, " all");
-                } else if (std.mem.startsWith(u8, name, "pop ")) {
+                    attrs.affects_all = std.mem.endsWith(u8, field_name, " all");
+                } else if (std.mem.startsWith(u8, field_name, "pop ")) {
                     attrs.pops = true;
-                    attrs.affects_all = std.mem.endsWith(u8, name, " all");
+                    attrs.affects_all = std.mem.endsWith(u8, field_name, " all");
                 }
-                const index: usize = field.value;
+                const index: usize = en.field_values[i];
                 table[index] = attrs;
             }
             return table;
@@ -1759,6 +1771,14 @@ const Instruction = switch (builtin.target.cpu.arch) {
             if (std.enums.fromInt(Prefix, bytes[i])) |prefix| {
                 i += 1;
                 instr.prefix = prefix;
+                if (prefix == .vex2) {
+                    instr.prefix_byte2 = bytes[i];
+                    i += 1;
+                } else if (prefix == .vex3) {
+                    instr.prefix_byte2 = bytes[i];
+                    instr.prefix_byte3 = bytes[i + 1];
+                    i += 2;
+                }
             }
             var wide = false;
             if (@bitSizeOf(usize) == 64) {
@@ -1775,7 +1795,9 @@ const Instruction = switch (builtin.target.cpu.arch) {
                 instr.ext_opcode = @enumFromInt(bytes[i]);
                 i += 1;
             }
-            const attrs = if (instr.ext_opcode) |opcode|
+            const attrs = if (instr.isVex())
+                vex_attribute_table[@intFromEnum(instr.opcode)]
+            else if (instr.ext_opcode) |opcode|
                 ext_attribute_table[@intFromEnum(opcode)]
             else
                 attribute_table[@intFromEnum(instr.opcode)];
@@ -1845,20 +1867,26 @@ const Instruction = switch (builtin.target.cpu.arch) {
         pub fn getImm(self: @This(), comptime T: type) T {
             const signedness = @typeInfo(T).int.signedness;
             if (self.imm8) |value| {
-                return @as(std.meta.Int(signedness, 8), @bitCast(value));
+                return @as(@Int(signedness, 8), @bitCast(value));
             }
             if (self.imm32) |value| {
-                return @as(std.meta.Int(signedness, 32), @bitCast(value));
+                return @as(@Int(signedness, 32), @bitCast(value));
             }
             if (@bitSizeOf(usize) == 64) {
                 if (self.imm64) |value| {
-                    return @as(std.meta.Int(signedness, 64), @bitCast(value));
+                    return @as(@Int(signedness, 64), @bitCast(value));
                 }
             }
             unreachable;
         }
 
+        pub fn isVex(self: @This()) bool {
+            return self.prefix == .vex2 or self.prefix == .vex3;
+        }
+
         prefix: ?Prefix = null,
+        prefix_byte2: ?u8 = null,
+        prefix_byte3: ?u8 = null,
         rex: ?REX = null,
         opcode: Opcode = .nop,
         ext_opcode: ?ExtOpcode = null,
@@ -2317,10 +2345,12 @@ const Instruction = switch (builtin.target.cpu.arch) {
 
 fn match(comptime ST: type, instr: anytype) ?ST {
     const instr_struct: ST = @bitCast(instr);
-    return inline for (@typeInfo(ST).@"struct".fields) |field| {
-        if (field.default_value_ptr) |opaque_ptr| {
-            const ptr: *const field.type = @ptrCast(@alignCast(opaque_ptr));
-            if (@field(instr_struct, field.name) != ptr.*) break null;
+    const st = @typeInfo(ST).@"struct";
+    return inline for (st.field_names, 0..) |field_name, i| {
+        if (st.field_attrs[i].default_value_ptr) |opaque_ptr| {
+            const FT = st.field_types[i];
+            const ptr: *const FT = @ptrCast(@alignCast(opaque_ptr));
+            if (@field(instr_struct, field_name) != ptr.*) break null;
         }
     } else instr_struct;
 }
@@ -2339,17 +2369,17 @@ const InstructionEncoder = struct {
                 if (st.layout == .@"packed") {
                     self.write(instr);
                 } else {
-                    inline for (st.fields) |field| {
-                        self.add(@field(instr, field.name));
+                    inline for (st.field_names) |field_name| {
+                        self.add(@field(instr, field_name));
                     }
                 }
             },
             .@"union" => |un| {
                 const Tag = un.tag_type orelse @compileError("Cannot handle untagged union");
                 const tag: Tag = instr;
-                inline for (un.fields) |field| {
-                    if (tag == @field(Tag, field.name)) {
-                        self.add(@field(instr, field.name));
+                inline for (un.field_names) |field_name| {
+                    if (tag == @field(Tag, field_name)) {
+                        self.add(@field(instr, field_name));
                         break;
                     }
                 }
